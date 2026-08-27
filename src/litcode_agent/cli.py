@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Sequence
 
@@ -14,13 +15,18 @@ from litcode_agent.config import ConfigurationError, Settings
 from litcode_agent.hooks import HookRunner
 from litcode_agent.model import ModelError, OpenAIChatModel
 from litcode_agent.tools import build_default_registry
+from litcode_agent.tui import run_tui
 from litcode_agent.ui import TerminalUI
+
+COMMANDS = {"doctor", "models", "run", "chat"}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="litcode",
+        usage="litcode [PATH] | litcode {doctor,models,run,chat} ...",
         description="一个透明、可解释的本地编程智能体。",
+        epilog="不带参数时打开当前目录；传入路径时打开该目录的全屏 TUI。",
     )
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -35,18 +41,31 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("task", help="交给 Agent 的编程任务")
     _add_common_options(run, allow_model_override=True)
 
-    chat = subparsers.add_parser("chat", help="启动保留上下文的交互会话")
-    _add_common_options(chat, allow_model_override=True)
+    chat = subparsers.add_parser("chat", help="启动全屏 TUI 会话")
+    chat.add_argument(
+        "path",
+        nargs="?",
+        type=Path,
+        help="要打开的工作区（默认：当前目录）",
+    )
+    _add_common_options(
+        chat,
+        allow_model_override=True,
+        workspace_default=None,
+    )
     return parser
 
 
 def _add_common_options(
-    parser: argparse.ArgumentParser, *, allow_model_override: bool = False
+    parser: argparse.ArgumentParser,
+    *,
+    allow_model_override: bool = False,
+    workspace_default: Path | None = Path.cwd(),
 ) -> None:
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=Path.cwd(),
+        default=workspace_default,
         help="Agent 可以访问的工作区（默认：当前目录）",
     )
     parser.add_argument(
@@ -61,7 +80,10 @@ def main(
     argv: Sequence[str] | None = None,
     ui: TerminalUI | None = None,
 ) -> int:
-    args = build_parser().parse_args(argv)
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(_normalize_args(raw_args))
+    if args.command == "chat":
+        args.workspace = args.path or args.workspace or Path.cwd()
     settings = _load_settings(args)
     terminal = ui or TerminalUI()
 
@@ -82,6 +104,9 @@ def main(
             terminal.show_error(str(error))
             return 1
         return 0
+
+    if args.command == "chat" and ui is None:
+        return run_tui(settings, model)
 
     agent = Agent(
         model,
@@ -115,6 +140,17 @@ def _load_settings(args: argparse.Namespace) -> Settings:
         return Settings.load(args.workspace, environ)
     except ConfigurationError as error:
         build_parser().error(str(error))
+
+
+def _normalize_args(argv: list[str]) -> list[str]:
+    """让 litcode [路径] 成为 chat 子命令的便捷入口。"""
+
+    if not argv:
+        return ["chat"]
+    first = argv[0]
+    if first in COMMANDS or first in {"-h", "--help", "--version"}:
+        return argv
+    return ["chat", *argv]
 
 
 def _chat(

@@ -115,3 +115,26 @@ def test_chat_keeps_context_and_switches_model(tmp_path: Path, monkeypatch) -> N
     assert "LitCode Agent" in rendered
     assert "已切换到模型 model-b" in rendered
     assert "回答 2" in rendered
+
+
+def test_no_arguments_opens_current_directory_tui(monkeypatch, tmp_path: Path) -> None:
+    opened = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    monkeypatch.setenv("LITCODE_MODEL", "model-a")
+    monkeypatch.setattr(cli, "run_tui", lambda settings, model: opened.append(settings.workspace) or 0)
+
+    assert main([]) == 0
+
+    assert opened == [tmp_path.resolve()]
+
+
+def test_path_argument_opens_that_directory_tui(monkeypatch, tmp_path: Path) -> None:
+    opened = []
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    monkeypatch.setenv("LITCODE_MODEL", "model-a")
+    monkeypatch.setattr(cli, "run_tui", lambda settings, model: opened.append(settings.workspace) or 0)
+
+    assert main([str(tmp_path)]) == 0
+
+    assert opened == [tmp_path.resolve()]

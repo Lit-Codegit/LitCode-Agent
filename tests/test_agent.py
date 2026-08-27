@@ -79,6 +79,27 @@ def test_closed_session_rejects_new_turn() -> None:
         session.ask("继续")
 
 
+def test_session_stops_at_cooperative_cancellation_boundary() -> None:
+    cancelled = False
+
+    class CancellingModel:
+        def complete(self, messages, tools):
+            nonlocal cancelled
+            cancelled = True
+            return AssistantTurn("不应显示的回答")
+
+    session = Agent(CancellingModel(), ToolRegistry([]), 2).start_session()
+
+    result = session.ask("开始", lambda: cancelled)
+
+    assert result.reason == "cancelled"
+    assert result.output == "本轮任务已由用户停止。"
+    assert result.messages[-1] == {
+        "role": "assistant",
+        "content": "本轮任务已由用户停止。",
+    }
+
+
 def test_agent_executes_tool_and_links_result_to_call() -> None:
     model = FakeModel(
         [

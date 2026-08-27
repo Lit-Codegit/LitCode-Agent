@@ -25,7 +25,11 @@ summary of changes, tests run, and any remaining limitations.
 """
 
 TerminationReason = Literal[
-    "completed", "empty_response", "model_incomplete", "max_iterations"
+    "completed",
+    "empty_response",
+    "model_incomplete",
+    "max_iterations",
+    "cancelled",
 ]
 
 
@@ -127,7 +131,11 @@ class AgentSession:
         self.started = False
         self.closed = False
 
-    def ask(self, task: str) -> AgentResult:
+    def ask(
+        self,
+        task: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> AgentResult:
         if self.closed:
             raise RuntimeError("session is closed")
         if not task.strip():
@@ -148,14 +156,19 @@ class AgentSession:
                 match_value="startup",
             )
         self.messages.append({"role": "user", "content": task})
+        cancelled = should_cancel or (lambda: False)
 
         for iteration in range(1, self.agent.max_iterations + 1):
+            if cancelled():
+                return self._cancelled(iteration - 1)
             self.agent.event_sink(
                 AgentEvent(kind="model_start", iteration=iteration)
             )
             turn = self.agent.model.complete(
                 self.messages, self.agent.tools.schemas()
             )
+            if cancelled():
+                return self._cancelled(iteration)
             self.messages.append(turn.as_message())
             if not turn.tool_calls:
                 if turn.finish_reason in {"length", "content_filter"}:
@@ -178,12 +191,23 @@ class AgentSession:
                 )
 
             for tool_call in turn.tool_calls:
+                if cancelled():
+                    return self._cancelled(iteration)
                 self._execute_tool(tool_call, iteration)
 
         return self._result(
             f"Stopped after reaching the {self.agent.max_iterations}-iteration limit.",
             "max_iterations",
             self.agent.max_iterations,
+        )
+
+    def _cancelled(self, iteration: int) -> AgentResult:
+        message = "本轮任务已由用户停止。"
+        self.messages.append({"role": "assistant", "content": message})
+        return self._result(
+            message,
+            "cancelled",
+            iteration,
         )
 
     def close(self, reason: str = "user_exit", output: str = "") -> None:
