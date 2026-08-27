@@ -1,8 +1,11 @@
 {
-  "model": {
-    "name": "",
-    "baseURL": "https://api.openai.com/v1",
-    "apiKeyEnv": "OPENAI_API_KEY"
+  "defaultModel": "deepseek",
+  "models": {
+    "deepseek": {
+      "model": "deepseek-v4-flash",
+      "baseURL": "https://api.deepseek.com",
+      "apiKeyEnv": "DEEPSEEK_API_KEY"
+    }
   },
   "agent": {
     "maxIterations": 20,

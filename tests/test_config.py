@@ -90,10 +90,13 @@ def test_loads_project_and_local_json_with_environment_precedence(
     (config_dir / "settings.json").write_text(
         json.dumps(
             {
-                "model": {
-                    "name": "project-model",
-                    "baseURL": "https://project.example/v1",
-                    "apiKeyEnv": "CUSTOM_API_KEY",
+                "defaultModel": "primary",
+                "models": {
+                    "primary": {
+                        "model": "project-model",
+                        "baseURL": "https://project.example/v1",
+                        "apiKeyEnv": "CUSTOM_API_KEY",
+                    }
                 },
                 "agent": {"maxIterations": 5, "maxOutputChars": 1234},
             }
@@ -112,6 +115,7 @@ def test_loads_project_and_local_json_with_environment_precedence(
     )
 
     assert settings.model == "environment-model"
+    assert settings.model_profile == "primary"
     assert settings.base_url == "https://project.example/v1"
     assert settings.max_iterations == 7
     assert settings.max_output_chars == 1234
@@ -128,9 +132,12 @@ def test_rejects_direct_api_key_in_tracked_configuration(tmp_path: Path) -> None
     (config_dir / "settings.json").write_text(
         json.dumps(
             {
-                "model": {
-                    "name": "model",
-                    "apiKey": "must-not-be-stored-here",
+                "defaultModel": "primary",
+                "models": {
+                    "primary": {
+                        "model": "model",
+                        "apiKey": "must-not-be-stored-here",
+                    }
                 }
             }
         )
@@ -146,7 +153,8 @@ def test_parses_claude_style_command_hooks(tmp_path: Path) -> None:
     (config_dir / "settings.json").write_text(
         json.dumps(
             {
-                "model": {"name": "model"},
+                "defaultModel": "primary",
+                "models": {"primary": {"model": "model"}},
                 "hooks": {
                     "PreToolUse": [
                         {
@@ -179,11 +187,61 @@ def test_rejects_fractional_integer_setting(tmp_path: Path) -> None:
     (config_dir / "settings.json").write_text(
         json.dumps(
             {
-                "model": {"name": "model"},
+                "defaultModel": "primary",
+                "models": {"primary": {"model": "model"}},
                 "agent": {"maxIterations": 1.5},
             }
         )
     )
 
     with pytest.raises(ConfigurationError, match="agent.maxIterations"):
+        Settings.load(tmp_path, {"OPENAI_API_KEY": "secret"})
+
+
+def test_environment_can_select_another_model_profile(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultModel": "primary",
+                "models": {
+                    "primary": {
+                        "model": "large-model",
+                        "apiKeyEnv": "PRIMARY_KEY",
+                    },
+                    "fast": {
+                        "model": "fast-model",
+                        "baseURL": "https://fast.example/v1",
+                        "apiKeyEnv": "FAST_KEY",
+                    },
+                },
+            }
+        )
+    )
+
+    settings = Settings.load(
+        tmp_path,
+        {"LITCODE_DEFAULT_MODEL": "fast", "FAST_KEY": "secret"},
+    )
+
+    assert settings.model_profile == "fast"
+    assert settings.model == "fast-model"
+    assert settings.base_url == "https://fast.example/v1"
+    assert settings.api_key_env == "FAST_KEY"
+
+
+def test_rejects_unknown_default_model_profile(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultModel": "missing",
+                "models": {"primary": {"model": "model"}},
+            }
+        )
+    )
+
+    with pytest.raises(ConfigurationError, match="not defined"):
         Settings.load(tmp_path, {"OPENAI_API_KEY": "secret"})

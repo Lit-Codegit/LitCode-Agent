@@ -25,6 +25,7 @@ class Settings:
     workspace: Path
     api_key: str
     model: str
+    model_profile: str = "environment"
     base_url: str | None = None
     api_key_env: str = "OPENAI_API_KEY"
     max_iterations: int = 20
@@ -89,16 +90,48 @@ class Settings:
     ) -> Settings:
         _reject_unknown_keys(
             raw,
-            {"model", "agent", "permissions", "tools", "hooks", "disableAllHooks"},
+            {
+                "defaultModel",
+                "models",
+                "agent",
+                "permissions",
+                "tools",
+                "hooks",
+                "disableAllHooks",
+            },
             "settings",
         )
-        model_config = _object(raw.get("model"), "model")
+        models_config = _object(raw.get("models"), "models")
         agent_config = _object(raw.get("agent"), "agent")
         permissions = _object(raw.get("permissions"), "permissions")
         tools = _object(raw.get("tools"), "tools")
         command_config = _object(tools.get("command"), "tools.command")
+        configured_default = _optional_string(
+            raw.get("defaultModel"), "defaultModel"
+        )
+        model_profile = (
+            environ.get("LITCODE_DEFAULT_MODEL", "").strip()
+            or configured_default
+            or "environment"
+        )
+        if models_config:
+            if model_profile not in models_config:
+                raise ConfigurationError(
+                    f"default model profile is not defined in models: {model_profile}"
+                )
+            model_config = _object(
+                models_config[model_profile], f"models.{model_profile}"
+            )
+        else:
+            if configured_default is not None:
+                raise ConfigurationError(
+                    "models must define the profile selected by defaultModel"
+                )
+            model_config = {}
         _reject_unknown_keys(
-            model_config, {"name", "baseURL", "apiKeyEnv"}, "model"
+            model_config,
+            {"model", "baseURL", "apiKeyEnv"},
+            f"models.{model_profile}",
         )
         _reject_unknown_keys(
             agent_config, {"maxIterations", "maxOutputChars"}, "agent"
@@ -112,25 +145,32 @@ class Settings:
         )
 
         api_key_env = _optional_string(
-            model_config.get("apiKeyEnv"), "model.apiKeyEnv"
+            model_config.get("apiKeyEnv"),
+            f"models.{model_profile}.apiKeyEnv",
         ) or "OPENAI_API_KEY"
         api_key = environ.get(api_key_env, "").strip()
         model = (
             environ.get("LITCODE_MODEL", "").strip()
-            or _optional_string(model_config.get("name"), "model.name")
+            or _optional_string(
+                model_config.get("model"), f"models.{model_profile}.model"
+            )
             or ""
         )
         if not api_key:
             raise ConfigurationError(f"{api_key_env} is required")
         if not model:
             raise ConfigurationError(
-                "model.name or environment variable LITCODE_MODEL is required"
+                "selected model profile or environment variable LITCODE_MODEL "
+                "must provide a model ID"
             )
 
         base_url = (
             environ.get("OPENAI_BASE_URL")
             if "OPENAI_BASE_URL" in environ
-            else _optional_string(model_config.get("baseURL"), "model.baseURL")
+            else _optional_string(
+                model_config.get("baseURL"),
+                f"models.{model_profile}.baseURL",
+            )
         )
         max_iterations = _environment_or_positive_int(
             environ,
@@ -175,6 +215,7 @@ class Settings:
             workspace=workspace,
             api_key=api_key,
             model=model,
+            model_profile=model_profile,
             base_url=base_url or None,
             api_key_env=api_key_env,
             max_iterations=max_iterations,
@@ -191,6 +232,7 @@ class Settings:
         return {
             "workspace": str(self.workspace),
             "config_files": [str(path) for path in self.config_files],
+            "model_profile": self.model_profile,
             "model": self.model,
             "base_url": self.base_url or "provider default",
             "api_key_env": self.api_key_env,

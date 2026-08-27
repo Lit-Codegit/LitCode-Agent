@@ -11,21 +11,29 @@
 
 ```json
 {
-  "model": {
-    "name": "模型名称",
-    "baseURL": "https://example.com/v1",
-    "apiKeyEnv": "OPENAI_API_KEY"
+  "defaultModel": "primary",
+  "models": {
+    "primary": {
+      "model": "主模型 ID",
+      "baseURL": "https://example.com/v1",
+      "apiKeyEnv": "PRIMARY_API_KEY"
+    },
+    "fast": {
+      "model": "快速模型 ID",
+      "baseURL": "https://example.com/v1",
+      "apiKeyEnv": "FAST_API_KEY"
+    }
   }
 }
 ```
 
-`apiKeyEnv` 是环境变量名称，不是密钥本身。真实密钥应在 shell 中设置：
+`defaultModel` 选择 `models` 中的默认配置档。`apiKeyEnv` 是环境变量名称，不是密钥本身。真实密钥应在 shell 中设置：
 
 ```bash
-export OPENAI_API_KEY="你的密钥"
+export PRIMARY_API_KEY="你的密钥"
 ```
 
-环境变量 `LITCODE_MODEL`、`OPENAI_BASE_URL`、`LITCODE_MAX_ITERATIONS`、`LITCODE_MAX_OUTPUT_CHARS`、`LITCODE_COMMAND_TIMEOUT_SECONDS` 和 `LITCODE_COMMAND_POLICY` 可临时覆盖文件配置。
+`LITCODE_DEFAULT_MODEL=fast` 可以临时切换配置档；`LITCODE_MODEL`、`OPENAI_BASE_URL`、`LITCODE_MAX_ITERATIONS`、`LITCODE_MAX_OUTPUT_CHARS`、`LITCODE_COMMAND_TIMEOUT_SECONDS` 和 `LITCODE_COMMAND_POLICY` 可临时覆盖选中配置档中的具体值。
 
 ## Hook 配置
 
