@@ -10,7 +10,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 authors = [{ name = "LitCode-Agent contributors" }]
-dependencies = []
+dependencies = [
+  "openai>=2.0,<3",
+]
 
 [project.scripts]
 litcode = "litcode_agent.cli:main"

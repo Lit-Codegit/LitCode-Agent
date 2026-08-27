@@ -10,8 +10,22 @@ repository.
 
 ## Current status
 
-The project is under active development. The current milestone provides the
-package skeleton, environment-based configuration, and a configuration doctor.
+The core MVP is runnable: it has an OpenAI-compatible model adapter, a bounded
+agent loop, five local tools, environment-based configuration, and a diagnostic
+command. UX and real-repository evaluation are still being refined.
+
+## How it works
+
+```text
+task -> model -> tool calls -> local validation/execution -> tool results
+             ^                                             |
+             +---------------- conversation history <------+
+```
+
+The model can list files, read files, search with `rg`, apply one exact text
+replacement atomically, and run a command with timeout and output limits. File
+paths are resolved inside the selected workspace. Dangerous commands are
+confirmed by default.
 
 ## Development setup
 
@@ -36,3 +50,23 @@ Run the non-secret configuration check with:
 ```bash
 uv run litcode doctor
 ```
+
+Run a task against the current directory:
+
+```bash
+uv run litcode run "Inspect the tests, fix the failing behavior, and verify it."
+```
+
+Or select another workspace:
+
+```bash
+uv run litcode run --workspace ../small-project "Add input validation."
+```
+
+## Safety model
+
+Filesystem tools reject absolute paths, parent traversal, and resolved symlink
+escapes. Commands start in the workspace, have a timeout, and require approval
+when they match dangerous patterns. Command execution is not an OS sandbox: an
+approved shell command can still access resources outside the workspace. Use a
+disposable repository when evaluating an unfamiliar model.
