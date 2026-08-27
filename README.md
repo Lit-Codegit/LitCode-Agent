@@ -6,7 +6,7 @@ LitCode Agent 是一个从零实现的小型编程智能体。它通过 OpenAI-c
 
 ## 当前状态
 
-核心 MVP 已可运行：包含模型适配器、有轮数上限的 Agent 循环、五个本地工具、配置诊断和端到端测试。下一阶段将继续改进真实模型表现和命令行体验。
+核心 MVP 已可运行：包含模型适配器、有轮数上限的 Agent 循环、五个本地工具、配置诊断、模型查询与选择、保留上下文的交互会话和端到端测试。下一阶段将继续用真实模型任务校正提示词和工具行为。
 
 ## 运行原理
 
@@ -38,6 +38,27 @@ export DEEPSEEK_API_KEY="你的密钥"
 uv run litcode doctor
 ```
 
+查询当前 API 端点公开的模型：
+
+```bash
+uv run litcode models
+```
+
+启动交互会话：
+
+```bash
+uv run litcode chat
+```
+
+交互会话会显示用户消息、模型请求轮次、工具参数、工具结果和 hook 状态。它支持以下斜杠命令：
+
+- `/help`：查看命令；
+- `/model`：重新查询 API，通过序号切换当前模型；
+- `/clear`：清空上下文，开始新会话；
+- `/exit`：退出。
+
+`/model` 只影响当前进程，不会改写配置文件；普通消息会保留在当前会话的线性历史中。
+
 在当前目录执行任务：
 
 ```bash
@@ -48,6 +69,12 @@ uv run litcode run "检查测试，修复失败行为并完成验证。"
 
 ```bash
 uv run litcode run --workspace ../small-project "为输入增加校验。"
+```
+
+也可以为单次运行覆盖配置档或具体模型：
+
+```bash
+uv run litcode run --profile fast --model fast-model-id "检查测试。"
 ```
 
 ## 配置与 hooks

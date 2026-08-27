@@ -50,6 +50,35 @@ def test_agent_returns_direct_model_answer() -> None:
     assert model.requests[0][1] == {"role": "user", "content": "Fix it"}
 
 
+def test_session_keeps_context_across_user_turns() -> None:
+    model = FakeModel([AssistantTurn("第一次回答"), AssistantTurn("第二次回答")])
+    session = Agent(model, ToolRegistry([]), 3).start_session()
+
+    first = session.ask("第一个问题")
+    second = session.ask("继续说明")
+    session.close()
+
+    assert first.output == "第一次回答"
+    assert second.output == "第二次回答"
+    assert model.requests[1] == [
+        {"role": "system", "content": model.requests[0][0]["content"]},
+        {"role": "user", "content": "第一个问题"},
+        {"role": "assistant", "content": "第一次回答"},
+        {"role": "user", "content": "继续说明"},
+    ]
+
+
+def test_closed_session_rejects_new_turn() -> None:
+    session = Agent(
+        FakeModel([AssistantTurn("完成")]), ToolRegistry([]), 1
+    ).start_session()
+    session.ask("任务")
+    session.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        session.ask("继续")
+
+
 def test_agent_executes_tool_and_links_result_to_call() -> None:
     model = FakeModel(
         [

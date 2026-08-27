@@ -17,10 +17,22 @@ class FakeCompletions:
         return self.response
 
 
-def fake_client(response):
+class FakeModels:
+    def __init__(self, model_ids: tuple[str, ...] = ()) -> None:
+        self.model_ids = model_ids
+
+    def list(self):
+        return SimpleNamespace(
+            data=[SimpleNamespace(id=model_id) for model_id in self.model_ids]
+        )
+
+
+def fake_client(response, model_ids: tuple[str, ...] = ()):
     completions = FakeCompletions(response)
     return SimpleNamespace(
-        chat=SimpleNamespace(completions=completions), completions=completions
+        chat=SimpleNamespace(completions=completions),
+        completions=completions,
+        models=FakeModels(model_ids),
     )
 
 
@@ -85,3 +97,26 @@ def test_rejects_unsupported_tool_call_type(tmp_path: Path) -> None:
 
     with pytest.raises(ModelError, match="unsupported"):
         OpenAIChatModel(settings(tmp_path), fake_client(response)).complete([], [])
+
+
+def test_lists_sorted_unique_models_and_selects_one(tmp_path: Path) -> None:
+    client = fake_client(
+        SimpleNamespace(choices=[]),
+        ("model-z", "model-a", "model-z"),
+    )
+    model = OpenAIChatModel(settings(tmp_path), client)
+
+    assert model.list_models() == ("model-a", "model-z")
+
+    model.select_model(" model-z ")
+
+    assert model.model == "model-z"
+
+
+def test_rejects_empty_model_selection(tmp_path: Path) -> None:
+    model = OpenAIChatModel(
+        settings(tmp_path), fake_client(SimpleNamespace(choices=[]))
+    )
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        model.select_model("  ")

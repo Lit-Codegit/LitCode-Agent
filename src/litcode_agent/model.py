@@ -100,3 +100,24 @@ class OpenAIChatModel:
             tool_calls=tuple(tool_calls),
             finish_reason=getattr(choice, "finish_reason", None),
         )
+
+    def list_models(self) -> tuple[str, ...]:
+        """查询当前 API 端点公开的模型 ID。"""
+
+        try:
+            response = self.client.models.list()
+        except OpenAIError as error:
+            raise ModelError(f"model query failed: {error}") from error
+        model_ids = {
+            model.id
+            for model in response.data
+            if isinstance(getattr(model, "id", None), str) and model.id
+        }
+        return tuple(sorted(model_ids))
+
+    def select_model(self, model: str) -> None:
+        """切换当前会话后续请求使用的具体模型 ID。"""
+
+        if not model.strip():
+            raise ValueError("model must not be empty")
+        self.model = model.strip()

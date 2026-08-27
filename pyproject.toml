@@ -12,6 +12,7 @@ license = "MIT"
 authors = [{ name = "LitCode-Agent contributors" }]
 dependencies = [
   "openai>=2.0,<3",
+  "rich>=14.0,<15",
 ]
 
 [project.scripts]
