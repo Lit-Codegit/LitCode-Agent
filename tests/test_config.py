@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import pytest
 
@@ -79,3 +80,110 @@ def test_safe_summary_never_contains_api_key(tmp_path: Path) -> None:
 
     assert "do-not-print" not in repr(summary)
     assert summary["api_key_configured"] is True
+
+
+def test_loads_project_and_local_json_with_environment_precedence(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "model": {
+                    "name": "project-model",
+                    "baseURL": "https://project.example/v1",
+                    "apiKeyEnv": "CUSTOM_API_KEY",
+                },
+                "agent": {"maxIterations": 5, "maxOutputChars": 1234},
+            }
+        )
+    )
+    (config_dir / "settings.local.json").write_text(
+        json.dumps({"agent": {"maxIterations": 7}})
+    )
+
+    settings = Settings.load(
+        tmp_path,
+        {
+            "CUSTOM_API_KEY": "secret",
+            "LITCODE_MODEL": "environment-model",
+        },
+    )
+
+    assert settings.model == "environment-model"
+    assert settings.base_url == "https://project.example/v1"
+    assert settings.max_iterations == 7
+    assert settings.max_output_chars == 1234
+    assert settings.api_key_env == "CUSTOM_API_KEY"
+    assert settings.config_files == (
+        config_dir / "settings.json",
+        config_dir / "settings.local.json",
+    )
+
+
+def test_rejects_direct_api_key_in_tracked_configuration(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "model": {
+                    "name": "model",
+                    "apiKey": "must-not-be-stored-here",
+                }
+            }
+        )
+    )
+
+    with pytest.raises(ConfigurationError, match="apiKey"):
+        Settings.load(tmp_path, {"OPENAI_API_KEY": "secret"})
+
+
+def test_parses_claude_style_command_hooks(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "model": {"name": "model"},
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "run_command|apply_patch",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "echo checked",
+                                    "timeout": 2,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        )
+    )
+
+    settings = Settings.load(tmp_path, {"OPENAI_API_KEY": "secret"})
+
+    group = settings.hooks.pre_tool_use[0]
+    assert group.matcher == "run_command|apply_patch"
+    assert group.hooks[0].command == "echo checked"
+    assert group.hooks[0].timeout_seconds == 2
+
+
+def test_rejects_fractional_integer_setting(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "model": {"name": "model"},
+                "agent": {"maxIterations": 1.5},
+            }
+        )
+    )
+
+    with pytest.raises(ConfigurationError, match="agent.maxIterations"):
+        Settings.load(tmp_path, {"OPENAI_API_KEY": "secret"})

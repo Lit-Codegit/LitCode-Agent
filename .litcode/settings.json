@@ -1,0 +1,27 @@
+{
+  "model": {
+    "name": "",
+    "baseURL": "https://api.openai.com/v1",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  },
+  "agent": {
+    "maxIterations": 20,
+    "maxOutputChars": 20000
+  },
+  "permissions": {
+    "dangerousCommands": "confirm"
+  },
+  "tools": {
+    "command": {
+      "timeoutSeconds": 30
+    }
+  },
+  "disableAllHooks": false,
+  "hooks": {
+    "SessionStart": [],
+    "PreToolUse": [],
+    "PostToolUse": [],
+    "PostToolUseFailure": [],
+    "SessionEnd": []
+  }
+}

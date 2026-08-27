@@ -11,6 +11,7 @@ from typing import Sequence
 from litcode_agent import __version__
 from litcode_agent.agent import Agent, AgentEvent
 from litcode_agent.config import ConfigurationError, Settings
+from litcode_agent.hooks import HookRunner
 from litcode_agent.model import ModelError, OpenAIChatModel
 from litcode_agent.tools import build_default_registry
 
@@ -48,14 +49,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "doctor":
         try:
-            settings = Settings.from_env(args.workspace)
+            settings = Settings.load(args.workspace)
         except ConfigurationError as error:
             build_parser().error(str(error))
         print(json.dumps(settings.safe_summary(), indent=2, ensure_ascii=False))
         return 0
     if args.command == "run":
         try:
-            settings = Settings.from_env(args.workspace)
+            settings = Settings.load(args.workspace)
         except ConfigurationError as error:
             build_parser().error(str(error))
         agent = Agent(
@@ -63,6 +64,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             build_default_registry(settings, _confirm_command),
             settings.max_iterations,
             _print_event,
+            HookRunner(settings.workspace, settings.hooks),
         )
         try:
             result = agent.run(args.task)
@@ -89,6 +91,14 @@ def _confirm_command(command: str) -> bool:
 def _print_event(event: AgentEvent) -> None:
     if event.kind == "model_start":
         print(f"[iteration {event.iteration}] asking model", file=sys.stderr)
+        return
+    if event.kind == "hook_result":
+        assert event.hook_execution is not None
+        execution = event.hook_execution
+        status = "timeout" if execution.timed_out else f"exit {execution.return_code}"
+        print(f"[hook {execution.event}] {status}: {execution.command}", file=sys.stderr)
+        if execution.stderr.strip():
+            print(execution.stderr.strip(), file=sys.stderr)
         return
     assert event.tool_call is not None
     if event.kind == "tool_start":
