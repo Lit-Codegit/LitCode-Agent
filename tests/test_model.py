@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from litcode_agent.config import Settings
-from litcode_agent.model import ModelError, OpenAIChatModel
+from litcode_agent.model import ModelDelta, ModelError, OpenAIChatModel
 
 
 class FakeCompletions:
@@ -120,3 +120,77 @@ def test_rejects_empty_model_selection(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must not be empty"):
         model.select_model("  ")
+
+
+def test_stream_normalizes_text_and_split_tool_arguments(tmp_path: Path) -> None:
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason=None,
+                    delta=SimpleNamespace(content="你", tool_calls=None),
+                )
+            ]
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason=None,
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call-1",
+                                function=SimpleNamespace(
+                                    name="read_file", arguments='{"path":'
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ]
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="tool_calls",
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                function=SimpleNamespace(
+                                    name=None, arguments='"a.py"}'
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ]
+        ),
+    ]
+    client = fake_client(chunks)
+
+    deltas = list(
+        OpenAIChatModel(settings(tmp_path), client).stream(
+            [{"role": "user", "content": "读取"}], []
+        )
+    )
+
+    assert deltas == [
+        ModelDelta(content="你"),
+        ModelDelta(
+            tool_index=0,
+            tool_call_id="call-1",
+            tool_name="read_file",
+            tool_arguments='{"path":',
+        ),
+        ModelDelta(
+            tool_index=0,
+            tool_arguments='"a.py"}',
+            finish_reason="tool_calls",
+        ),
+    ]
+    assert client.completions.requests[0]["stream"] is True

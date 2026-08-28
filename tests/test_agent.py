@@ -6,7 +6,13 @@ from collections.abc import Mapping, Sequence
 import pytest
 
 from litcode_agent.agent import Agent, AgentEvent
-from litcode_agent.model import AssistantTurn, Message, ToolCall, ToolSchema
+from litcode_agent.model import (
+    AssistantTurn,
+    Message,
+    ModelDelta,
+    ToolCall,
+    ToolSchema,
+)
 from litcode_agent.tools.base import ToolResult
 from litcode_agent.tools.registry import ToolRegistry
 
@@ -124,9 +130,11 @@ def test_agent_executes_tool_and_links_result_to_call() -> None:
     }
     assert [event.kind for event in events] == [
         "model_start",
+        "model_end",
         "tool_start",
         "tool_result",
         "model_start",
+        "model_end",
     ]
 
 
@@ -168,6 +176,45 @@ def test_agent_reports_empty_model_response() -> None:
 
     assert result.reason == "empty_response"
     assert not result.succeeded
+
+
+def test_agent_accumulates_streamed_text_and_tool_arguments() -> None:
+    class StreamingModel:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def stream(self, messages, tools):
+            self.requests.append(list(messages))
+            if len(self.requests) == 1:
+                yield ModelDelta(
+                    tool_index=0,
+                    tool_call_id="stream-call",
+                    tool_name="echo",
+                    tool_arguments='{"text":',
+                )
+                yield ModelDelta(
+                    tool_index=0,
+                    tool_arguments='"流式"}',
+                    finish_reason="tool_calls",
+                )
+            else:
+                yield ModelDelta(content="完")
+                yield ModelDelta(content="成", finish_reason="stop")
+
+    model = StreamingModel()
+    events: list[AgentEvent] = []
+
+    result = Agent(
+        model, ToolRegistry([EchoTool()]), 3, events.append
+    ).run("执行")
+
+    assert result.output == "完成"
+    assert json.loads(model.requests[1][-1]["content"])["content"] == "流式"
+    assert [event.content for event in events if event.kind == "model_delta"] == [
+        "完",
+        "成",
+    ]
+    assert [event.kind for event in events].count("model_end") == 2
 
 
 @pytest.mark.parametrize("finish_reason", ["length", "content_filter"])

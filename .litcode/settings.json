@@ -9,7 +9,9 @@
   },
   "agent": {
     "maxIterations": 20,
-    "maxOutputChars": 20000
+    "maxOutputChars": 20000,
+    "maxReferenceFileChars": 32768,
+    "maxReferenceChars": 131072
   },
   "permissions": {
     "dangerousCommands": "confirm"

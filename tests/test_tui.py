@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 from textual.widgets import Markdown, Static
 
 from litcode_agent.config import Settings
-from litcode_agent.model import AssistantTurn, ToolCall
+from litcode_agent.model import AssistantTurn, ModelDelta, ToolCall
 from litcode_agent.tui import ConfirmCommand, LitCodeTUI, ModelPicker, PromptArea
 
 
@@ -128,3 +129,101 @@ def test_tui_denies_dangerous_command_in_modal(tmp_path: Path) -> None:
             assert not app.busy
 
     asyncio.run(exercise())
+
+
+def test_slash_command_uses_fuzzy_inline_completion(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = "/mo"
+            prompt.move_cursor((0, 3))
+            await pilot.pause()
+
+            assert app.completion_visible
+            assert "/model" in app.completion_values
+            await pilot.press("enter")
+
+            assert prompt.text == "/model "
+            assert not app.completion_visible
+
+    asyncio.run(exercise())
+
+
+def test_at_completion_references_workspace_file_in_model_prompt(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "main.py").write_text("print('引用内容')", encoding="utf-8")
+
+    async def exercise() -> None:
+        model = FakeModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if "main.py" in app.file_paths:
+                    break
+            prompt = app.query_one(PromptArea)
+            prompt.text = "检查 @ma"
+            prompt.move_cursor((0, len(prompt.text)))
+            await pilot.pause()
+
+            assert app.completion_visible
+            assert "main.py" in app.completion_values
+            await pilot.press("enter")
+            assert prompt.text == "检查 @{main.py}"
+
+            await pilot.press("ctrl+enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if model.requests and not app.busy:
+                    break
+
+            sent = model.requests[0][-1]["content"]
+            assert '<file path="main.py" truncated="false">' in sent
+            assert "print('引用内容')" in sent
+
+    asyncio.run(exercise())
+
+
+def test_tui_renders_first_stream_delta_before_completion(tmp_path: Path) -> None:
+    first_delta = threading.Event()
+    release = threading.Event()
+
+    class StreamingModel(FakeModel):
+        def stream(self, messages, tools):
+            self.requests.append(list(messages))
+            yield ModelDelta(content="流")
+            first_delta.set()
+            release.wait(timeout=2)
+            yield ModelDelta(content="式", finish_reason="stop")
+
+    async def exercise() -> None:
+        model = StreamingModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = "测试流式"
+            await pilot.press("ctrl+enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if first_delta.is_set() and app.streaming_buffer == "流":
+                    break
+
+            assert app.busy
+            assert app.streaming_buffer == "流"
+            assert app.streaming_markdown is not None
+
+            release.set()
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if not app.busy:
+                    break
+
+            assert not app.busy
+            assert len(list(app.query(Markdown))) == 1
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()

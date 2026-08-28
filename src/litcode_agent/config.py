@@ -31,6 +31,8 @@ class Settings:
     max_iterations: int = 20
     command_timeout_seconds: float = 30.0
     max_output_chars: int = 20_000
+    max_reference_file_chars: int = 32_768
+    max_reference_chars: int = 131_072
     command_policy: CommandPolicy = "confirm"
     hooks: HookSettings = HookSettings()
     config_files: tuple[Path, ...] = ()
@@ -134,7 +136,14 @@ class Settings:
             f"models.{model_profile}",
         )
         _reject_unknown_keys(
-            agent_config, {"maxIterations", "maxOutputChars"}, "agent"
+            agent_config,
+            {
+                "maxIterations",
+                "maxOutputChars",
+                "maxReferenceFileChars",
+                "maxReferenceChars",
+            },
+            "agent",
         )
         _reject_unknown_keys(
             permissions, {"dangerousCommands"}, "permissions"
@@ -186,6 +195,25 @@ class Settings:
             "agent.maxOutputChars",
             20_000,
         )
+        max_reference_file_chars = _environment_or_positive_int(
+            environ,
+            "LITCODE_MAX_REFERENCE_FILE_CHARS",
+            agent_config.get("maxReferenceFileChars"),
+            "agent.maxReferenceFileChars",
+            32_768,
+        )
+        max_reference_chars = _environment_or_positive_int(
+            environ,
+            "LITCODE_MAX_REFERENCE_CHARS",
+            agent_config.get("maxReferenceChars"),
+            "agent.maxReferenceChars",
+            131_072,
+        )
+        if max_reference_file_chars > max_reference_chars:
+            raise ConfigurationError(
+                "agent.maxReferenceFileChars must not exceed "
+                "agent.maxReferenceChars"
+            )
         command_timeout = _environment_or_positive_float(
             environ,
             "LITCODE_COMMAND_TIMEOUT_SECONDS",
@@ -221,6 +249,8 @@ class Settings:
             max_iterations=max_iterations,
             command_timeout_seconds=command_timeout,
             max_output_chars=max_output_chars,
+            max_reference_file_chars=max_reference_file_chars,
+            max_reference_chars=max_reference_chars,
             command_policy=cast(CommandPolicy, policy_value),
             hooks=_parse_hooks(raw.get("hooks"), disabled),
             config_files=config_files,
@@ -240,6 +270,8 @@ class Settings:
             "max_iterations": self.max_iterations,
             "command_timeout_seconds": self.command_timeout_seconds,
             "max_output_chars": self.max_output_chars,
+            "max_reference_file_chars": self.max_reference_file_chars,
+            "max_reference_chars": self.max_reference_chars,
             "command_policy": self.command_policy,
             "hooks_enabled": not self.hooks.disabled,
             "hook_commands": self.hooks.count,

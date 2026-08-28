@@ -16,6 +16,8 @@ def test_loads_and_normalizes_settings(tmp_path: Path) -> None:
             "LITCODE_MAX_ITERATIONS": "7",
             "LITCODE_COMMAND_TIMEOUT_SECONDS": "2.5",
             "LITCODE_MAX_OUTPUT_CHARS": "1234",
+            "LITCODE_MAX_REFERENCE_FILE_CHARS": "2048",
+            "LITCODE_MAX_REFERENCE_CHARS": "8192",
             "LITCODE_COMMAND_POLICY": "deny",
         },
     )
@@ -26,6 +28,8 @@ def test_loads_and_normalizes_settings(tmp_path: Path) -> None:
     assert settings.max_iterations == 7
     assert settings.command_timeout_seconds == 2.5
     assert settings.max_output_chars == 1234
+    assert settings.max_reference_file_chars == 2048
+    assert settings.max_reference_chars == 8192
     assert settings.command_policy == "deny"
 
 
@@ -38,6 +42,8 @@ def test_uses_safe_defaults(tmp_path: Path) -> None:
     assert settings.max_iterations == 20
     assert settings.command_timeout_seconds == 30.0
     assert settings.max_output_chars == 20_000
+    assert settings.max_reference_file_chars == 32_768
+    assert settings.max_reference_chars == 131_072
     assert settings.command_policy == "confirm"
 
 
@@ -56,6 +62,8 @@ def test_requires_model_credentials(tmp_path: Path, missing: str) -> None:
         ("LITCODE_MAX_ITERATIONS", "0"),
         ("LITCODE_COMMAND_TIMEOUT_SECONDS", "later"),
         ("LITCODE_MAX_OUTPUT_CHARS", "-1"),
+        ("LITCODE_MAX_REFERENCE_FILE_CHARS", "0"),
+        ("LITCODE_MAX_REFERENCE_CHARS", "many"),
         ("LITCODE_COMMAND_POLICY", "sometimes"),
     ],
 )
@@ -80,6 +88,19 @@ def test_safe_summary_never_contains_api_key(tmp_path: Path) -> None:
 
     assert "do-not-print" not in repr(summary)
     assert summary["api_key_configured"] is True
+
+
+def test_rejects_per_file_reference_limit_above_total(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError, match="must not exceed"):
+        Settings.from_env(
+            tmp_path,
+            {
+                "OPENAI_API_KEY": "secret",
+                "LITCODE_MODEL": "example-model",
+                "LITCODE_MAX_REFERENCE_FILE_CHARS": "101",
+                "LITCODE_MAX_REFERENCE_CHARS": "100",
+            },
+        )
 
 
 def test_loads_project_and_local_json_with_environment_precedence(

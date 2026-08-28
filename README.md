@@ -58,7 +58,9 @@ uv run litcode ../small-project
 
 `uv run litcode chat [路径]` 作为兼容写法继续可用。
 
-TUI 中央是可滚动的对话和工具时间线，底部是固定的多行输入区，状态栏显示工作区、配置档、模型与当前阶段。工具卡片可以展开或折叠，危险命令会通过弹窗确认。
+TUI 中央是可滚动的对话和工具时间线，底部是固定的多行输入区，状态栏显示工作区、配置档、模型与当前阶段。模型文本会实时流式显示；工具卡片可以展开或折叠，危险命令会通过弹窗确认。
+
+输入 `/` 会打开命令模糊补全；输入 `@` 会搜索当前工作区文件。选择文件后会插入 `@{relative/path}`，提交时 LitCode 将受大小限制的 UTF-8 文本快照附在本轮模型上下文中。引用仍受工作区 real-path 边界保护，敏感文件、二进制文件和越界路径会被拒绝。
 
 快捷键：
 
@@ -98,10 +100,12 @@ uv run litcode run --profile fast --model fast-model-id "检查测试。"
 
 `.litcode/settings.json` 通过 `defaultModel` 和 `models` 管理多个模型/API 配置档，也可以配置 Agent 限制、命令策略和生命周期 hooks。`.litcode/settings.local.json` 可覆盖项目配置，适合本机差异，并已被 Git 忽略。环境变量优先级最高，便于临时切换模型或网关。
 
+`agent.maxReferenceFileChars` 和 `agent.maxReferenceChars` 分别限制单个引用文件和单轮全部引用的字符数，避免 `@` 引用无边界占用模型上下文。
+
 Hook 配置借鉴 Claude Code 的事件、matcher 和 command handler 结构。命令从标准输入接收 JSON 事件。具体格式见 [配置说明](.litcode/README.md)。
 
 ## 安全模型
 
 文件工具拒绝绝对路径、父目录穿越和解析后的符号链接逃逸。命令从工作区启动，具有超时限制，并在匹配危险模式时要求确认。
 
-命令执行不是操作系统沙箱：得到允许的 shell 命令仍可能访问工作区以外的资源。评估不熟悉的模型时，请使用一次性测试仓库。
+命令执行不是操作系统沙箱：得到允许的 shell 命令仍可能访问工作区以外的资源。文件引用内容也会发送到配置的模型 API；评估不熟悉的模型时，请使用一次性测试仓库。

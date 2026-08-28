@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,7 +11,14 @@ from pathlib import Path
 from typing import Literal
 
 from litcode_agent.hooks import HookEvent, HookExecution, HookOutcome, HookRunner
-from litcode_agent.model import Message, Model, ModelError, ToolCall
+from litcode_agent.model import (
+    AssistantTurn,
+    Message,
+    Model,
+    ModelDelta,
+    ModelError,
+    ToolCall,
+)
 from litcode_agent.tools.base import ToolResult
 from litcode_agent.tools.registry import ToolRegistry
 
@@ -35,12 +43,20 @@ TerminationReason = Literal[
 
 @dataclass(frozen=True, slots=True)
 class AgentEvent:
-    kind: Literal["model_start", "tool_start", "tool_result", "hook_result"]
+    kind: Literal[
+        "model_start",
+        "model_delta",
+        "model_end",
+        "tool_start",
+        "tool_result",
+        "hook_result",
+    ]
     iteration: int
     tool_call: ToolCall | None = None
     hook_execution: HookExecution | None = None
     content: str | None = None
     is_error: bool = False
+    has_tool_calls: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,10 +180,11 @@ class AgentSession:
             self.agent.event_sink(
                 AgentEvent(kind="model_start", iteration=iteration)
             )
-            turn = self.agent.model.complete(
-                self.messages, self.agent.tools.schemas()
+            turn, stream_cancelled = self._request_model(
+                iteration,
+                cancelled,
             )
-            if cancelled():
+            if stream_cancelled or cancelled():
                 return self._cancelled(iteration)
             self.messages.append(turn.as_message())
             if not turn.tool_calls:
@@ -199,6 +216,96 @@ class AgentSession:
             f"Stopped after reaching the {self.agent.max_iterations}-iteration limit.",
             "max_iterations",
             self.agent.max_iterations,
+        )
+
+    def _request_model(
+        self,
+        iteration: int,
+        cancelled: Callable[[], bool],
+    ) -> tuple[AssistantTurn, bool]:
+        stream = getattr(self.agent.model, "stream", None)
+        if not callable(stream):
+            turn = self.agent.model.complete(
+                self.messages, self.agent.tools.schemas()
+            )
+            self.agent.event_sink(
+                AgentEvent(
+                    kind="model_end",
+                    iteration=iteration,
+                    content=turn.content,
+                    has_tool_calls=bool(turn.tool_calls),
+                )
+            )
+            return turn, False
+
+        content_parts: list[str] = []
+        tools: dict[int, dict[str, str]] = {}
+        finish_reason: str | None = None
+        pending_text: list[str] = []
+        last_flush = 0.0
+        stream_cancelled = False
+        deltas = stream(self.messages, self.agent.tools.schemas())
+        try:
+            for delta in deltas:
+                if cancelled():
+                    stream_cancelled = True
+                    break
+                if not isinstance(delta, ModelDelta):
+                    raise ModelError("model stream returned an invalid delta")
+                if delta.content:
+                    content_parts.append(delta.content)
+                    pending_text.append(delta.content)
+                if delta.tool_index is not None:
+                    tool = tools.setdefault(
+                        delta.tool_index,
+                        {"id": "", "name": "", "arguments": ""},
+                    )
+                    tool["id"] += delta.tool_call_id
+                    tool["name"] += delta.tool_name
+                    tool["arguments"] += delta.tool_arguments
+                if delta.finish_reason is not None:
+                    finish_reason = delta.finish_reason
+                if pending_text and time.monotonic() - last_flush >= 0.04:
+                    self._emit_delta(iteration, "".join(pending_text))
+                    pending_text.clear()
+                    last_flush = time.monotonic()
+        finally:
+            close = getattr(deltas, "close", None)
+            if callable(close):
+                close()
+        if pending_text:
+            self._emit_delta(iteration, "".join(pending_text))
+
+        tool_calls = tuple(
+            ToolCall(
+                value["id"] or f"tool-{index}",
+                value["name"],
+                value["arguments"],
+            )
+            for index, value in sorted(tools.items())
+        )
+        turn = AssistantTurn(
+            "".join(content_parts) or None,
+            tool_calls,
+            finish_reason,
+        )
+        self.agent.event_sink(
+            AgentEvent(
+                kind="model_end",
+                iteration=iteration,
+                content=turn.content,
+                has_tool_calls=bool(tool_calls),
+            )
+        )
+        return turn, stream_cancelled
+
+    def _emit_delta(self, iteration: int, content: str) -> None:
+        self.agent.event_sink(
+            AgentEvent(
+                kind="model_delta",
+                iteration=iteration,
+                content=content,
+            )
         )
 
     def _cancelled(self, iteration: int) -> AgentResult:

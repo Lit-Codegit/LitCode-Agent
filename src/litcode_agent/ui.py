@@ -113,6 +113,8 @@ class TerminalUI:
                 f"[dim]第 {event.iteration} 轮 · 正在请求模型…[/dim]"
             )
             return
+        if event.kind in {"model_delta", "model_end"}:
+            return
         if event.kind == "hook_result":
             self._show_hook(event)
             return
