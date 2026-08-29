@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 import threading
 from dataclasses import dataclass
@@ -37,8 +36,9 @@ from litcode_agent.references import (
     ReferenceBundle,
     ReferenceError,
     build_reference_bundle,
-    list_workspace_files,
+    list_workspace_entries,
 )
+from litcode_agent.tool_display import tool_result_summary, tool_title
 from litcode_agent.tools import build_default_registry
 from litcode_agent.tools.workspace import Workspace
 
@@ -205,6 +205,12 @@ class LitCodeTUI(App[None]):
         background: $boost;
         border-left: thick $accent;
     }
+    Collapsible.tool-succeeded {
+        border-left: thick $success;
+    }
+    Collapsible.tool-failed {
+        border-left: thick $error;
+    }
     #composer {
         height: 7;
         padding: 0 1 1 1;
@@ -286,8 +292,10 @@ class LitCodeTUI(App[None]):
         self.busy = False
         self.pending_confirmations: set[threading.Event] = set()
         self.tool_bodies: dict[str, Static] = {}
+        self.tool_cards: dict[str, Collapsible] = {}
         self.workspace = Workspace(settings.workspace)
         self.file_paths: tuple[str, ...] = ()
+        self.directory_paths: tuple[str, ...] = ()
         self.completion_context: CompletionContext | None = None
         self.completion_values: list[str] = []
         self.streaming_markdown: Markdown | None = None
@@ -466,6 +474,7 @@ class LitCodeTUI(App[None]):
         timeline = self.query_one("#timeline", VerticalScroll)
         timeline.remove_children()
         self.tool_bodies.clear()
+        self.tool_cards.clear()
         self.streaming_markdown = None
         self.rendered_output = None
         self._append_notice("对话上下文已清空。")
@@ -543,30 +552,27 @@ class LitCodeTUI(App[None]):
         self._mount_timeline(Static(Text(content), classes=classes))
 
     def _append_tool(self, tool_call: ToolCall) -> None:
-        body = Static(Text(_pretty_json(tool_call.arguments)))
-        self.tool_bodies[tool_call.id] = body
-        self._mount_timeline(
-            Collapsible(
-                body,
-                title=f"工具 · {tool_call.name}",
-                collapsed=False,
-            )
+        body = Static(Text("运行中…"))
+        card = Collapsible(
+            body,
+            title=tool_title(tool_call, "●"),
+            collapsed=True,
         )
+        self.tool_bodies[tool_call.id] = body
+        self.tool_cards[tool_call.id] = card
+        self._mount_timeline(card)
 
     def _finish_tool(
         self, tool_call: ToolCall, content: str, is_error: bool
     ) -> None:
         body = self.tool_bodies.get(tool_call.id)
-        if body is None:
+        card = self.tool_cards.get(tool_call.id)
+        if body is None or card is None:
             self._append_notice(content, error=is_error)
             return
-        label = "失败" if is_error else "完成"
-        body.update(
-            Text(
-                f"参数\n{_pretty_json(tool_call.arguments)}"
-                f"\n\n结果 · {label}\n{content}"
-            )
-        )
+        card.title = tool_title(tool_call, "✗" if is_error else "✓")
+        card.add_class("tool-failed" if is_error else "tool-succeeded")
+        body.update(Text(tool_result_summary(content, is_error)))
 
     def _finish_turn(self, output: str, succeeded: bool) -> None:
         if output != self.rendered_output:
@@ -645,11 +651,20 @@ class LitCodeTUI(App[None]):
             widget.update("_模型没有返回文本。_")
 
     def _build_file_index(self) -> None:
-        paths = list_workspace_files(self.workspace)
-        self.call_from_thread(self._file_index_ready, paths)
+        entries = list_workspace_entries(self.workspace)
+        self.call_from_thread(
+            self._file_index_ready,
+            entries.files,
+            entries.directories,
+        )
 
-    def _file_index_ready(self, paths: tuple[str, ...]) -> None:
-        self.file_paths = paths
+    def _file_index_ready(
+        self,
+        files: tuple[str, ...],
+        directories: tuple[str, ...],
+    ) -> None:
+        self.file_paths = files
+        self.directory_paths = directories
         self.refresh_completions()
 
     @property
@@ -668,7 +683,10 @@ class LitCodeTUI(App[None]):
             matches = _fuzzy_matches(context.query, candidates, 8)
             labels = [f"{name:<10} {descriptions[name]}" for name in matches]
         else:
-            matches = _fuzzy_matches(context.query, self.file_paths, 30)
+            paths = [*self.directory_paths, *self.file_paths]
+            matches = _fuzzy_matches(context.query, paths, 30)
+            if context.query.endswith("/"):
+                matches = [path for path in matches if path != context.query]
             labels = matches
         if not matches:
             self.hide_completions()
@@ -708,7 +726,13 @@ class LitCodeTUI(App[None]):
         if context is None or not 0 <= index < len(self.completion_values):
             return
         value = self.completion_values[index]
-        replacement = f"{value} " if context.kind == "command" else f"@{{{value}}}"
+        is_directory = context.kind == "file" and value.endswith("/")
+        if context.kind == "command":
+            replacement = f"{value} "
+        elif is_directory:
+            replacement = f"@{{{value}"
+        else:
+            replacement = f"@{{{value}}}"
         prompt = self.query_one(PromptArea)
         end = (context.row, context.end_column)
         prompt.replace(
@@ -720,6 +744,8 @@ class LitCodeTUI(App[None]):
             (context.row, context.start_column + len(replacement))
         )
         self.hide_completions()
+        if is_directory:
+            self.refresh_completions()
 
 
 def _completion_context(prompt: PromptArea) -> CompletionContext | None:
@@ -772,13 +798,6 @@ def _fuzzy_matches(
 def run_tui(settings: Settings, model: OpenAIChatModel) -> int:
     LitCodeTUI(settings, model).run()
     return 0
-
-
-def _pretty_json(raw: str) -> str:
-    try:
-        return json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
-    except json.JSONDecodeError:
-        return raw
 
 
 def _model_label(model: str, current: str) -> str:

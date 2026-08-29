@@ -58,10 +58,24 @@ class ReferenceBundle:
     references: tuple[FileReference, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class WorkspaceEntries:
+    files: tuple[str, ...]
+    directories: tuple[str, ...]
+
+
 def list_workspace_files(
     workspace: Workspace, timeout: float = 10.0
 ) -> tuple[str, ...]:
     """优先用 rg 建立遵守 ignore 规则的相对路径索引。"""
+
+    return list_workspace_entries(workspace, timeout).files
+
+
+def list_workspace_entries(
+    workspace: Workspace, timeout: float = 10.0
+) -> WorkspaceEntries:
+    """返回可引用文件，以及由文件路径推导出的可导航目录。"""
 
     try:
         completed = subprocess.run(
@@ -73,15 +87,18 @@ def list_workspace_files(
             check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return _fallback_files(workspace)
+        files = _fallback_files(workspace)
+        return WorkspaceEntries(files, _directories(files))
     if completed.returncode not in {0, 1}:
-        return _fallback_files(workspace)
+        files = _fallback_files(workspace)
+        return WorkspaceEntries(files, _directories(files))
     paths = {
         path
         for line in completed.stdout.splitlines()
         if (path := _safe_index_path(workspace, line)) is not None
     }
-    return tuple(sorted(paths))
+    files = tuple(sorted(paths))
+    return WorkspaceEntries(files, _directories(files))
 
 
 def build_reference_bundle(
@@ -170,6 +187,16 @@ def _fallback_files(workspace: Workspace) -> tuple[str, ...]:
             if not _is_sensitive(display):
                 paths.append(display)
     return tuple(paths)
+
+
+def _directories(files: tuple[str, ...]) -> tuple[str, ...]:
+    directories: set[str] = set()
+    for raw_path in files:
+        parent = Path(raw_path).parent
+        while parent != Path("."):
+            directories.add(f"{parent.as_posix()}/")
+            parent = parent.parent
+    return tuple(sorted(directories))
 
 
 def _safe_index_path(workspace: Workspace, raw_path: str) -> str | None:

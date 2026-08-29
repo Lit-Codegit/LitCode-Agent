@@ -4,7 +4,7 @@ import asyncio
 import threading
 from pathlib import Path
 
-from textual.widgets import Markdown, Static
+from textual.widgets import Collapsible, Markdown, Static
 
 from litcode_agent.config import Settings
 from litcode_agent.model import AssistantTurn, ModelDelta, ToolCall
@@ -182,6 +182,78 @@ def test_at_completion_references_workspace_file_in_model_prompt(
             sent = model.requests[0][-1]["content"]
             assert '<file path="main.py" truncated="false">' in sent
             assert "print('引用内容')" in sent
+
+    asyncio.run(exercise())
+
+
+def test_at_completion_can_navigate_directories(tmp_path: Path) -> None:
+    nested = tmp_path / "src" / "package"
+    nested.mkdir(parents=True)
+    (nested / "main.py").write_text("pass", encoding="utf-8")
+
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if "src/package/main.py" in app.file_paths:
+                    break
+            prompt = app.query_one(PromptArea)
+            prompt.text = "检查 @sr"
+            prompt.move_cursor((0, len(prompt.text)))
+            await pilot.pause()
+
+            assert "src/" in app.completion_values
+            app._insert_completion(app.completion_values.index("src/"))
+            await pilot.pause()
+
+            assert prompt.text == "检查 @{src/"
+            assert "src/package/" in app.completion_values
+            assert "src/package/main.py" in app.completion_values
+
+    asyncio.run(exercise())
+
+
+def test_tool_card_is_collapsed_with_key_argument_and_bounded_summary(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "README.md").write_text("工具摘要", encoding="utf-8")
+
+    class ToolModel(FakeModel):
+        def complete(self, messages, tools):
+            self.requests.append(list(messages))
+            if len(self.requests) == 1:
+                return AssistantTurn(
+                    None,
+                    (
+                        ToolCall(
+                            "read",
+                            "read_file",
+                            '{"path":"README.md","start_line":1,"end_line":10}',
+                        ),
+                    ),
+                )
+            return AssistantTurn("完成")
+
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), ToolModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = "读取文件"
+            await pilot.press("ctrl+enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if not app.busy and "read" in app.tool_cards:
+                    break
+
+            card = app.tool_cards["read"]
+            body = app.tool_bodies["read"]
+            assert isinstance(card, Collapsible)
+            assert card.collapsed
+            assert card.title == "✓ read_file · README.md · 1–10"
+            assert "状态：成功" in str(body.render())
+            assert "工具摘要" in str(body.render())
+            assert '"path"' not in str(body.render())
 
     asyncio.run(exercise())
 

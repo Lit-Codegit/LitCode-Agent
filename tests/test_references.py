@@ -5,6 +5,7 @@ import pytest
 from litcode_agent.references import (
     ReferenceError,
     build_reference_bundle,
+    list_workspace_entries,
     list_workspace_files,
 )
 from litcode_agent.tools.workspace import Workspace
@@ -83,3 +84,16 @@ def test_file_index_lists_regular_files_but_not_sensitive_files(
 
     assert "main.py" in paths
     assert ".env" not in paths
+
+
+def test_workspace_index_includes_navigable_parent_directories(
+    tmp_path: Path,
+) -> None:
+    nested = tmp_path / "src" / "package"
+    nested.mkdir(parents=True)
+    (nested / "main.py").write_text("pass", encoding="utf-8")
+
+    entries = list_workspace_entries(Workspace(tmp_path))
+
+    assert entries.files == ("src/package/main.py",)
+    assert entries.directories == ("src/", "src/package/")
