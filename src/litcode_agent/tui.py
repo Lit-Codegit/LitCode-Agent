@@ -36,17 +36,32 @@ from litcode_agent.references import (
     ReferenceBundle,
     ReferenceError,
     build_reference_bundle,
-    list_workspace_entries,
+    list_reference_entries,
 )
+from litcode_agent.prompt import PromptBuilder
+from litcode_agent.session_store import Checkpoint, SessionStore
 from litcode_agent.tool_display import tool_result_summary, tool_title
 from litcode_agent.tools import build_default_registry
 from litcode_agent.tools.workspace import Workspace
 
+@dataclass(frozen=True, slots=True)
+class CommandSpec:
+    name: str
+    description: str
+    handler: str
+    aliases: tuple[str, ...] = ()
+
+
 COMMANDS = (
-    ("/help", "显示命令帮助"),
-    ("/model", "查询并选择模型"),
-    ("/clear", "清空当前对话上下文"),
-    ("/exit", "退出 LitCode"),
+    CommandSpec("/help", "显示命令帮助", "help"),
+    CommandSpec("/model", "查询并选择模型", "model", ("/models",)),
+    CommandSpec("/clear", "新建空白会话", "clear"),
+    CommandSpec("/sessions", "选择并恢复会话", "sessions", ("/resume",)),
+    CommandSpec("/compact", "压缩当前上下文", "compact"),
+    CommandSpec("/rewind", "回到历史检查点", "rewind"),
+    CommandSpec("/redo", "撤销最近一次 rewind", "redo"),
+    CommandSpec("/fork", "从检查点创建分支", "fork"),
+    CommandSpec("/exit", "退出 LitCode", "exit", ("/quit",)),
 )
 
 
@@ -150,6 +165,57 @@ class ConfirmCommand(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class ChoicePicker(ModalScreen[str | None]):
+    """Generic keyboard picker used for sessions and checkpoints."""
+
+    BINDINGS = [Binding("escape", "cancel", "取消")]
+
+    def __init__(self, title: str, choices: tuple[tuple[str, str], ...]) -> None:
+        super().__init__()
+        self.dialog_title = title
+        self.choices = choices
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="model-dialog"):
+            yield Label(self.dialog_title, classes="dialog-title")
+            yield ListView(
+                *(ListItem(Label(label)) for _, label in self.choices),
+                initial_index=0,
+                id="model-list",
+            )
+            yield Label("Enter 选择 · Esc 取消", classes="dialog-help")
+
+    @on(ListView.Selected)
+    def selected(self, event: ListView.Selected) -> None:
+        if event.list_view.index is not None:
+            self.dismiss(self.choices[event.list_view.index][0])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class RewindMode(ModalScreen[str | None]):
+    """Choose whether a rewind also restores agent-edited files."""
+
+    BINDINGS = [Binding("escape", "cancel", "取消")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Label("选择回退范围", classes="dialog-title")
+            yield Static("文件回退只覆盖仍与 Agent 写入结果一致的文件。")
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("仅对话", id="dialogue")
+                yield Button("对话和文件", id="files", variant="warning")
+                yield Button("取消", id="cancel")
+
+    @on(Button.Pressed)
+    def choose(self, event: Button.Pressed) -> None:
+        self.dismiss(None if event.button.id == "cancel" else event.button.id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class LitCodeTUI(App[None]):
     """LitCode Agent 的常驻全屏界面。"""
 
@@ -241,7 +307,7 @@ class LitCodeTUI(App[None]):
     Footer {
         height: 1;
     }
-    ModelPicker, ConfirmCommand {
+    ModelPicker, ConfirmCommand, ChoicePicker, RewindMode {
         align: center middle;
         background: $background 70%;
     }
@@ -294,6 +360,8 @@ class LitCodeTUI(App[None]):
         self.tool_bodies: dict[str, Static] = {}
         self.tool_cards: dict[str, Collapsible] = {}
         self.workspace = Workspace(settings.workspace)
+        assert settings.session_database is not None
+        self.store = SessionStore(settings.session_database)
         self.file_paths: tuple[str, ...] = ()
         self.directory_paths: tuple[str, ...] = ()
         self.completion_context: CompletionContext | None = None
@@ -307,6 +375,10 @@ class LitCodeTUI(App[None]):
             settings.max_iterations,
             self.receive_agent_event,
             HookRunner(settings.workspace, settings.hooks),
+            PromptBuilder(settings.workspace, settings.max_iterations).build(),
+            self.store,
+            model.model,
+            settings.workspace,
         )
         self.session: AgentSession = self.agent.start_session()
 
@@ -345,6 +417,7 @@ class LitCodeTUI(App[None]):
         for confirmation in self.pending_confirmations:
             confirmation.set()
         self.session.close("user_exit", "")
+        self.store.close()
 
     @on(PromptArea.Submitted)
     def submit_prompt(self, event: PromptArea.Submitted) -> None:
@@ -362,6 +435,7 @@ class LitCodeTUI(App[None]):
                 self.workspace,
                 max_file_chars=self.settings.max_reference_file_chars,
                 max_total_chars=self.settings.max_reference_chars,
+                read_roots=self.settings.read_roots,
             )
         except ReferenceError as error:
             self._append_notice(str(error), error=True)
@@ -440,21 +514,34 @@ class LitCodeTUI(App[None]):
         )
 
     def _handle_command(self, command: str) -> None:
-        if command in {"/exit", "/quit"}:
-            self.action_cancel_or_quit()
-        elif command == "/help":
-            self._append_notice(
-                "/model 选择模型 · /clear 清空上下文 · /exit 退出 · "
-                "Ctrl+Enter 发送"
-            )
-        elif command in {"/model", "/models"}:
-            self.action_choose_model()
-        elif command == "/clear":
-            self.action_clear_session()
-        else:
+        name, _, arguments = command.strip().partition(" ")
+        spec = next(
+            (item for item in COMMANDS if name == item.name or name in item.aliases),
+            None,
+        )
+        if spec is None:
             self._append_notice(
                 "未知命令；输入 /help 查看帮助。", error=True
             )
+            return
+        handlers = {
+            "exit": lambda: self.action_cancel_or_quit(),
+            "help": self._show_help,
+            "model": self.action_choose_model,
+            "clear": self.action_clear_session,
+            "sessions": self.action_choose_session,
+            "compact": lambda: self.action_compact(arguments),
+            "rewind": self.action_rewind,
+            "redo": self.action_redo,
+            "fork": self.action_fork,
+        }
+        handlers[spec.handler]()
+
+    def _show_help(self) -> None:
+        self._append_notice(
+            " · ".join(f"{item.name} {item.description}" for item in COMMANDS)
+            + " · Ctrl+Enter 发送"
+        )
 
     def action_cancel_or_quit(self) -> None:
         if self.busy:
@@ -478,6 +565,129 @@ class LitCodeTUI(App[None]):
         self.streaming_markdown = None
         self.rendered_output = None
         self._append_notice("对话上下文已清空。")
+
+    def action_choose_session(self) -> None:
+        sessions = self.store.list_sessions(self.settings.workspace)
+        choices = tuple(
+            (item.id, f"{item.title} · {item.model} · {item.id[:8]}")
+            for item in sessions
+        )
+        if not choices:
+            self._append_notice("没有可恢复的会话。")
+            return
+        self.push_screen(ChoicePicker("恢复会话", choices), self._session_selected)
+
+    def _session_selected(self, identifier: str | None) -> None:
+        if identifier is None or identifier == self.session.session_id:
+            return
+        self.session.close("user_switch", "")
+        info = self.store.session_info(identifier)
+        self.model.select_model(info.model)
+        self.agent.model_name = info.model
+        self.session = self.agent.start_session(identifier)
+        self._render_session_history("已恢复会话")
+
+    def action_compact(self, instructions: str = "") -> None:
+        if self.busy:
+            self._append_notice("当前任务结束后才能压缩。", error=True)
+            return
+        self._set_busy(True, "正在压缩上下文…")
+        self.run_worker(
+            lambda: self._compact_worker(instructions),
+            name="compact",
+            group="agent",
+            thread=True,
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    def _compact_worker(self, instructions: str) -> None:
+        try:
+            summary = self.session.compact(instructions)
+        except (ModelError, ValueError) as error:
+            self.call_from_thread(self._finish_with_error, str(error))
+            return
+        self.call_from_thread(self._compact_finished, summary)
+
+    def _compact_finished(self, summary: str) -> None:
+        self._append_notice(f"上下文已压缩：\n{summary[:1200]}")
+        self._set_busy(False, "就绪")
+
+    def action_rewind(self) -> None:
+        self._choose_checkpoint("选择 rewind 检查点", self._rewind_checkpoint)
+
+    def _rewind_checkpoint(self, identifier: str | None) -> None:
+        checkpoint = self._checkpoint(identifier)
+        if checkpoint is not None:
+            self._pending_checkpoint = checkpoint
+            self.push_screen(RewindMode(), self._rewind_mode_selected)
+
+    def _rewind_mode_selected(self, mode: str | None) -> None:
+        checkpoint = getattr(self, "_pending_checkpoint", None)
+        if checkpoint is None or mode is None:
+            return
+        try:
+            count = self.session.rewind(checkpoint, restore_files=mode == "files")
+        except RuntimeError as error:
+            self._append_notice(str(error), error=True)
+            return
+        self._render_session_history(
+            f"已回到检查点：{checkpoint.label}；恢复文件 {count} 个"
+        )
+
+    def action_redo(self) -> None:
+        try:
+            count = self.session.redo()
+        except RuntimeError as error:
+            self._append_notice(str(error), error=True)
+            return
+        self._render_session_history(f"已撤销 rewind；恢复文件 {count} 个")
+
+    def action_fork(self) -> None:
+        self._choose_checkpoint("选择 fork 检查点", self._fork_checkpoint)
+
+    def _fork_checkpoint(self, identifier: str | None) -> None:
+        checkpoint = self._checkpoint(identifier)
+        if checkpoint is None:
+            return
+        self.session.close("user_fork", "")
+        self.session = self.session.fork(checkpoint)
+        self._render_session_history(f"已从检查点创建分支：{checkpoint.label}")
+
+    def _choose_checkpoint(self, title: str, callback) -> None:
+        checkpoints = self.session.checkpoints()
+        choices = tuple(
+            (item.id, f"{item.label} · {item.id[:8]}") for item in checkpoints
+        )
+        if not choices:
+            self._append_notice("当前会话还没有检查点。")
+            return
+        self.push_screen(ChoicePicker(title, choices), callback)
+
+    def _checkpoint(self, identifier: str | None) -> Checkpoint | None:
+        if identifier is None:
+            return None
+        return next(
+            (item for item in self.session.checkpoints() if item.id == identifier),
+            None,
+        )
+
+    def _render_session_history(self, notice: str) -> None:
+        timeline = self.query_one("#timeline", VerticalScroll)
+        timeline.remove_children()
+        self.tool_bodies.clear()
+        self.tool_cards.clear()
+        for message in self.session.messages[1:]:
+            content = message.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            if message.get("role") == "user":
+                self._mount_timeline(
+                    Static(Text(_display_user_content(content)), classes="message-user")
+                )
+            elif message.get("role") == "assistant":
+                self._append_assistant(content)
+        self._append_notice(notice)
 
     def action_choose_model(self) -> None:
         if self.busy:
@@ -513,6 +723,8 @@ class LitCodeTUI(App[None]):
     def _model_selected(self, selected: str | None) -> None:
         if selected and selected != self.model.model:
             self.model.select_model(selected)
+            self.agent.model_name = selected
+            self.store.update_model(self.session.session_id, selected)
             self._append_notice(
                 f"已切换到模型 {selected}；对话上下文保持不变。"
             )
@@ -651,7 +863,7 @@ class LitCodeTUI(App[None]):
             widget.update("_模型没有返回文本。_")
 
     def _build_file_index(self) -> None:
-        entries = list_workspace_entries(self.workspace)
+        entries = list_reference_entries(self.workspace, self.settings.read_roots)
         self.call_from_thread(
             self._file_index_ready,
             entries.files,
@@ -678,8 +890,8 @@ class LitCodeTUI(App[None]):
             self.hide_completions()
             return
         if context.kind == "command":
-            candidates = [name for name, description in COMMANDS]
-            descriptions = dict(COMMANDS)
+            candidates = [item.name for item in COMMANDS]
+            descriptions = {item.name: item.description for item in COMMANDS}
             matches = _fuzzy_matches(context.query, candidates, 8)
             labels = [f"{name:<10} {descriptions[name]}" for name in matches]
         else:
@@ -802,3 +1014,8 @@ def run_tui(settings: Settings, model: OpenAIChatModel) -> int:
 
 def _model_label(model: str, current: str) -> str:
     return f"{model}  （当前）" if model == current else model
+
+
+def _display_user_content(content: str) -> str:
+    marker = "\n\n以下是用户明确引用的本地文件快照。"
+    return content.partition(marker)[0]

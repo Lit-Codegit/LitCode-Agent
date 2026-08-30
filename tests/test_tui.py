@@ -8,7 +8,13 @@ from textual.widgets import Collapsible, Markdown, Static
 
 from litcode_agent.config import Settings
 from litcode_agent.model import AssistantTurn, ModelDelta, ToolCall
-from litcode_agent.tui import ConfirmCommand, LitCodeTUI, ModelPicker, PromptArea
+from litcode_agent.tui import (
+    COMMANDS,
+    ConfirmCommand,
+    LitCodeTUI,
+    ModelPicker,
+    PromptArea,
+)
 
 
 class FakeModel:
@@ -146,6 +152,45 @@ def test_slash_command_uses_fuzzy_inline_completion(tmp_path: Path) -> None:
 
             assert prompt.text == "/model "
             assert not app.completion_visible
+
+    asyncio.run(exercise())
+
+
+def test_command_registry_includes_session_workflows() -> None:
+    assert {item.name for item in COMMANDS} >= {
+        "/sessions",
+        "/compact",
+        "/rewind",
+        "/redo",
+        "/fork",
+    }
+
+
+def test_tui_manual_compaction_keeps_session_available(tmp_path: Path) -> None:
+    class CompactModel(FakeModel):
+        def complete(self, messages, tools):
+            self.requests.append(list(messages))
+            return AssistantTurn("摘要" if not tools else "回答")
+
+    async def exercise() -> None:
+        model = CompactModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = "问题"
+            await pilot.press("ctrl+enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if not app.busy:
+                    break
+            app._handle_command("/compact")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if not app.busy:
+                    break
+
+            assert app.session.summary is not None
+            assert app.session.summary[0] == "摘要"
 
     asyncio.run(exercise())
 

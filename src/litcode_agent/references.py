@@ -10,6 +10,7 @@ from pathlib import Path
 
 from litcode_agent.tools.base import ToolError
 from litcode_agent.tools.workspace import Workspace
+from litcode_agent.config import ReadRoot
 
 REFERENCE_PATTERN = re.compile(r"@\{([^}]+)\}|(?<!\S)@([^\s{}]+)")
 SENSITIVE_NAMES = {
@@ -101,12 +102,32 @@ def list_workspace_entries(
     return WorkspaceEntries(files, _directories(files))
 
 
+def list_reference_entries(
+    workspace: Workspace,
+    read_roots: tuple[ReadRoot, ...],
+    timeout: float = 10.0,
+) -> WorkspaceEntries:
+    """Merge the workspace index with explicitly configured read-only roots."""
+
+    base = list_workspace_entries(workspace, timeout)
+    files = set(base.files)
+    for root in read_roots:
+        if not root.send_to_model:
+            continue
+        for relative in _root_files(root.path, timeout):
+            if not _is_sensitive(relative, protect_local=False):
+                files.add(f"{root.alias}/{relative}")
+    ordered = tuple(sorted(files))
+    return WorkspaceEntries(ordered, _directories(ordered))
+
+
 def build_reference_bundle(
     display_text: str,
     workspace: Workspace,
     *,
     max_file_chars: int,
     max_total_chars: int,
+    read_roots: tuple[ReadRoot, ...] = (),
 ) -> ReferenceBundle:
     """解析 @ 引用，并生成与界面原文分离的模型上下文。"""
 
@@ -121,12 +142,8 @@ def build_reference_bundle(
     references: list[FileReference] = []
     remaining = max_total_chars
     for raw_path in unique_paths:
-        if _is_sensitive(raw_path):
-            raise ReferenceError(
-                f"拒绝引用可能包含凭据的文件：{raw_path}"
-            )
         try:
-            path = workspace.resolve(raw_path)
+            path, display = _resolve_reference(raw_path, workspace, read_roots)
         except ToolError as error:
             raise ReferenceError(str(error)) from error
         if not path.is_file():
@@ -150,7 +167,7 @@ def build_reference_bundle(
         snapshot = content[:allowed]
         remaining -= len(snapshot)
         references.append(
-            FileReference(workspace.display(path), snapshot, truncated)
+            FileReference(display, snapshot, truncated)
         )
 
     blocks = [
@@ -209,7 +226,7 @@ def _safe_index_path(workspace: Workspace, raw_path: str) -> str | None:
     return workspace.display(path) if path.is_file() else None
 
 
-def _is_sensitive(raw_path: str) -> bool:
+def _is_sensitive(raw_path: str, *, protect_local: bool = True) -> bool:
     normalized = Path(raw_path).as_posix().lower()
     if normalized.startswith("./"):
         normalized = normalized[2:]
@@ -217,10 +234,61 @@ def _is_sensitive(raw_path: str) -> bool:
     name = path.name
     return (
         normalized in SENSITIVE_PATHS
-        or bool(path.parts and path.parts[0] in SENSITIVE_TOP_LEVEL)
+        or bool(protect_local and path.parts and path.parts[0] in SENSITIVE_TOP_LEVEL)
         or name in SENSITIVE_NAMES
         or path.suffix in SENSITIVE_SUFFIXES
     )
+
+
+def _resolve_reference(
+    raw_path: str, workspace: Workspace, read_roots: tuple[ReadRoot, ...]
+) -> tuple[Path, str]:
+    normalized = raw_path.removeprefix("@")
+    alias, separator, relative = normalized.partition("/")
+    root = next((item for item in read_roots if item.alias == alias), None)
+    if separator and root is not None:
+        if not root.send_to_model:
+            raise ToolError(f"只读根未允许发送给模型：{alias}")
+        if _is_sensitive(relative, protect_local=False):
+            raise ToolError(f"拒绝引用可能包含凭据的文件：{raw_path}")
+        path = (root.path / relative).resolve(strict=False)
+        if not path.is_relative_to(root.path):
+            raise ToolError("path escapes the configured read root")
+        if not path.exists():
+            raise ToolError(f"path does not exist: {raw_path}")
+        return path, f"{alias}/{Path(relative).as_posix()}"
+    if _is_sensitive(raw_path):
+        raise ToolError(f"拒绝引用可能包含凭据的文件：{raw_path}")
+    path = workspace.resolve(raw_path)
+    return path, workspace.display(path)
+
+
+def _root_files(root: Path, timeout: float) -> tuple[str, ...]:
+    try:
+        completed = subprocess.run(
+            ["rg", "--files", "--hidden", "--no-ignore", "--color", "never"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        completed = None
+    if completed is not None and completed.returncode in {0, 1}:
+        candidates = completed.stdout.splitlines()
+    else:
+        candidates = [
+            str(path.relative_to(root))
+            for path in root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        ]
+    result: list[str] = []
+    for raw in candidates:
+        path = (root / raw).resolve(strict=False)
+        if path.is_relative_to(root) and path.is_file() and not path.is_symlink():
+            result.append(Path(raw).as_posix())
+    return tuple(sorted(set(result)))
 
 
 def _escape_attribute(value: str) -> str:

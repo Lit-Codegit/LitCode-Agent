@@ -15,7 +15,8 @@ from litcode_agent.tools import (
     Workspace,
     build_default_registry,
 )
-from litcode_agent.config import Settings
+from litcode_agent.config import ReadRoot, Settings
+from litcode_agent.read_scope import ReadScope
 from litcode_agent.tools.base import ToolError
 from litcode_agent.tools.command import is_dangerous_command
 from litcode_agent.tools.files import truncate_output
@@ -199,3 +200,25 @@ def test_default_registry_contains_exactly_the_mvp_tools(tmp_path: Path) -> None
         "apply_patch",
         "run_command",
     }
+
+
+def test_read_tools_can_use_named_external_root_but_patch_cannot(
+    tmp_path: Path,
+) -> None:
+    workspace_path = tmp_path / "workspace"
+    reference_path = tmp_path / "reference"
+    workspace_path.mkdir()
+    reference_path.mkdir()
+    (reference_path / "notes.txt").write_text("external", encoding="utf-8")
+    workspace = Workspace(workspace_path)
+    scope = ReadScope(
+        workspace, (ReadRoot("docs", reference_path.resolve(), False),)
+    )
+
+    read = ReadFileTool(scope, 1000).execute({"path": "docs/notes.txt"})
+
+    assert "external" in read.content
+    with pytest.raises(ToolError, match="does not exist"):
+        ApplyPatchTool(workspace).execute(
+            {"path": "docs/notes.txt", "old_text": "external", "new_text": "x"}
+        )

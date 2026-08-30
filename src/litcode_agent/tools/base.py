@@ -11,11 +11,20 @@ class ToolError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class FileChange:
+    path: str
+    before_content: str | None
+    after_content: str
+    before_exists: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ToolResult:
     """Text returned to the model after a local tool invocation."""
 
     content: str
     is_error: bool = False
+    file_change: FileChange | None = None
 
     @classmethod
     def error(cls, message: str) -> ToolResult:

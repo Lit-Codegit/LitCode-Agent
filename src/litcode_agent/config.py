@@ -19,6 +19,13 @@ class ConfigurationError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class ReadRoot:
+    alias: str
+    path: Path
+    send_to_model: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """一次 Agent 运行所需的完整已校验配置。"""
 
@@ -34,6 +41,8 @@ class Settings:
     max_reference_file_chars: int = 32_768
     max_reference_chars: int = 131_072
     command_policy: CommandPolicy = "confirm"
+    read_roots: tuple[ReadRoot, ...] = ()
+    session_database: Path | None = None
     hooks: HookSettings = HookSettings()
     config_files: tuple[Path, ...] = ()
 
@@ -146,7 +155,7 @@ class Settings:
             "agent",
         )
         _reject_unknown_keys(
-            permissions, {"dangerousCommands"}, "permissions"
+            permissions, {"dangerousCommands", "readRoots"}, "permissions"
         )
         _reject_unknown_keys(tools, {"command"}, "tools")
         _reject_unknown_keys(
@@ -239,6 +248,9 @@ class Settings:
         if not isinstance(disabled, bool):
             raise ConfigurationError("disableAllHooks must be a boolean")
 
+        read_roots = _parse_read_roots(
+            workspace, permissions.get("readRoots")
+        )
         return cls(
             workspace=workspace,
             api_key=api_key,
@@ -252,6 +264,8 @@ class Settings:
             max_reference_file_chars=max_reference_file_chars,
             max_reference_chars=max_reference_chars,
             command_policy=cast(CommandPolicy, policy_value),
+            read_roots=read_roots,
+            session_database=workspace / ".litcode" / "sessions.db",
             hooks=_parse_hooks(raw.get("hooks"), disabled),
             config_files=config_files,
         )
@@ -273,6 +287,15 @@ class Settings:
             "max_reference_file_chars": self.max_reference_file_chars,
             "max_reference_chars": self.max_reference_chars,
             "command_policy": self.command_policy,
+            "read_roots": [
+                {
+                    "alias": root.alias,
+                    "path": str(root.path),
+                    "send_to_model": root.send_to_model,
+                }
+                for root in self.read_roots
+            ],
+            "session_database": str(self.session_database),
             "hooks_enabled": not self.hooks.disabled,
             "hook_commands": self.hooks.count,
         }
@@ -288,6 +311,42 @@ def _read_json_object(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ConfigurationError(f"configuration root must be an object: {path}")
     return value
+
+
+def _parse_read_roots(workspace: Path, value: object) -> tuple[ReadRoot, ...]:
+    roots = _object(value, "permissions.readRoots")
+    result: list[ReadRoot] = []
+    for alias, raw in roots.items():
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", alias):
+            raise ConfigurationError(
+                f"permissions.readRoots alias is invalid: {alias}"
+            )
+        config = _object(raw, f"permissions.readRoots.{alias}")
+        _reject_unknown_keys(
+            config, {"path", "sendToModel"}, f"permissions.readRoots.{alias}"
+        )
+        raw_path = _optional_string(
+            config.get("path"), f"permissions.readRoots.{alias}.path"
+        )
+        if raw_path is None:
+            raise ConfigurationError(
+                f"permissions.readRoots.{alias}.path is required"
+            )
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = workspace / path
+        path = path.resolve()
+        if not path.is_dir():
+            raise ConfigurationError(
+                f"permissions.readRoots.{alias}.path is not a directory: {path}"
+            )
+        send = config.get("sendToModel", False)
+        if not isinstance(send, bool):
+            raise ConfigurationError(
+                f"permissions.readRoots.{alias}.sendToModel must be a boolean"
+            )
+        result.append(ReadRoot(alias, path, send))
+    return tuple(result)
 
 
 def _deep_merge(

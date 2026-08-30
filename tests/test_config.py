@@ -266,3 +266,28 @@ def test_rejects_unknown_default_model_profile(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigurationError, match="not defined"):
         Settings.load(tmp_path, {"OPENAI_API_KEY": "secret"})
+
+
+def test_loads_named_read_only_roots(tmp_path: Path) -> None:
+    (tmp_path / "local").mkdir()
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultModel": "primary",
+                "models": {"primary": {"model": "model"}},
+                "permissions": {
+                    "readRoots": {
+                        "local": {"path": "local", "sendToModel": True}
+                    }
+                },
+            }
+        )
+    )
+
+    settings = Settings.load(tmp_path, {"OPENAI_API_KEY": "secret"})
+
+    assert settings.read_roots[0].alias == "local"
+    assert settings.read_roots[0].path == (tmp_path / "local").resolve()
+    assert settings.read_roots[0].send_to_model

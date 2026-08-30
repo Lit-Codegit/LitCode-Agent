@@ -13,6 +13,7 @@ from litcode_agent.tools.files import (
 )
 from litcode_agent.tools.registry import ToolRegistry
 from litcode_agent.tools.workspace import Workspace
+from litcode_agent.read_scope import ReadScope
 
 
 def build_default_registry(
@@ -21,12 +22,13 @@ def build_default_registry(
     """Construct the complete MVP tool set from validated settings."""
 
     workspace = Workspace(settings.workspace)
+    read_scope = ReadScope(workspace, settings.read_roots)
     return ToolRegistry(
         [
-            ListFilesTool(workspace, settings.max_output_chars),
-            ReadFileTool(workspace, settings.max_output_chars),
+            ListFilesTool(read_scope, settings.max_output_chars),
+            ReadFileTool(read_scope, settings.max_output_chars),
             SearchFilesTool(
-                workspace,
+                read_scope,
                 settings.max_output_chars,
                 settings.command_timeout_seconds,
             ),

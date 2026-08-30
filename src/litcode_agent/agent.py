@@ -21,6 +21,8 @@ from litcode_agent.model import (
 )
 from litcode_agent.tools.base import ToolResult
 from litcode_agent.tools.registry import ToolRegistry
+from litcode_agent.session_store import Checkpoint, SessionStore
+from litcode_agent.tools.workspace import Workspace
 
 SYSTEM_PROMPT = """You are LitCode Agent, a careful coding assistant operating in a local workspace.
 
@@ -83,6 +85,9 @@ class Agent:
         event_sink: EventSink | None = None,
         hooks: HookRunner | None = None,
         system_prompt: str = SYSTEM_PROMPT,
+        store: SessionStore | None = None,
+        model_name: str = "unknown",
+        workspace: Path | None = None,
     ) -> None:
         if max_iterations <= 0:
             raise ValueError("max_iterations must be positive")
@@ -92,11 +97,14 @@ class Agent:
         self.event_sink = event_sink or (lambda event: None)
         self.hooks = hooks
         self.system_prompt = system_prompt
+        self.store = store
+        self.model_name = model_name
+        self.workspace = workspace.resolve() if workspace is not None else None
 
-    def start_session(self) -> AgentSession:
+    def start_session(self, session_id: str | None = None) -> AgentSession:
         """创建一段保留消息历史的交互会话。"""
 
-        return AgentSession(self)
+        return AgentSession(self, session_id)
 
     def run(self, task: str) -> AgentResult:
         """执行一次任务，并在返回前关闭对应会话。"""
@@ -132,18 +140,33 @@ class Agent:
         return outcome
 
     def _workspace(self) -> Path:
+        if self.workspace is not None:
+            return self.workspace
         return self.hooks.workspace if self.hooks is not None else Path.cwd()
 
 
 class AgentSession:
     """一段只触发一次 SessionStart/SessionEnd 的多轮对话。"""
 
-    def __init__(self, agent: Agent) -> None:
+    def __init__(self, agent: Agent, session_id: str | None = None) -> None:
         self.agent = agent
-        self.session_id = str(uuid.uuid4())
-        self.messages: list[Message] = [
-            {"role": "system", "content": agent.system_prompt}
-        ]
+        initial: list[Message] = [{"role": "system", "content": agent.system_prompt}]
+        if session_id is not None and agent.store is not None:
+            self.session_id = session_id
+            self.messages = list(agent.store.load(session_id))
+        else:
+            self.session_id = str(uuid.uuid4())
+            self.messages = initial
+            if agent.store is not None:
+                self.session_id = agent.store.create(
+                    agent._workspace(), agent.model_name, self.messages,
+                    session_id=self.session_id,
+                )
+        saved_summary = agent.store.summary(self.session_id) if agent.store else None
+        self.summary = saved_summary
+        self._redo: (
+            tuple[list[Message], Checkpoint, bool, tuple[str, int] | None] | None
+        ) = None
         self.started = False
         self.closed = False
 
@@ -156,6 +179,17 @@ class AgentSession:
             raise RuntimeError("session is closed")
         if not task.strip():
             raise ValueError("task must not be empty")
+        if self._redo is not None:
+            _, checkpoint, restored_files, _ = self._redo
+            if restored_files and self.agent.store is not None:
+                self.agent.store.discard_changes_after(
+                    self.session_id, checkpoint.file_cursor
+                )
+            if self.agent.store is not None:
+                self.agent.store.discard_checkpoints_after(
+                    self.session_id, checkpoint.created_at
+                )
+            self._redo = None
         task = task.strip()
         if not self.started:
             self.started = True
@@ -171,7 +205,7 @@ class AgentSession:
                 iteration=0,
                 match_value="startup",
             )
-        self.messages.append({"role": "user", "content": task})
+        self._append_message({"role": "user", "content": task})
         cancelled = should_cancel or (lambda: False)
 
         for iteration in range(1, self.agent.max_iterations + 1):
@@ -186,37 +220,37 @@ class AgentSession:
             )
             if stream_cancelled or cancelled():
                 return self._cancelled(iteration)
-            self.messages.append(turn.as_message())
+            self._append_message(turn.as_message())
             if not turn.tool_calls:
                 if turn.finish_reason in {"length", "content_filter"}:
-                    return self._result(
+                    return self._finish_turn(task, self._result(
                         output=(
                             "The model response was incomplete "
                             f"(finish_reason={turn.finish_reason})."
                         ),
                         reason="model_incomplete",
                         iteration=iteration,
-                    )
+                    ))
                 if turn.content and turn.content.strip():
-                    return self._result(
+                    return self._finish_turn(task, self._result(
                         turn.content.strip(), "completed", iteration
-                    )
-                return self._result(
+                    ))
+                return self._finish_turn(task, self._result(
                     "The model returned neither text nor tool calls.",
                     "empty_response",
                     iteration,
-                )
+                ))
 
             for tool_call in turn.tool_calls:
                 if cancelled():
                     return self._cancelled(iteration)
                 self._execute_tool(tool_call, iteration)
 
-        return self._result(
+        return self._finish_turn(task, self._result(
             f"Stopped after reaching the {self.agent.max_iterations}-iteration limit.",
             "max_iterations",
             self.agent.max_iterations,
-        )
+        ))
 
     def _request_model(
         self,
@@ -226,7 +260,7 @@ class AgentSession:
         stream = getattr(self.agent.model, "stream", None)
         if not callable(stream):
             turn = self.agent.model.complete(
-                self.messages, self.agent.tools.schemas()
+                self._model_messages(), self.agent.tools.schemas()
             )
             self.agent.event_sink(
                 AgentEvent(
@@ -244,7 +278,7 @@ class AgentSession:
         pending_text: list[str] = []
         last_flush = 0.0
         stream_cancelled = False
-        deltas = stream(self.messages, self.agent.tools.schemas())
+        deltas = stream(self._model_messages(), self.agent.tools.schemas())
         try:
             for delta in deltas:
                 if cancelled():
@@ -310,7 +344,7 @@ class AgentSession:
 
     def _cancelled(self, iteration: int) -> AgentResult:
         message = "本轮任务已由用户停止。"
-        self.messages.append({"role": "assistant", "content": message})
+        self._append_message({"role": "assistant", "content": message})
         return self._result(
             message,
             "cancelled",
@@ -366,7 +400,7 @@ class AgentSession:
                 tool_call.name, tool_call.arguments
             )
         )
-        self.messages.append(
+        self._append_message(
             {
                 "role": "tool",
                 "tool_call_id": tool_call.id,
@@ -376,6 +410,8 @@ class AgentSession:
                 ),
             }
         )
+        if result.file_change is not None and self.agent.store is not None:
+            self.agent.store.record_change(self.session_id, result.file_change)
         post_event: HookEvent = (
             "PostToolUseFailure" if result.is_error else "PostToolUse"
         )
@@ -414,6 +450,107 @@ class AgentSession:
             iterations=iteration,
             messages=tuple(self.messages),
         )
+
+    def _append_message(self, message: Message) -> None:
+        self.messages.append(message)
+        if self.agent.store is not None:
+            self.agent.store.save_messages(self.session_id, self.messages)
+
+    def _finish_turn(self, task: str, result: AgentResult) -> AgentResult:
+        if self.agent.store is not None:
+            title = task.replace("\n", " ")[:48]
+            self.agent.store.save_messages(self.session_id, self.messages, title=title)
+            self.agent.store.add_checkpoint(self.session_id, title, self.messages)
+        return result
+
+    def _model_messages(self) -> list[Message]:
+        if self.summary is None:
+            return list(self.messages)
+        summary, boundary = self.summary
+        return [
+            self.messages[0],
+            {
+                "role": "user",
+                "content": "以下是此前会话的受信压缩摘要：\n\n" + summary,
+            },
+            *self.messages[boundary + 1 :],
+        ]
+
+    def compact(self, instructions: str = "") -> str:
+        """Create a manual summary checkpoint without deleting raw history."""
+
+        if len(self.messages) <= 1:
+            raise ValueError("当前会话没有可压缩的内容")
+        request: Message = {
+            "role": "user",
+            "content": (
+                "请把以上会话压缩成可供后续模型继续工作的中文摘要。固定栏目："
+                "用户约束、关键决定、已完成、未完成、相关文件、下一步。"
+                "不要虚构事实。" + (f"\n额外要求：{instructions}" if instructions else "")
+            ),
+        }
+        turn = self.agent.model.complete([*self._model_messages(), request], [])
+        if not turn.content or not turn.content.strip():
+            raise ModelError("上下文压缩没有返回摘要")
+        boundary = len(self.messages) - 1
+        summary = turn.content.strip()
+        self.summary = (summary, boundary)
+        if self.agent.store is not None:
+            self.agent.store.save_summary(self.session_id, summary, boundary)
+            self.agent.store.add_checkpoint(self.session_id, "上下文压缩", self.messages)
+        return summary
+
+    def checkpoints(self) -> tuple[Checkpoint, ...]:
+        if self.agent.store is None:
+            return ()
+        return self.agent.store.checkpoints(self.session_id)
+
+    def rewind(self, checkpoint: Checkpoint, *, restore_files: bool) -> int:
+        if self.agent.store is None:
+            raise RuntimeError("会话存储未启用")
+        self._redo = (
+            list(self.messages), checkpoint, restore_files, self.summary
+        )
+        restored = 0
+        if restore_files:
+            restored = self.agent.store.restore_files(
+                self.session_id, checkpoint.file_cursor, Workspace(self.agent._workspace())
+            )
+        self.messages = list(checkpoint.messages)
+        self.summary = None
+        self.agent.store.clear_summary(self.session_id)
+        self.agent.store.save_messages(self.session_id, self.messages)
+        return restored
+
+    def redo(self) -> int:
+        if self.agent.store is None or self._redo is None:
+            raise RuntimeError("没有可恢复的 rewind")
+        messages, checkpoint, restore_files, summary = self._redo
+        restored = 0
+        if restore_files:
+            restored = self.agent.store.restore_files(
+                self.session_id,
+                checkpoint.file_cursor,
+                Workspace(self.agent._workspace()),
+                forward=True,
+            )
+        self.messages = messages
+        self.summary = summary
+        self.agent.store.save_messages(self.session_id, self.messages)
+        if summary is None:
+            self.agent.store.clear_summary(self.session_id)
+        else:
+            self.agent.store.save_summary(self.session_id, *summary)
+        self._redo = None
+        return restored
+
+    def fork(self, checkpoint: Checkpoint) -> AgentSession:
+        if self.agent.store is None:
+            raise RuntimeError("会话存储未启用")
+        identifier = self.agent.store.fork(
+            self.session_id, checkpoint, self.agent.model_name
+        )
+        return self.agent.start_session(identifier)
 
 
 def _hook_tool_input(raw_arguments: str) -> object:

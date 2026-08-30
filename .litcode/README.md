@@ -37,6 +37,29 @@ export PRIMARY_API_KEY="你的密钥"
 
 `agent.maxReferenceFileChars` 限制单个 `@` 引用文件的字符数，`agent.maxReferenceChars` 限制一轮消息全部文件快照的字符数。对应环境变量是 `LITCODE_MAX_REFERENCE_FILE_CHARS` 和 `LITCODE_MAX_REFERENCE_CHARS`，前者不得大于后者。
 
+## 命名只读根
+
+`permissions.readRoots` 用 alias 声明工作区外或被 Git ignore 的参考目录：
+
+```json
+{
+  "permissions": {
+    "readRoots": {
+      "docs": {
+        "path": "../shared-docs",
+        "sendToModel": false
+      }
+    }
+  }
+}
+```
+
+`path` 的相对路径以工作区为基准。读取工具使用 `docs/相对路径` 访问；`sendToModel` 只控制是否允许 `@{docs/相对路径}` 附加文件快照。建议在 `settings.local.json` 中配置本机绝对路径。
+
+## 会话数据
+
+TUI 会话保存在 `.litcode/sessions.db`，包括原始消息、摘要检查点和 `apply_patch` 的文件前后镜像。该数据库为本机私有文件，已在 `.gitignore` 中排除。
+
 命令行中的 `--profile` 对应 `LITCODE_DEFAULT_MODEL`，用于选择一整套 API 配置；`--model` 只覆盖其中的具体模型 ID。交互会话还可以用 `/model` 查询 API 并临时切换模型，这一操作不会写回 `settings.json`。
 
 ## Hook 配置

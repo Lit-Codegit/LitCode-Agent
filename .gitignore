@@ -9,3 +9,6 @@ dist/
 build/
 *.egg-info/
 .litcode/settings.local.json
+.litcode/sessions.db
+.litcode/sessions.db-shm
+.litcode/sessions.db-wal

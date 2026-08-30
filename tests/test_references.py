@@ -9,6 +9,8 @@ from litcode_agent.references import (
     list_workspace_files,
 )
 from litcode_agent.tools.workspace import Workspace
+from litcode_agent.config import ReadRoot
+from litcode_agent.references import list_reference_entries
 
 
 def test_builds_deduplicated_bounded_file_snapshots(tmp_path: Path) -> None:
@@ -97,3 +99,45 @@ def test_workspace_index_includes_navigable_parent_directories(
 
     assert entries.files == ("src/package/main.py",)
     assert entries.directories == ("src/", "src/package/")
+
+
+def test_explicit_local_root_is_searchable_despite_git_exclude(
+    tmp_path: Path,
+) -> None:
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "notes.md").write_text("私人笔记", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("local/\n", encoding="utf-8")
+    root = ReadRoot("local", local.resolve(), True)
+
+    entries = list_reference_entries(Workspace(tmp_path), (root,))
+    bundle = build_reference_bundle(
+        "查看 @{local/notes.md}",
+        Workspace(tmp_path),
+        max_file_chars=100,
+        max_total_chars=100,
+        read_roots=(root,),
+    )
+
+    assert "local/notes.md" in entries.files
+    assert "私人笔记" in bundle.model_text
+
+
+def test_read_root_must_opt_in_before_reference_is_sent(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    (reference / "note.md").write_text("内容", encoding="utf-8")
+
+    root = ReadRoot("docs", reference.resolve(), False)
+    assert "docs/note.md" not in list_reference_entries(
+        Workspace(tmp_path), (root,)
+    ).files
+
+    with pytest.raises(ReferenceError, match="未允许发送"):
+        build_reference_bundle(
+            "查看 @{docs/note.md}",
+            Workspace(tmp_path),
+            max_file_chars=100,
+            max_total_chars=100,
+            read_roots=(root,),
+        )

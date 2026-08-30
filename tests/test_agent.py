@@ -15,6 +15,8 @@ from litcode_agent.model import (
 )
 from litcode_agent.tools.base import ToolResult
 from litcode_agent.tools.registry import ToolRegistry
+from litcode_agent.session_store import SessionStore
+from litcode_agent.tools import ApplyPatchTool, Workspace
 
 
 class FakeModel:
@@ -229,3 +231,71 @@ def test_agent_does_not_treat_incomplete_response_as_success(
 
     assert result.reason == "model_incomplete"
     assert not result.succeeded
+
+
+def test_session_compaction_keeps_raw_history_and_changes_model_view(
+    tmp_path,
+) -> None:
+    model = FakeModel(
+        [
+            AssistantTurn("第一次回答"),
+            AssistantTurn("压缩摘要"),
+            AssistantTurn("继续回答"),
+        ]
+    )
+    store = SessionStore(tmp_path / "sessions.db")
+    agent = Agent(
+        model,
+        ToolRegistry([]),
+        3,
+        store=store,
+        model_name="model",
+        workspace=tmp_path,
+    )
+    session = agent.start_session()
+    session.ask("第一个问题")
+
+    summary = session.compact()
+    session.ask("继续")
+
+    assert summary == "压缩摘要"
+    assert store.load(session.session_id)[1]["content"] == "第一个问题"
+    assert "受信压缩摘要" in model.requests[-1][1]["content"]
+    assert model.requests[-1][-1]["content"] == "继续"
+
+
+def test_rewind_can_restore_agent_edits_and_redo_them(tmp_path) -> None:
+    model = FakeModel(
+        [
+            AssistantTurn(
+                None,
+                (ToolCall("create", "apply_patch", '{"path":"a.txt","old_text":"","new_text":"one"}'),),
+            ),
+            AssistantTurn("第一轮完成"),
+            AssistantTurn(
+                None,
+                (ToolCall("edit", "apply_patch", '{"path":"a.txt","old_text":"one","new_text":"two"}'),),
+            ),
+            AssistantTurn("第二轮完成"),
+        ]
+    )
+    store = SessionStore(tmp_path / "sessions.db")
+    session = Agent(
+        model,
+        ToolRegistry([ApplyPatchTool(Workspace(tmp_path))]),
+        3,
+        store=store,
+        model_name="model",
+        workspace=tmp_path,
+    ).start_session()
+    session.ask("第一轮")
+    first = session.checkpoints()[0]
+    session.ask("第二轮")
+    assert (tmp_path / "a.txt").read_text() == "two"
+
+    restored = session.rewind(first, restore_files=True)
+    assert restored == 1
+    assert (tmp_path / "a.txt").read_text() == "one"
+
+    assert session.redo() == 1
+    assert (tmp_path / "a.txt").read_text() == "two"

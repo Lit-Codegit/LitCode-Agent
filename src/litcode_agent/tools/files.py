@@ -8,8 +8,9 @@ import tempfile
 from pathlib import Path
 from typing import Mapping
 
-from litcode_agent.tools.base import ToolError, ToolResult
+from litcode_agent.tools.base import FileChange, ToolError, ToolResult
 from litcode_agent.tools.workspace import Workspace
+from litcode_agent.read_scope import ReadScope
 
 
 def _string_argument(
@@ -63,8 +64,9 @@ class ListFilesTool:
         "additionalProperties": False,
     }
 
-    def __init__(self, workspace: Workspace, max_output_chars: int) -> None:
-        self.workspace = workspace
+    def __init__(self, workspace: Workspace | ReadScope, max_output_chars: int) -> None:
+        self.scope = workspace if isinstance(workspace, ReadScope) else ReadScope(workspace)
+        self.workspace = self.scope.workspace
         self.max_output_chars = max_output_chars
 
     def execute(self, arguments: Mapping[str, object]) -> ToolResult:
@@ -74,7 +76,7 @@ class ListFilesTool:
         depth = _integer_argument(
             arguments, "depth", default=2, minimum=1, maximum=8
         )
-        root = self.workspace.resolve(raw_path)
+        root = self.scope.resolve(raw_path).path
         if not root.is_dir():
             raise ToolError(f"path is not a directory: {raw_path}")
 
@@ -88,9 +90,9 @@ class ListFilesTool:
                 directories.clear()
             for directory in directories:
                 path = current_path / directory
-                lines.append(f"{self.workspace.display(path)}/")
+                lines.append(f"{self.scope.display(path)}/")
             lines.extend(
-                self.workspace.display(current_path / filename) for filename in files
+                self.scope.display(current_path / filename) for filename in files
             )
         content = "\n".join(lines) or "(empty directory)"
         return ToolResult(truncate_output(content, self.max_output_chars))
@@ -110,8 +112,9 @@ class ReadFileTool:
         "additionalProperties": False,
     }
 
-    def __init__(self, workspace: Workspace, max_output_chars: int) -> None:
-        self.workspace = workspace
+    def __init__(self, workspace: Workspace | ReadScope, max_output_chars: int) -> None:
+        self.scope = workspace if isinstance(workspace, ReadScope) else ReadScope(workspace)
+        self.workspace = self.scope.workspace
         self.max_output_chars = max_output_chars
 
     def execute(self, arguments: Mapping[str, object]) -> ToolResult:
@@ -128,7 +131,7 @@ class ReadFileTool:
         )
         if end < start:
             raise ToolError("end_line must be greater than or equal to start_line")
-        path = self.workspace.resolve(raw_path)
+        path = self.scope.resolve(raw_path).path
         if not path.is_file():
             raise ToolError(f"path is not a file: {raw_path}")
         try:
@@ -160,9 +163,10 @@ class SearchFilesTool:
     }
 
     def __init__(
-        self, workspace: Workspace, max_output_chars: int, timeout_seconds: float
+        self, workspace: Workspace | ReadScope, max_output_chars: int, timeout_seconds: float
     ) -> None:
-        self.workspace = workspace
+        self.scope = workspace if isinstance(workspace, ReadScope) else ReadScope(workspace)
+        self.workspace = self.scope.workspace
         self.max_output_chars = max_output_chars
         self.timeout_seconds = timeout_seconds
 
@@ -171,14 +175,14 @@ class SearchFilesTool:
         raw_path = arguments.get("path", ".")
         if not isinstance(raw_path, str) or not raw_path:
             raise ToolError("path must be a non-empty string")
-        search_path = self.workspace.resolve(raw_path)
+        search_path = self.scope.resolve(raw_path).path
         command = ["rg", "--line-number", "--color", "never", "--", pattern]
         glob = arguments.get("glob")
         if glob is not None:
             if not isinstance(glob, str) or not glob:
                 raise ToolError("glob must be a non-empty string")
             command[1:1] = ["--glob", glob]
-        command.append(self.workspace.display(search_path))
+        command.append(str(search_path))
         try:
             completed = subprocess.run(
                 command,
@@ -236,7 +240,10 @@ class ApplyPatchTool:
                 raise ToolError("new_text must not be empty when creating a file")
             path.parent.mkdir(parents=True, exist_ok=True)
             self._atomic_write(path, new_text)
-            return ToolResult(f"created {raw_path} ({len(new_text)} characters)")
+            return ToolResult(
+                f"created {raw_path} ({len(new_text)} characters)",
+                file_change=FileChange(raw_path, None, new_text, False),
+            )
 
         if not path.is_file():
             raise ToolError(f"path is not a file: {raw_path}")
@@ -251,8 +258,12 @@ class ApplyPatchTool:
             raise ToolError(
                 f"old_text must match exactly once; found {occurrences} matches"
             )
-        self._atomic_write(path, content.replace(old_text, new_text, 1))
-        return ToolResult(f"updated {raw_path}")
+        updated = content.replace(old_text, new_text, 1)
+        self._atomic_write(path, updated)
+        return ToolResult(
+            f"updated {raw_path}",
+            file_change=FileChange(raw_path, content, updated, True),
+        )
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
