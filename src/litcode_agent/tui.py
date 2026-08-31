@@ -252,7 +252,13 @@ class LitCodeTUI(App[None]):
         ),
         Binding("ctrl+l", "clear_session", "清空", show=True),
         Binding("f2", "choose_model", "模型", show=True),
-        Binding("ctrl+w", "pane_leader", "分屏前缀", show=True, priority=True),
+        Binding(
+            "ctrl+w",
+            "pane_leader",
+            "后按方向分屏",
+            show=True,
+            priority=True,
+        ),
         Binding("super+left", "split('left')", "向左分屏", show=False),
         Binding("super+right", "split('right')", "向右分屏", show=False),
         Binding("super+up", "split('up')", "向上分屏", show=False),
@@ -529,7 +535,7 @@ class LitCodeTUI(App[None]):
 
     def action_pane_leader(self) -> None:
         self._pane_leader = True
-        self._update_status("分屏：按方向键创建 pane")
+        self._update_status("分屏：现在按方向键创建 pane；Esc 取消")
 
     def on_key(self, event: events.Key) -> None:
         if not self._pane_leader:
@@ -548,6 +554,10 @@ class LitCodeTUI(App[None]):
         self._append_notice(
             "会话已启动。输入 /help 查看命令，"
             "工具调用会显示在时间线中。"
+        )
+        self._append_notice(
+            "分屏：Ctrl+W 后按方向键，或输入 /split right。"
+            "多数 macOS 终端不会把 Cmd 组合键传给应用。"
         )
         for issue in self.skills.issues:
             self._append_notice(f"Skill 加载失败：{issue}", error=True)

@@ -55,6 +55,18 @@ def test_tui_mounts_status_timeline_and_fixed_prompt(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_tui_explains_portable_split_shortcut_on_start(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)):
+            notices = [str(widget.render()) for widget in app.query(".notice").results(Static)]
+
+            assert any("Ctrl+W 后按方向键" in notice for notice in notices)
+            assert any("/split right" in notice for notice in notices)
+
+    asyncio.run(exercise())
+
+
 def test_tui_submits_prompt_in_background_and_renders_answer(
     tmp_path: Path,
 ) -> None:

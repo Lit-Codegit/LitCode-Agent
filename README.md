@@ -76,9 +76,9 @@ TUI 中央是可滚动的对话和工具时间线，底部是固定的多行输�
 
 - `Ctrl+Enter`：发送，多行输入中的 `Enter` 保留为换行；
 - `F2`：查询并选择 API 模型；
-- `Cmd+方向键`：向对应方向创建会话 pane（取决于终端是否传递 Cmd）；
+- `Cmd+方向键`：向对应方向创建会话 pane；这是 best-effort 入口，多数 macOS 终端会拦截 Cmd，不应作为唯一入口；
 - `Cmd+Shift+方向键`：移动 pane 焦点；
-- `Ctrl+W` 后按方向键：跨终端可用的分屏 fallback；
+- `Ctrl+W` 后按方向键：可靠的分屏入口；也可直接输入 `/split right`；
 - `Ctrl+L`：清空当前会话；
 - `Ctrl+C`：任务运行时请求停止，空闲时退出。
 
