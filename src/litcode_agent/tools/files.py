@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Mapping
 
@@ -222,10 +223,19 @@ class ApplyPatchTool:
         "additionalProperties": False,
     }
 
-    def __init__(self, workspace: Workspace) -> None:
+    def __init__(
+        self,
+        workspace: Workspace,
+        execution_lock: threading.RLock | None = None,
+    ) -> None:
         self.workspace = workspace
+        self.execution_lock = execution_lock or threading.RLock()
 
     def execute(self, arguments: Mapping[str, object]) -> ToolResult:
+        with self.execution_lock:
+            return self._execute_locked(arguments)
+
+    def _execute_locked(self, arguments: Mapping[str, object]) -> ToolResult:
         raw_path = _string_argument(arguments, "path")
         old_text = arguments.get("old_text")
         new_text = arguments.get("new_text")

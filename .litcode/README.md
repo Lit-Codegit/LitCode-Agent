@@ -35,7 +35,9 @@ export PRIMARY_API_KEY="你的密钥"
 
 `LITCODE_DEFAULT_MODEL=fast` 可以临时切换配置档；`LITCODE_MODEL`、`OPENAI_BASE_URL`、`LITCODE_MAX_ITERATIONS`、`LITCODE_MAX_OUTPUT_CHARS`、`LITCODE_COMMAND_TIMEOUT_SECONDS` 和 `LITCODE_COMMAND_POLICY` 可临时覆盖选中配置档中的具体值。
 
-`agent.maxReferenceFileChars` 限制单个 `@` 引用文件的字符数，`agent.maxReferenceChars` 限制一轮消息全部文件快照的字符数。对应环境变量是 `LITCODE_MAX_REFERENCE_FILE_CHARS` 和 `LITCODE_MAX_REFERENCE_CHARS`，前者不得大于后者。
+`agent.maxReferenceFileChars` 限制单个 `@` 引用文件的字符数，`agent.maxReferenceChars` 限制一轮消息全部文件快照，`agent.maxSessionReferenceChars` 限制一轮 `#` 会话 capsule 总量。对应环境变量是 `LITCODE_MAX_REFERENCE_FILE_CHARS`、`LITCODE_MAX_REFERENCE_CHARS` 和 `LITCODE_MAX_SESSION_REFERENCE_CHARS`，文件单项上限不得大于文件总上限。
+
+`permissions.sessionMessages` 控制 Agent 是否能向同工作区其他会话 inbox 投递消息：`confirm` 每次确认，`deny` 禁止，`allow` 直接投递。环境变量 `LITCODE_SESSION_MESSAGE_POLICY` 可临时覆盖。投递不会自动启动目标模型。
 
 ## 命名只读根
 
@@ -59,6 +61,12 @@ export PRIMARY_API_KEY="你的密钥"
 ## 会话数据
 
 TUI 会话保存在 `.litcode/sessions.db`，包括原始消息、摘要检查点和 `apply_patch` 的文件前后镜像。该数据库为本机私有文件，已在 `.gitignore` 中排除。
+
+数据库还保存稳定的时间戳 ASCII alias、`#` 引用的不可变 capsule 和跨会话 inbox。旧数据库打开时会自动补 alias 并记录 schema version。
+
+## Agent Skills
+
+项目 Skill 使用标准目录 `.agents/skills/<name>/SKILL.md`。`SKILL.md` 必须包含合法 YAML frontmatter，`name` 要与目录一致，并提供非空 `description`。LitCode 不跟随 Skill 符号链接，不自动扫描全局目录，也不自动安装远程 Skill。
 
 命令行中的 `--profile` 对应 `LITCODE_DEFAULT_MODEL`，用于选择一整套 API 配置；`--model` 只覆盖其中的具体模型 ID。交互会话还可以用 `/model` 查询 API 并临时切换模型，这一操作不会写回 `settings.json`。
 

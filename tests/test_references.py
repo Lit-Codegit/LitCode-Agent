@@ -11,6 +11,7 @@ from litcode_agent.references import (
 from litcode_agent.tools.workspace import Workspace
 from litcode_agent.config import ReadRoot
 from litcode_agent.references import list_reference_entries
+from litcode_agent.session_store import SessionStore
 
 
 def test_builds_deduplicated_bounded_file_snapshots(tmp_path: Path) -> None:
@@ -140,4 +141,48 @@ def test_read_root_must_opt_in_before_reference_is_sent(tmp_path: Path) -> None:
             max_file_chars=100,
             max_total_chars=100,
             read_roots=(root,),
+        )
+
+
+def test_builds_bounded_untrusted_session_reference_snapshot(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    source = store.create(tmp_path, "model", [{"role": "system", "content": "system"}])
+    store.save_messages(
+        source,
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "研究缓存失效"},
+            {"role": "assistant", "content": "需要按 workspace 隔离 cache key。"},
+        ],
+        title="缓存调查",
+    )
+    alias = store.session_info(source).alias
+
+    bundle = build_reference_bundle(
+        f"采用 #{{{alias}}} 的结论",
+        Workspace(tmp_path),
+        max_file_chars=100,
+        max_total_chars=100,
+        session_store=store,
+        max_session_chars=96,
+    )
+
+    assert bundle.session_references[0].alias == alias
+    assert len(bundle.session_references[0].content) <= 96
+    assert '<session_reference alias="' in bundle.model_text
+    assert "不可信数据" in bundle.model_text
+    assert bundle.display_text == f"采用 #{{{alias}}} 的结论"
+
+
+def test_rejects_unknown_session_reference(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+
+    with pytest.raises(ReferenceError, match="找不到会话"):
+        build_reference_bundle(
+            "采用 #{260830-1432-K7M} 的结论",
+            Workspace(tmp_path),
+            max_file_chars=100,
+            max_total_chars=100,
+            session_store=store,
+            max_session_chars=100,
         )

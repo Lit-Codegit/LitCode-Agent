@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
 from collections.abc import Callable
 from typing import Mapping
 
@@ -49,12 +50,14 @@ class RunCommandTool:
         max_output_chars: int,
         policy: CommandPolicy,
         confirm: ConfirmCommand | None = None,
+        execution_lock: threading.RLock | None = None,
     ) -> None:
         self.workspace = workspace
         self.timeout_seconds = timeout_seconds
         self.max_output_chars = max_output_chars
         self.policy = policy
         self.confirm = confirm
+        self.execution_lock = execution_lock or threading.RLock()
 
     def execute(self, arguments: Mapping[str, object]) -> ToolResult:
         command = _string_argument(arguments, "command")
@@ -66,15 +69,16 @@ class RunCommandTool:
             ):
                 raise ToolError("dangerous command was not approved")
         try:
-            completed = subprocess.run(
-                command,
-                cwd=self.workspace.root,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                check=False,
-            )
+            with self.execution_lock:
+                completed = subprocess.run(
+                    command,
+                    cwd=self.workspace.root,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout_seconds,
+                    check=False,
+                )
         except subprocess.TimeoutExpired as error:
             partial_stdout = error.stdout or ""
             partial_stderr = error.stderr or ""

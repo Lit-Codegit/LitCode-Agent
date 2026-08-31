@@ -6,6 +6,7 @@ from pathlib import Path
 
 from textual.widgets import Collapsible, Markdown, Static
 
+from litcode_agent.agent import AgentEvent
 from litcode_agent.config import Settings
 from litcode_agent.model import AssistantTurn, ModelDelta, ToolCall
 from litcode_agent.tui import (
@@ -259,6 +260,198 @@ def test_at_completion_can_navigate_directories(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_hash_completion_inserts_session_alias_and_sends_capsule(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        model = FakeModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        source = app.store.create(
+            tmp_path,
+            "model-a",
+            [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "检查缓存"},
+                {"role": "assistant", "content": "cache key 缺少 workspace"},
+            ],
+            title="缓存调查",
+        )
+        alias = app.store.session_info(source).alias
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = f"参考 #{alias}"
+            prompt.move_cursor((0, len(prompt.text)))
+            await pilot.pause()
+
+            assert alias in app.completion_values
+            await pilot.press("enter")
+            assert prompt.text == f"参考 #{{{alias}}}"
+
+            await pilot.press("ctrl+enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if model.requests and not app.busy:
+                    break
+
+            sent = model.requests[0][-1]["content"]
+            assert f'<session_reference alias="{alias}"' in sent
+            assert "缓存调查" in sent
+            assert "cache key 缺少 workspace" in sent
+
+    asyncio.run(exercise())
+
+
+def test_tui_advertises_skill_metadata_without_eager_body(tmp_path: Path) -> None:
+    skill = tmp_path / ".agents" / "skills" / "review-code"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: review-code\ndescription: Use when reviewing code.\n---\n"
+        "PRIVATE SKILL BODY",
+        encoding="utf-8",
+    )
+
+    async def exercise() -> None:
+        model = FakeModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = "检查代码"
+            await pilot.press("ctrl+enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if model.requests and not app.busy:
+                    break
+
+            system = model.requests[0][0]["content"]
+            assert "review-code" in system
+            assert "Use when reviewing code." in system
+            assert "PRIVATE SKILL BODY" not in system
+
+    asyncio.run(exercise())
+
+
+def test_split_panes_run_concurrently_and_keep_streams_isolated(
+    tmp_path: Path,
+) -> None:
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+
+    class ConcurrentModel(FakeModel):
+        def stream(self, messages, tools):
+            self.requests.append(list(messages))
+            task = messages[-1]["content"]
+            if task == "慢任务":
+                yield ModelDelta(content="慢")
+                slow_started.set()
+                release_slow.wait(timeout=2)
+                yield ModelDelta(content="完成", finish_reason="stop")
+            else:
+                yield ModelDelta(content="快完成", finish_reason="stop")
+
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), ConcurrentModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(160, 44)) as pilot:
+            app._handle_command("/split right")
+            await pilot.pause()
+            assert len(app.panes) == 2
+            assert app.active_pane_id == "pane-2"
+
+            app._handle_command("/focus left")
+            prompt = app.query_one(PromptArea)
+            prompt.text = "慢任务"
+            await pilot.press("ctrl+enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if slow_started.is_set():
+                    break
+
+            assert app.panes["pane-1"].busy
+            app._handle_command("/focus right")
+            assert not prompt.disabled
+            prompt.text = "快任务"
+            await pilot.press("ctrl+enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if not app.panes["pane-2"].busy:
+                    break
+
+            assert app.panes["pane-1"].streaming_buffer == "慢"
+            fast_timeline = app.query_one("#timeline-pane-2")
+            assert len(list(fast_timeline.query(Markdown))) == 1
+            assert app.panes["pane-2"].session.messages[-1]["content"] == "快完成"
+
+            release_slow.set()
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if not app.panes["pane-1"].busy:
+                    break
+            assert not app.panes["pane-1"].busy
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release_slow.set()
+
+
+def test_ctrl_w_direction_is_portable_split_fallback(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.press("ctrl+w", "right")
+            await pilot.pause()
+
+            assert len(app.panes) == 2
+            assert app.active_pane_id == "pane-2"
+
+    asyncio.run(exercise())
+
+
+def test_closing_pane_detaches_without_ending_session(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(140, 40)) as pilot:
+            app.action_split("right")
+            await pilot.pause()
+            detached_id = app.session.session_id
+            detached_session = app.session
+
+            app.action_close_pane()
+            await pilot.pause()
+
+            assert not detached_session.closed
+            assert detached_id in app.sessions.detached
+            app._session_selected(detached_id)
+            await pilot.pause()
+            assert app.session is detached_session
+            assert not app.session.closed
+
+    asyncio.run(exercise())
+
+
+def test_event_for_unmounted_session_is_not_routed_to_active_pane(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        rendered: list[str] = []
+        async with app.run_test(size=(120, 40)):
+            app._render_agent_event = (  # type: ignore[method-assign]
+                lambda event, runtime: rendered.append(runtime.pane_id)
+            )
+            app.receive_agent_event(
+                AgentEvent(
+                    kind="model_delta",
+                    iteration=1,
+                    content="late",
+                    session_id="gone",
+                )
+            )
+
+            assert rendered == []
+
+    asyncio.run(exercise())
+
+
 def test_tool_card_is_collapsed_with_key_argument_and_bounded_summary(
     tmp_path: Path,
 ) -> None:
@@ -288,11 +481,11 @@ def test_tool_card_is_collapsed_with_key_argument_and_bounded_summary(
             await pilot.press("ctrl+enter")
             for _ in range(30):
                 await pilot.pause(0.02)
-                if not app.busy and "read" in app.tool_cards:
+                if not app.busy and "read" in app._active_runtime().tool_cards:
                     break
 
-            card = app.tool_cards["read"]
-            body = app.tool_bodies["read"]
+            card = app._active_runtime().tool_cards["read"]
+            body = app._active_runtime().tool_bodies["read"]
             assert isinstance(card, Collapsible)
             assert card.collapsed
             assert card.title == "✓ read_file · README.md · 1–10"
@@ -324,12 +517,15 @@ def test_tui_renders_first_stream_delta_before_completion(tmp_path: Path) -> Non
             await pilot.press("ctrl+enter")
             for _ in range(30):
                 await pilot.pause(0.02)
-                if first_delta.is_set() and app.streaming_buffer == "流":
+                if (
+                    first_delta.is_set()
+                    and app._active_runtime().streaming_buffer == "流"
+                ):
                     break
 
             assert app.busy
-            assert app.streaming_buffer == "流"
-            assert app.streaming_markdown is not None
+            assert app._active_runtime().streaming_buffer == "流"
+            assert app._active_runtime().streaming_markdown is not None
 
             release.set()
             for _ in range(30):

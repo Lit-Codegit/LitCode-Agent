@@ -5,12 +5,19 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping
 
-from litcode_agent.tools.base import Tool, ToolError, ToolResult
+from litcode_agent.tools.base import (
+    ContextualTool,
+    Tool,
+    ToolDefinition,
+    ToolError,
+    ToolExecutionContext,
+    ToolResult,
+)
 
 
 class ToolRegistry:
-    def __init__(self, tools: Iterable[Tool]) -> None:
-        self._tools: dict[str, Tool] = {}
+    def __init__(self, tools: Iterable[Tool | ContextualTool]) -> None:
+        self._tools: dict[str, ToolDefinition] = {}
         for tool in tools:
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool name: {tool.name}")
@@ -31,7 +38,12 @@ class ToolRegistry:
             for tool in self._tools.values()
         ]
 
-    def execute_json(self, name: str, raw_arguments: str) -> ToolResult:
+    def execute_json(
+        self,
+        name: str,
+        raw_arguments: str,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult.error(f"unknown tool: {name}")
@@ -42,6 +54,11 @@ class ToolRegistry:
         if not isinstance(arguments, dict):
             return ToolResult.error("tool arguments must be a JSON object")
         try:
+            if isinstance(tool, ContextualTool):
+                if context is None:
+                    raise ToolError("tool requires an active session context")
+                return tool.execute_with_context(arguments, context)
+            assert isinstance(tool, Tool)
             return tool.execute(arguments)
         except (ToolError, OSError) as error:
             return ToolResult.error(str(error))

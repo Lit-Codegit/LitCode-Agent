@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from pathlib import Path
+from typing import Mapping, Protocol, runtime_checkable
 
 
 class ToolError(ValueError):
@@ -31,11 +32,35 @@ class ToolResult:
         return cls(content=message, is_error=True)
 
 
-class Tool(Protocol):
-    """The small interface implemented by every local tool."""
+class ToolDefinition(Protocol):
+    """Metadata shared by ordinary and session-context tools."""
 
     name: str
     description: str
     input_schema: Mapping[str, object]
 
+
+@runtime_checkable
+class Tool(ToolDefinition, Protocol):
+    """A local tool whose caller identity is irrelevant."""
+
     def execute(self, arguments: Mapping[str, object]) -> ToolResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionContext:
+    """Trusted invocation identity supplied by the Agent runtime."""
+
+    session_id: str
+    workspace: Path
+
+
+@runtime_checkable
+class ContextualTool(ToolDefinition, Protocol):
+    """A tool that requires an unforgeable active-session context."""
+
+    def execute_with_context(
+        self,
+        arguments: Mapping[str, object],
+        context: ToolExecutionContext,
+    ) -> ToolResult: ...

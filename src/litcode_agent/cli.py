@@ -14,6 +14,8 @@ from litcode_agent.agent import Agent
 from litcode_agent.config import ConfigurationError, Settings
 from litcode_agent.hooks import HookRunner
 from litcode_agent.model import ModelError, OpenAIChatModel
+from litcode_agent.prompt import PromptBuilder
+from litcode_agent.skills import SkillCatalog
 from litcode_agent.tools import build_default_registry
 from litcode_agent.tui import run_tui
 from litcode_agent.ui import TerminalUI
@@ -94,6 +96,7 @@ def main(
         return 0
 
     model = OpenAIChatModel(settings)
+    skills = SkillCatalog.discover(settings.workspace)
     if getattr(args, "model", None):
         model.select_model(args.model)
 
@@ -110,10 +113,13 @@ def main(
 
     agent = Agent(
         model,
-        build_default_registry(settings, terminal.confirm_command),
+        build_default_registry(settings, terminal.confirm_command, skills),
         settings.max_iterations,
         terminal.handle_event,
         HookRunner(settings.workspace, settings.hooks),
+        PromptBuilder(
+            settings.workspace, settings.max_iterations, skills.metadata()
+        ).build(),
     )
     if args.command == "run":
         terminal.show_user(args.task)

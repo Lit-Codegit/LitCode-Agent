@@ -20,6 +20,7 @@ from litcode_agent.model import (
     ToolCall,
 )
 from litcode_agent.tools.base import ToolResult
+from litcode_agent.tools.base import ToolExecutionContext
 from litcode_agent.tools.registry import ToolRegistry
 from litcode_agent.session_store import Checkpoint, SessionStore
 from litcode_agent.tools.workspace import Workspace
@@ -59,6 +60,7 @@ class AgentEvent:
     content: str | None = None
     is_error: bool = False
     has_tool_calls: bool = False
+    session_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +137,11 @@ class Agent:
                     kind="hook_result",
                     iteration=iteration,
                     hook_execution=execution,
+                    session_id=(
+                        str(payload["session_id"])
+                        if "session_id" in payload
+                        else None
+                    ),
                 )
             )
         return outcome
@@ -212,7 +219,11 @@ class AgentSession:
             if cancelled():
                 return self._cancelled(iteration - 1)
             self.agent.event_sink(
-                AgentEvent(kind="model_start", iteration=iteration)
+                AgentEvent(
+                    kind="model_start",
+                    iteration=iteration,
+                    session_id=self.session_id,
+                )
             )
             turn, stream_cancelled = self._request_model(
                 iteration,
@@ -268,6 +279,7 @@ class AgentSession:
                     iteration=iteration,
                     content=turn.content,
                     has_tool_calls=bool(turn.tool_calls),
+                    session_id=self.session_id,
                 )
             )
             return turn, False
@@ -329,6 +341,7 @@ class AgentSession:
                 iteration=iteration,
                 content=turn.content,
                 has_tool_calls=bool(tool_calls),
+                session_id=self.session_id,
             )
         )
         return turn, stream_cancelled
@@ -339,6 +352,7 @@ class AgentSession:
                 kind="model_delta",
                 iteration=iteration,
                 content=content,
+                session_id=self.session_id,
             )
         )
 
@@ -376,6 +390,7 @@ class AgentSession:
                 kind="tool_start",
                 iteration=iteration,
                 tool_call=tool_call,
+                session_id=self.session_id,
             )
         )
         tool_input = _hook_tool_input(tool_call.arguments)
@@ -397,7 +412,9 @@ class AgentSession:
             ToolResult.error(f"blocked by PreToolUse hook: {pre_tool.reason}")
             if pre_tool.blocked
             else self.agent.tools.execute_json(
-                tool_call.name, tool_call.arguments
+                tool_call.name,
+                tool_call.arguments,
+                ToolExecutionContext(self.session_id, self.agent._workspace()),
             )
         )
         self._append_message(
@@ -435,6 +452,7 @@ class AgentSession:
                 tool_call=tool_call,
                 content=result.content,
                 is_error=result.is_error,
+                session_id=self.session_id,
             )
         )
 

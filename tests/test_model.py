@@ -122,6 +122,17 @@ def test_rejects_empty_model_selection(tmp_path: Path) -> None:
         model.select_model("  ")
 
 
+def test_cloned_model_selection_is_isolated_but_reuses_client(tmp_path: Path) -> None:
+    client = fake_client(SimpleNamespace(choices=[]))
+    original = OpenAIChatModel(settings(tmp_path), client)
+
+    clone = original.clone_for_model("other-model")
+
+    assert clone.client is original.client
+    assert clone.model == "other-model"
+    assert original.model == "example-model"
+
+
 def test_stream_normalizes_text_and_split_tool_arguments(tmp_path: Path) -> None:
     chunks = [
         SimpleNamespace(

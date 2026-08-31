@@ -18,7 +18,9 @@ def test_loads_and_normalizes_settings(tmp_path: Path) -> None:
             "LITCODE_MAX_OUTPUT_CHARS": "1234",
             "LITCODE_MAX_REFERENCE_FILE_CHARS": "2048",
             "LITCODE_MAX_REFERENCE_CHARS": "8192",
+            "LITCODE_MAX_SESSION_REFERENCE_CHARS": "4096",
             "LITCODE_COMMAND_POLICY": "deny",
+            "LITCODE_SESSION_MESSAGE_POLICY": "allow",
         },
     )
 
@@ -30,7 +32,9 @@ def test_loads_and_normalizes_settings(tmp_path: Path) -> None:
     assert settings.max_output_chars == 1234
     assert settings.max_reference_file_chars == 2048
     assert settings.max_reference_chars == 8192
+    assert settings.max_session_reference_chars == 4096
     assert settings.command_policy == "deny"
+    assert settings.session_message_policy == "allow"
 
 
 def test_uses_safe_defaults(tmp_path: Path) -> None:
@@ -44,7 +48,9 @@ def test_uses_safe_defaults(tmp_path: Path) -> None:
     assert settings.max_output_chars == 20_000
     assert settings.max_reference_file_chars == 32_768
     assert settings.max_reference_chars == 131_072
+    assert settings.max_session_reference_chars == 4096
     assert settings.command_policy == "confirm"
+    assert settings.session_message_policy == "confirm"
 
 
 @pytest.mark.parametrize("missing", ["OPENAI_API_KEY", "LITCODE_MODEL"])
@@ -64,7 +70,9 @@ def test_requires_model_credentials(tmp_path: Path, missing: str) -> None:
         ("LITCODE_MAX_OUTPUT_CHARS", "-1"),
         ("LITCODE_MAX_REFERENCE_FILE_CHARS", "0"),
         ("LITCODE_MAX_REFERENCE_CHARS", "many"),
+        ("LITCODE_MAX_SESSION_REFERENCE_CHARS", "0"),
         ("LITCODE_COMMAND_POLICY", "sometimes"),
+        ("LITCODE_SESSION_MESSAGE_POLICY", "sometimes"),
     ],
 )
 def test_rejects_invalid_limits(tmp_path: Path, name: str, value: str) -> None:

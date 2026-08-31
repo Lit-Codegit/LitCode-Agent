@@ -1,4 +1,5 @@
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -20,6 +21,182 @@ def test_persists_sessions_checkpoints_and_forks(tmp_path: Path) -> None:
     assert store.load(session_id) == tuple(messages)
     assert store.load(fork_id) == tuple(messages)
     assert store.list_sessions(tmp_path)[0].parent_id == session_id
+
+
+def test_sessions_receive_stable_human_readable_aliases(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+
+    first = store.create(tmp_path, "model", [])
+    second = store.create(tmp_path, "model", [])
+    aliases = {item.id: item.alias for item in store.list_sessions(tmp_path)}
+
+    assert aliases[first] != aliases[second]
+    assert aliases[first][:6].isdigit()
+    assert aliases[first][6] == "-"
+    assert aliases[first][11] == "-"
+    assert len(aliases[first]) == 15
+    assert set(aliases[first][-3:]) <= set("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+
+    store.close()
+    reopened = SessionStore(tmp_path / "sessions.db")
+    assert reopened.session_info(first).alias == aliases[first]
+
+
+def test_existing_database_is_backfilled_with_aliases(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "sessions.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE sessions ("
+        "id TEXT PRIMARY KEY, workspace TEXT NOT NULL, title TEXT NOT NULL, "
+        "model TEXT NOT NULL, parent_id TEXT, messages_json TEXT NOT NULL, "
+        "summary TEXT, summary_boundary INTEGER, created_at REAL NOT NULL, "
+        "updated_at REAL NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?)",
+        ("legacy-id", str(tmp_path.resolve()), "旧会话", "model", "[]", 0.0, 0.0),
+    )
+    connection.commit()
+    connection.close()
+
+    store = SessionStore(path)
+
+    info = store.session_info("legacy-id")
+    assert info.alias == "700101-0800-" + info.alias[-3:]
+    assert len(info.alias) == 15
+
+
+def test_builds_bounded_session_capsule_in_same_workspace(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    source = store.create(tmp_path, "model-a", [{"role": "system", "content": "system"}])
+    store.save_messages(
+        source,
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "检查登录失败"},
+            {"role": "assistant", "content": "根因是 token 已过期；建议刷新 token。"},
+        ],
+        title="登录问题",
+    )
+    alias = store.session_info(source).alias
+
+    capsule = store.session_capsule(tmp_path, alias, max_chars=48)
+
+    assert capsule.alias == alias
+    assert capsule.title == "登录问题"
+    assert len(capsule.content) <= 48
+    assert "登录问题" in capsule.content
+    assert capsule.truncated
+
+
+def test_session_alias_cannot_resolve_across_workspaces(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    store = SessionStore(tmp_path / "sessions.db")
+    source = store.create(first, "model", [])
+    alias = store.session_info(source).alias
+
+    with pytest.raises(KeyError):
+        store.session_capsule(second, alias, max_chars=100)
+
+
+def test_session_inbox_preserves_source_and_read_state(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    source = store.create(tmp_path, "model", [])
+    target = store.create(tmp_path, "model", [])
+    target_alias = store.session_info(target).alias
+
+    delivered = store.send_to_session(
+        tmp_path, source, target_alias, "请验证缓存测试"
+    )
+
+    assert delivered.source_session_id == source
+    assert delivered.target_session_id == target
+    assert delivered.content == "请验证缓存测试"
+    assert not delivered.read
+    assert store.inbox(target) == (delivered,)
+
+    store.mark_inbox_read(target, delivered.id)
+    assert store.inbox(target) == ()
+    assert store.inbox(target, unread_only=False)[0].read
+
+
+def test_session_message_cannot_cross_workspace(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    store = SessionStore(tmp_path / "sessions.db")
+    source = store.create(first, "model", [])
+    target = store.create(second, "model", [])
+
+    with pytest.raises(KeyError):
+        store.send_to_session(
+            first, source, store.session_info(target).alias, "越界消息"
+        )
+
+
+def test_searches_only_relevant_bounded_session_context(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    source = store.create(tmp_path, "model", [])
+    store.save_messages(
+        source,
+        [
+            {"role": "user", "content": "数据库迁移已完成"},
+            {"role": "assistant", "content": "迁移测试通过"},
+            {"role": "user", "content": "CSS 颜色待定"},
+        ],
+    )
+    alias = store.session_info(source).alias
+
+    excerpt = store.search_session_context(
+        tmp_path, alias, "迁移", max_chars=30
+    )
+
+    assert "迁移" in excerpt
+    assert "CSS" not in excerpt
+    assert len(excerpt) <= 30
+
+
+def test_session_store_serializes_concurrent_inbox_writes(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    source = store.create(tmp_path, "model", [])
+    target = store.create(tmp_path, "model", [])
+    alias = store.session_info(target).alias
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        delivered = list(
+            pool.map(
+                lambda number: store.send_to_session(
+                    tmp_path, source, alias, f"message-{number}"
+                ),
+                range(40),
+            )
+        )
+
+    assert len({message.id for message in delivered}) == 40
+    assert len(store.inbox(target)) == 40
+
+
+def test_session_reference_snapshot_is_immutable_and_traceable(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    target = store.create(tmp_path, "model", [])
+    source = store.create(tmp_path, "model", [])
+    info = store.session_info(source)
+
+    snapshot = store.record_session_reference(
+        target, info.alias, info.updated_at, "第一次 capsule"
+    )
+    store.save_messages(source, [{"role": "assistant", "content": "后来改变"}])
+
+    loaded = store.session_references(target)[0]
+    assert loaded == snapshot
+    assert loaded.source_alias == info.alias
+    assert loaded.capsule == "第一次 capsule"
 
 
 def test_rewinds_and_reapplies_agent_file_changes(tmp_path: Path) -> None:

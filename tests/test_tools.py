@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -17,9 +19,10 @@ from litcode_agent.tools import (
 )
 from litcode_agent.config import ReadRoot, Settings
 from litcode_agent.read_scope import ReadScope
-from litcode_agent.tools.base import ToolError
+from litcode_agent.tools.base import ToolError, ToolExecutionContext
 from litcode_agent.tools.command import is_dangerous_command
 from litcode_agent.tools.files import truncate_output
+from litcode_agent.session_store import SessionStore
 
 
 def test_workspace_rejects_parent_traversal(tmp_path: Path) -> None:
@@ -182,7 +185,7 @@ def test_registry_exports_schemas_and_reports_recoverable_errors(
     assert invalid.is_error and "does not exist" in invalid.content
 
 
-def test_default_registry_contains_exactly_the_mvp_tools(tmp_path: Path) -> None:
+def test_default_registry_contains_core_and_progressive_context_tools(tmp_path: Path) -> None:
     settings = Settings.from_env(
         tmp_path,
         {"OPENAI_API_KEY": "secret", "LITCODE_MODEL": "example-model"},
@@ -199,7 +202,56 @@ def test_default_registry_contains_exactly_the_mvp_tools(tmp_path: Path) -> None
         "search_files",
         "apply_patch",
         "run_command",
+        "load_skill",
     }
+
+
+def test_default_registry_serializes_workspace_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings.from_env(
+        tmp_path,
+        {"OPENAI_API_KEY": "secret", "LITCODE_MODEL": "example-model"},
+    )
+    registry = build_default_registry(settings)
+    command_started = threading.Event()
+    release_command = threading.Event()
+    patch_finished = threading.Event()
+
+    def blocking_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command_started.set()
+        assert release_command.wait(2)
+        return subprocess.CompletedProcess(args="noop", returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("litcode_agent.tools.command.subprocess.run", blocking_run)
+    command_thread = threading.Thread(
+        target=lambda: registry.execute_json(
+            "run_command", json.dumps({"command": "noop"})
+        )
+    )
+    patch_thread = threading.Thread(
+        target=lambda: (
+            registry.execute_json(
+                "apply_patch",
+                json.dumps(
+                    {"path": "shared.txt", "old_text": "", "new_text": "done"}
+                ),
+            ),
+            patch_finished.set(),
+        )
+    )
+
+    command_thread.start()
+    assert command_started.wait(1)
+    patch_thread.start()
+    assert not patch_finished.wait(0.05)
+    assert not (tmp_path / "shared.txt").exists()
+    release_command.set()
+    command_thread.join(2)
+    patch_thread.join(2)
+
+    assert patch_finished.is_set()
+    assert (tmp_path / "shared.txt").read_text() == "done"
 
 
 def test_read_tools_can_use_named_external_root_but_patch_cannot(
@@ -222,3 +274,56 @@ def test_read_tools_can_use_named_external_root_but_patch_cannot(
         ApplyPatchTool(workspace).execute(
             {"path": "docs/notes.txt", "old_text": "external", "new_text": "x"}
         )
+
+
+def test_session_tools_use_runtime_source_identity_and_confirmation(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    source = store.create(tmp_path, "model", [])
+    target = store.create(tmp_path, "model", [])
+    target_alias = store.session_info(target).alias
+    confirmations: list[str] = []
+    settings = Settings.from_env(
+        tmp_path,
+        {"OPENAI_API_KEY": "secret", "LITCODE_MODEL": "model"},
+    )
+    registry = build_default_registry(
+        settings,
+        store=store,
+        confirm_session_message=lambda description: not confirmations.append(description),
+    )
+
+    result = registry.execute_json(
+        "send_session_message",
+        json.dumps({"session": target_alias, "instruction": "运行测试"}),
+        ToolExecutionContext(source, tmp_path.resolve()),
+    )
+
+    assert not result.is_error
+    assert confirmations and target_alias in confirmations[0]
+    assert store.inbox(target)[0].source_session_id == source
+
+
+def test_session_context_tool_returns_query_bounded_excerpt(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    source = store.create(tmp_path, "model", [])
+    store.save_messages(
+        source,
+        [{"role": "assistant", "content": "测试结论：需要 workspace lock"}],
+    )
+    alias = store.session_info(source).alias
+    settings = Settings.from_env(
+        tmp_path,
+        {"OPENAI_API_KEY": "secret", "LITCODE_MODEL": "model"},
+    )
+    registry = build_default_registry(settings, store=store)
+
+    result = registry.execute_json(
+        "read_session_context",
+        json.dumps({"session": alias, "query": "workspace", "max_chars": 64}),
+        ToolExecutionContext(source, tmp_path.resolve()),
+    )
+
+    assert "workspace lock" in result.content
+    assert len(result.content) <= 64

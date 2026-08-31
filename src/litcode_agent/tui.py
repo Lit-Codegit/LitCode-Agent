@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from rich.text import Text
 from textual import events, on
@@ -30,8 +30,8 @@ from textual.widgets.option_list import Option
 
 from litcode_agent.agent import Agent, AgentEvent, AgentSession
 from litcode_agent.config import Settings
-from litcode_agent.hooks import HookRunner
 from litcode_agent.model import ModelError, OpenAIChatModel, ToolCall
+from litcode_agent.pane_layout import PaneBranch, PaneLayout, PaneLeaf, PaneNode
 from litcode_agent.references import (
     ReferenceBundle,
     ReferenceError,
@@ -40,6 +40,8 @@ from litcode_agent.references import (
 )
 from litcode_agent.prompt import PromptBuilder
 from litcode_agent.session_store import Checkpoint, SessionStore
+from litcode_agent.session_workspace import PaneSession, SessionWorkspace
+from litcode_agent.skills import SkillCatalog
 from litcode_agent.tool_display import tool_result_summary, tool_title
 from litcode_agent.tools import build_default_registry
 from litcode_agent.tools.workspace import Workspace
@@ -61,6 +63,10 @@ COMMANDS = (
     CommandSpec("/rewind", "回到历史检查点", "rewind"),
     CommandSpec("/redo", "撤销最近一次 rewind", "redo"),
     CommandSpec("/fork", "从检查点创建分支", "fork"),
+    CommandSpec("/split", "按方向创建会话 pane", "split"),
+    CommandSpec("/focus", "按方向切换 pane", "focus"),
+    CommandSpec("/close-pane", "关闭当前 pane", "close_pane"),
+    CommandSpec("/inbox", "查看当前会话收件箱", "inbox"),
     CommandSpec("/exit", "退出 LitCode", "exit", ("/quit",)),
 )
 
@@ -72,6 +78,21 @@ class CompletionContext:
     row: int
     start_column: int
     end_column: int
+
+
+@dataclass(slots=True)
+class PaneRuntime:
+    pane_id: str
+    agent: Agent
+    model: OpenAIChatModel
+    session: AgentSession
+    busy: bool = False
+    cancel_requested: threading.Event = field(default_factory=threading.Event)
+    tool_bodies: dict[str, Static] = field(default_factory=dict)
+    tool_cards: dict[str, Collapsible] = field(default_factory=dict)
+    streaming_markdown: Markdown | None = None
+    streaming_buffer: str = ""
+    rendered_output: str | None = None
 
 
 class PromptArea(TextArea):
@@ -141,13 +162,14 @@ class ConfirmCommand(ModalScreen[bool]):
 
     BINDINGS = [Binding("escape", "deny", "拒绝")]
 
-    def __init__(self, command: str) -> None:
+    def __init__(self, command: str, dialog_title: str = "危险命令请求") -> None:
         super().__init__()
         self.command = command
+        self.dialog_title = dialog_title
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-dialog"):
-            yield Label("危险命令请求", classes="dialog-title")
+            yield Label(self.dialog_title, classes="dialog-title")
             yield Static(Text(self.command), id="confirm-command")
             with Horizontal(classes="dialog-buttons"):
                 yield Button("拒绝", id="deny", variant="default")
@@ -230,6 +252,15 @@ class LitCodeTUI(App[None]):
         ),
         Binding("ctrl+l", "clear_session", "清空", show=True),
         Binding("f2", "choose_model", "模型", show=True),
+        Binding("ctrl+w", "pane_leader", "分屏前缀", show=True, priority=True),
+        Binding("super+left", "split('left')", "向左分屏", show=False),
+        Binding("super+right", "split('right')", "向右分屏", show=False),
+        Binding("super+up", "split('up')", "向上分屏", show=False),
+        Binding("super+down", "split('down')", "向下分屏", show=False),
+        Binding("super+shift+left", "focus_pane('left')", "聚焦左侧", show=False),
+        Binding("super+shift+right", "focus_pane('right')", "聚焦右侧", show=False),
+        Binding("super+shift+up", "focus_pane('up')", "聚焦上方", show=False),
+        Binding("super+shift+down", "focus_pane('down')", "聚焦下方", show=False),
     ]
     CSS = """
     Screen {
@@ -243,7 +274,29 @@ class LitCodeTUI(App[None]):
         background: $panel;
         border-bottom: solid $primary;
     }
-    #timeline {
+    #pane-area, .split-horizontal, .split-vertical {
+        height: 1fr;
+        width: 1fr;
+    }
+    .session-pane {
+        height: 1fr;
+        width: 1fr;
+        border: round $secondary;
+    }
+    .session-pane.pane-active {
+        border: round $primary;
+    }
+    .pane-header {
+        height: 1;
+        padding: 0 1;
+        background: $panel;
+        color: $text-muted;
+    }
+    .pane-active > .pane-header {
+        color: $primary;
+        text-style: bold;
+    }
+    .pane-timeline {
         height: 1fr;
         padding: 1 2;
         scrollbar-size: 1 1;
@@ -352,47 +405,142 @@ class LitCodeTUI(App[None]):
         super().__init__()
         self.settings = settings
         self.model = model
-        self.cancel_requested = threading.Event()
         self.ui_thread_id: int | None = None
         self.shutting_down = False
-        self.busy = False
         self.pending_confirmations: set[threading.Event] = set()
-        self.tool_bodies: dict[str, Static] = {}
-        self.tool_cards: dict[str, Collapsible] = {}
         self.workspace = Workspace(settings.workspace)
+        self.skills = SkillCatalog.discover(settings.workspace)
         assert settings.session_database is not None
         self.store = SessionStore(settings.session_database)
         self.file_paths: tuple[str, ...] = ()
         self.directory_paths: tuple[str, ...] = ()
         self.completion_context: CompletionContext | None = None
         self.completion_values: list[str] = []
-        self.streaming_markdown: Markdown | None = None
-        self.streaming_buffer = ""
-        self.rendered_output: str | None = None
-        self.agent = Agent(
-            model,
-            build_default_registry(settings, self.confirm_command),
-            settings.max_iterations,
-            self.receive_agent_event,
-            HookRunner(settings.workspace, settings.hooks),
-            PromptBuilder(settings.workspace, settings.max_iterations).build(),
+        self.registry = build_default_registry(
+            settings,
+            self.confirm_command,
+            self.skills,
             self.store,
-            model.model,
-            settings.workspace,
+            self.confirm_session_message,
         )
-        self.session: AgentSession = self.agent.start_session()
+        self.system_prompt = PromptBuilder(
+            settings.workspace,
+            settings.max_iterations,
+            self.skills.metadata(),
+        ).build()
+        self.sessions = SessionWorkspace(
+            settings,
+            model,
+            self.registry,
+            self.system_prompt,
+            self.store,
+            self.receive_agent_event,
+        )
+        first = self.sessions.active
+        self.agent = first.agent
+        self.panes = {first.pane_id: self._pane_runtime(first)}
+        self._pane_leader = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="status")
-        yield VerticalScroll(id="timeline")
+        yield Vertical(self._pane_widget(self._active_runtime()), id="pane-area")
         with Vertical(id="composer"):
             yield OptionList(id="completion", compact=True, markup=False)
             yield Label(
-                "输入任务，使用 / 命令或 @ 引用文件 · Ctrl+Enter 发送",
+                "输入任务，使用 / 命令、@ 文件或 # 会话 · Ctrl+Enter 发送",
                 id="prompt-label",
             )
             yield PromptArea(id="prompt", language=None)
         yield Footer()
+
+    def _active_runtime(self) -> PaneRuntime:
+        return self.panes[self.active_pane_id]
+
+    @property
+    def active_pane_id(self) -> str:
+        return self.sessions.active_pane_id
+
+    @property
+    def pane_layout(self) -> PaneLayout:
+        return self.sessions.layout
+
+    @staticmethod
+    def _pane_runtime(pane: PaneSession) -> PaneRuntime:
+        return PaneRuntime(pane.pane_id, pane.agent, pane.model, pane.session)
+
+    def _sync_runtime(self, pane: PaneSession) -> PaneRuntime:
+        runtime = self.panes[pane.pane_id]
+        runtime.agent = pane.agent
+        runtime.model = pane.model
+        runtime.session = pane.session
+        self.agent = pane.agent
+        self.model = pane.model
+        return runtime
+
+    @property
+    def session(self) -> AgentSession:
+        return self._active_runtime().session
+
+    @property
+    def busy(self) -> bool:
+        return self._active_runtime().busy
+
+    def _pane_widget(self, runtime: PaneRuntime) -> Vertical:
+        info = self.store.session_info(runtime.session.session_id)
+        unread = len(self.store.inbox(runtime.session.session_id))
+        unread_label = f" · 未读 {unread}" if unread else ""
+        timeline_id = (
+            "timeline"
+            if runtime.pane_id == "pane-1"
+            else f"timeline-{runtime.pane_id}"
+        )
+        classes = (
+            "session-pane pane-active"
+            if runtime.pane_id == self.active_pane_id
+            else "session-pane"
+        )
+        return Vertical(
+            Static(
+                Text(f"{info.alias} · {info.title} · {info.model}{unread_label}"),
+                classes="pane-header",
+            ),
+            VerticalScroll(id=timeline_id, classes="pane-timeline"),
+            id=f"view-{runtime.pane_id}",
+            classes=classes,
+        )
+
+    def _layout_widget(self, node: PaneNode):
+        if isinstance(node, PaneLeaf):
+            return self._pane_widget(self.panes[node.pane_id])
+        children = (self._layout_widget(node.first), self._layout_widget(node.second))
+        if node.axis == "horizontal":
+            return Horizontal(*children, classes="split-horizontal")
+        return Vertical(*children, classes="split-vertical")
+
+    def _rebuild_panes(self) -> None:
+        area = self.query_one("#pane-area", Vertical)
+        area.remove_children()
+        area.mount(self._layout_widget(self.pane_layout.root))
+        self.call_after_refresh(self._render_all_pane_histories)
+
+    def _render_all_pane_histories(self) -> None:
+        for runtime in self.panes.values():
+            self._render_runtime_history(runtime)
+
+    def action_pane_leader(self) -> None:
+        self._pane_leader = True
+        self._update_status("分屏：按方向键创建 pane")
+
+    def on_key(self, event: events.Key) -> None:
+        if not self._pane_leader:
+            return
+        self._pane_leader = False
+        if event.key in {"left", "right", "up", "down"}:
+            self.action_split(event.key)
+            event.prevent_default()
+            event.stop()
+            return
+        self._update_status("已取消分屏前缀")
 
     def on_mount(self) -> None:
         self.ui_thread_id = threading.get_ident()
@@ -401,6 +549,8 @@ class LitCodeTUI(App[None]):
             "会话已启动。输入 /help 查看命令，"
             "工具调用会显示在时间线中。"
         )
+        for issue in self.skills.issues:
+            self._append_notice(f"Skill 加载失败：{issue}", error=True)
         self.query_one(PromptArea).focus()
         self.run_worker(
             self._build_file_index,
@@ -413,10 +563,11 @@ class LitCodeTUI(App[None]):
 
     def on_unmount(self) -> None:
         self.shutting_down = True
-        self.cancel_requested.set()
+        for runtime in self.panes.values():
+            runtime.cancel_requested.set()
         for confirmation in self.pending_confirmations:
             confirmation.set()
-        self.session.close("user_exit", "")
+        self.sessions.close_all()
         self.store.close()
 
     @on(PromptArea.Submitted)
@@ -436,17 +587,27 @@ class LitCodeTUI(App[None]):
                 max_file_chars=self.settings.max_reference_file_chars,
                 max_total_chars=self.settings.max_reference_chars,
                 read_roots=self.settings.read_roots,
+                session_store=self.store,
+                max_session_chars=self.settings.max_session_reference_chars,
             )
         except ReferenceError as error:
             self._append_notice(str(error), error=True)
             return
+        for reference in bundle.session_references:
+            self.store.record_session_reference(
+                self.session.session_id,
+                reference.alias,
+                reference.updated_at,
+                reference.content,
+            )
         self._append_user_bundle(bundle)
-        self._set_busy(True, "正在启动…")
-        self.cancel_requested.clear()
+        runtime = self._active_runtime()
+        self._set_pane_busy(runtime, True, "正在启动…")
+        runtime.cancel_requested.clear()
         self.run_worker(
-            lambda: self._run_turn(bundle.model_text),
-            name="agent-turn",
-            group="agent",
+            lambda: self._run_turn(bundle.model_text, runtime.pane_id),
+            name=f"agent-turn-{runtime.pane_id}",
+            group=f"agent-{runtime.pane_id}",
             thread=True,
             exclusive=True,
             exit_on_error=False,
@@ -463,54 +624,69 @@ class LitCodeTUI(App[None]):
         if event.option.id is not None:
             self._insert_completion(int(event.option.id))
 
-    def _run_turn(self, value: str) -> None:
+    def _run_turn(self, value: str, pane_id: str) -> None:
+        runtime = self.panes[pane_id]
         try:
-            result = self.session.ask(value, self.cancel_requested.is_set)
+            result = runtime.session.ask(value, runtime.cancel_requested.is_set)
         except ModelError as error:
-            self.call_from_thread(self._finish_with_error, str(error))
+            self.call_from_thread(self._finish_with_error, str(error), pane_id)
             return
         except Exception as error:  # keep an unexpected worker error visible
             self.call_from_thread(
                 self._finish_with_error,
                 f"未预期错误：{type(error).__name__}: {error}",
+                pane_id,
             )
             return
-        self.call_from_thread(self._finish_turn, result.output, result.succeeded)
+        self.call_from_thread(
+            self._finish_turn, result.output, result.succeeded, pane_id
+        )
 
     def receive_agent_event(self, event: AgentEvent) -> None:
         if self.shutting_down:
             return
+        runtime = next(
+            (
+                item
+                for item in self.panes.values()
+                if item.session.session_id == event.session_id
+            ),
+            None,
+        )
+        if runtime is None:
+            return
         if threading.get_ident() == self.ui_thread_id:
-            self._render_agent_event(event)
+            self._render_agent_event(event, runtime)
         else:
-            self.call_from_thread(self._render_agent_event, event)
+            self.call_from_thread(self._render_agent_event, event, runtime)
 
-    def _render_agent_event(self, event: AgentEvent) -> None:
+    def _render_agent_event(self, event: AgentEvent, runtime: PaneRuntime) -> None:
         if event.kind == "model_start":
-            self._start_streaming_message()
-            self._update_status(f"第 {event.iteration} 轮 · 请求模型")
+            self._start_streaming_message(runtime)
+            self._update_pane_status(runtime, f"第 {event.iteration} 轮 · 请求模型")
             return
         if event.kind == "model_delta":
-            self._append_stream_delta(event.content or "")
+            self._append_stream_delta(event.content or "", runtime)
             return
         if event.kind == "model_end":
-            self._end_streaming_message(event.content, event.has_tool_calls)
+            self._end_streaming_message(event.content, event.has_tool_calls, runtime)
             return
         if event.kind == "hook_result":
             assert event.hook_execution is not None
             execution = event.hook_execution
             status = "完成" if execution.return_code == 0 else "失败"
-            self._append_notice(f"hook {execution.event} · {status}")
+            self._append_notice(f"hook {execution.event} · {status}", runtime=runtime)
             return
         assert event.tool_call is not None
         if event.kind == "tool_start":
-            self._append_tool(event.tool_call)
-            self._update_status(f"正在调用工具 · {event.tool_call.name}")
+            self._append_tool(event.tool_call, runtime)
+            self._update_pane_status(runtime, f"正在调用工具 · {event.tool_call.name}")
             return
         self._finish_tool(
             event.tool_call,
             event.content or "（无输出）",
             event.is_error,
+            runtime,
         )
 
     def _handle_command(self, command: str) -> None:
@@ -534,8 +710,21 @@ class LitCodeTUI(App[None]):
             "rewind": self.action_rewind,
             "redo": self.action_redo,
             "fork": self.action_fork,
+            "split": lambda: self._command_direction(arguments, self.action_split),
+            "focus": lambda: self._command_direction(arguments, self.action_focus_pane),
+            "close_pane": self.action_close_pane,
+            "inbox": self.action_inbox,
         }
         handlers[spec.handler]()
+
+    def _command_direction(self, arguments: str, action) -> None:
+        direction = arguments.strip().lower()
+        if direction not in {"left", "right", "up", "down"}:
+            self._append_notice(
+                "方向必须是 left、right、up 或 down。", error=True
+            )
+            return
+        action(direction)
 
     def _show_help(self) -> None:
         self._append_notice(
@@ -545,10 +734,80 @@ class LitCodeTUI(App[None]):
 
     def action_cancel_or_quit(self) -> None:
         if self.busy:
-            self.cancel_requested.set()
+            self._active_runtime().cancel_requested.set()
             self._update_status("正在停止；等待当前阻塞调用返回…")
             return
         self.exit()
+
+    def action_split(self, direction: str) -> None:
+        if direction not in {"left", "right", "up", "down"}:
+            self._append_notice(f"未知分屏方向：{direction}", error=True)
+            return
+        if len(self.panes) >= 4:
+            self._append_notice("第一版最多同时打开 4 个 pane。", error=True)
+            return
+        if any(runtime.busy for runtime in self.panes.values()):
+            self._append_notice(
+                "等待所有 pane 当前任务结束后再改变布局。", error=True
+            )
+            return
+        pane = self.sessions.split(direction)
+        runtime = self._pane_runtime(pane)
+        self.panes[pane.pane_id] = runtime
+        self.agent = runtime.agent
+        self.model = runtime.model
+        self._rebuild_panes()
+        self._set_pane_busy(runtime, False, "新 pane")
+
+    def action_focus_pane(self, direction: str) -> None:
+        if direction not in {"left", "right", "up", "down"}:
+            self._append_notice(f"未知焦点方向：{direction}", error=True)
+            return
+        previous = self.active_pane_id
+        pane = self.sessions.focus(direction)
+        if pane is None:
+            self._append_notice(f"{direction} 方向没有 pane。")
+            return
+        target = pane.pane_id
+        try:
+            self.query_one(f"#view-{previous}").remove_class("pane-active")
+            self.query_one(f"#view-{target}").add_class("pane-active")
+        except Exception:
+            pass
+        runtime = self._active_runtime()
+        self.agent = runtime.agent
+        self.model = runtime.model
+        prompt = self.query_one(PromptArea)
+        prompt.disabled = runtime.busy
+        if not runtime.busy:
+            prompt.focus()
+        self._update_status("运行中" if runtime.busy else "就绪")
+
+    def action_close_pane(self) -> None:
+        if len(self.panes) == 1:
+            self._append_notice("不能关闭最后一个 pane。", error=True)
+            return
+        runtime = self._active_runtime()
+        if runtime.busy:
+            self._append_notice("请先停止当前 pane 的任务。", error=True)
+            return
+        removed_id, pane = self.sessions.close_active_pane()
+        del self.panes[removed_id]
+        self._sync_runtime(pane)
+        self._rebuild_panes()
+        self._update_status("就绪")
+
+    def action_inbox(self) -> None:
+        messages = self.sessions.consume_inbox()
+        if not messages:
+            self._append_notice("当前会话没有未读消息。")
+            return
+        for message in messages:
+            source = self.store.session_info(message.source_session_id)
+            self._append_notice(
+                f"来自 {source.alias} · {source.title}：\n{message.content}"
+            )
+        self._update_pane_header(self._active_runtime(), "就绪")
 
     def action_clear_session(self) -> None:
         if self.busy:
@@ -556,20 +815,24 @@ class LitCodeTUI(App[None]):
                 "请先停止或等待当前任务结束。", error=True
             )
             return
-        self.session.close("user_clear", "")
-        self.session = self.agent.start_session()
-        timeline = self.query_one("#timeline", VerticalScroll)
+        self.sessions.clear_active()
+        self._sync_runtime(self.sessions.active)
+        runtime = self._active_runtime()
+        timeline = self._timeline(self._active_runtime())
         timeline.remove_children()
-        self.tool_bodies.clear()
-        self.tool_cards.clear()
-        self.streaming_markdown = None
-        self.rendered_output = None
+        runtime.tool_bodies.clear()
+        runtime.tool_cards.clear()
+        runtime.streaming_markdown = None
+        runtime.rendered_output = None
         self._append_notice("对话上下文已清空。")
 
     def action_choose_session(self) -> None:
+        if self.busy:
+            self._append_notice("当前任务结束后才能切换会话。", error=True)
+            return
         sessions = self.store.list_sessions(self.settings.workspace)
         choices = tuple(
-            (item.id, f"{item.title} · {item.model} · {item.id[:8]}")
+            (item.id, f"{item.alias} · {item.title} · {item.model}")
             for item in sessions
         )
         if not choices:
@@ -580,11 +843,10 @@ class LitCodeTUI(App[None]):
     def _session_selected(self, identifier: str | None) -> None:
         if identifier is None or identifier == self.session.session_id:
             return
-        self.session.close("user_switch", "")
-        info = self.store.session_info(identifier)
-        self.model.select_model(info.model)
-        self.agent.model_name = info.model
-        self.session = self.agent.start_session(identifier)
+        if self.busy:
+            self._append_notice("当前任务结束后才能切换会话。", error=True)
+            return
+        self._sync_runtime(self.sessions.switch_active(identifier))
         self._render_session_history("已恢复会话")
 
     def action_compact(self, instructions: str = "") -> None:
@@ -592,26 +854,31 @@ class LitCodeTUI(App[None]):
             self._append_notice("当前任务结束后才能压缩。", error=True)
             return
         self._set_busy(True, "正在压缩上下文…")
+        pane_id = self.active_pane_id
         self.run_worker(
-            lambda: self._compact_worker(instructions),
-            name="compact",
-            group="agent",
+            lambda: self._compact_worker(instructions, pane_id),
+            name=f"compact-{pane_id}",
+            group=f"agent-{pane_id}",
             thread=True,
             exclusive=True,
             exit_on_error=False,
         )
 
-    def _compact_worker(self, instructions: str) -> None:
+    def _compact_worker(self, instructions: str, pane_id: str) -> None:
+        runtime = self.panes[pane_id]
         try:
-            summary = self.session.compact(instructions)
+            summary = runtime.session.compact(instructions)
         except (ModelError, ValueError) as error:
-            self.call_from_thread(self._finish_with_error, str(error))
+            self.call_from_thread(self._finish_with_error, str(error), pane_id)
             return
-        self.call_from_thread(self._compact_finished, summary)
+        self.call_from_thread(self._compact_finished, summary, pane_id)
 
-    def _compact_finished(self, summary: str) -> None:
-        self._append_notice(f"上下文已压缩：\n{summary[:1200]}")
-        self._set_busy(False, "就绪")
+    def _compact_finished(self, summary: str, pane_id: str) -> None:
+        runtime = self.panes[pane_id]
+        self._append_notice(
+            f"上下文已压缩：\n{summary[:1200]}", runtime=runtime
+        )
+        self._set_pane_busy(runtime, False, "就绪")
 
     def action_rewind(self) -> None:
         self._choose_checkpoint("选择 rewind 检查点", self._rewind_checkpoint)
@@ -650,8 +917,8 @@ class LitCodeTUI(App[None]):
         checkpoint = self._checkpoint(identifier)
         if checkpoint is None:
             return
-        self.session.close("user_fork", "")
-        self.session = self.session.fork(checkpoint)
+        self.sessions.fork_active(checkpoint)
+        self._sync_runtime(self.sessions.active)
         self._render_session_history(f"已从检查点创建分支：{checkpoint.label}")
 
     def _choose_checkpoint(self, title: str, callback) -> None:
@@ -673,21 +940,29 @@ class LitCodeTUI(App[None]):
         )
 
     def _render_session_history(self, notice: str) -> None:
-        timeline = self.query_one("#timeline", VerticalScroll)
+        runtime = self._active_runtime()
+        self._render_runtime_history(runtime)
+        self._append_notice(notice, runtime=runtime)
+
+    def _render_runtime_history(self, runtime: PaneRuntime) -> None:
+        timeline = self._timeline(runtime)
         timeline.remove_children()
-        self.tool_bodies.clear()
-        self.tool_cards.clear()
-        for message in self.session.messages[1:]:
+        runtime.tool_bodies.clear()
+        runtime.tool_cards.clear()
+        runtime.streaming_markdown = None
+        runtime.streaming_buffer = ""
+        runtime.rendered_output = None
+        for message in runtime.session.messages[1:]:
             content = message.get("content")
             if not isinstance(content, str) or not content:
                 continue
             if message.get("role") == "user":
                 self._mount_timeline(
-                    Static(Text(_display_user_content(content)), classes="message-user")
+                    Static(Text(_display_user_content(content)), classes="message-user"),
+                    runtime,
                 )
             elif message.get("role") == "assistant":
-                self._append_assistant(content)
-        self._append_notice(notice)
+                self._append_assistant(content, runtime)
 
     def action_choose_model(self) -> None:
         if self.busy:
@@ -722,9 +997,7 @@ class LitCodeTUI(App[None]):
 
     def _model_selected(self, selected: str | None) -> None:
         if selected and selected != self.model.model:
-            self.model.select_model(selected)
-            self.agent.model_name = selected
-            self.store.update_model(self.session.session_id, selected)
+            self.sessions.select_model(selected)
             self._append_notice(
                 f"已切换到模型 {selected}；对话上下文保持不变。"
             )
@@ -732,6 +1005,12 @@ class LitCodeTUI(App[None]):
         self.query_one(PromptArea).focus()
 
     def confirm_command(self, command: str) -> bool:
+        return self._confirm_action(command, "危险命令请求")
+
+    def confirm_session_message(self, description: str) -> bool:
+        return self._confirm_action(description, "跨会话消息确认")
+
+    def _confirm_action(self, content: str, title: str) -> bool:
         finished = threading.Event()
         decision = {"allowed": False}
         self.pending_confirmations.add(finished)
@@ -742,7 +1021,7 @@ class LitCodeTUI(App[None]):
 
         self.call_from_thread(
             self.push_screen,
-            ConfirmCommand(command),
+            ConfirmCommand(content, title),
             resolved,
         )
         finished.wait()
@@ -754,61 +1033,94 @@ class LitCodeTUI(App[None]):
         if bundle.references:
             paths = "、".join(reference.path for reference in bundle.references)
             content = f"{content}\n\n引用文件：{paths}"
-        self._mount_timeline(Static(Text(content), classes="message-user"))
+        if bundle.session_references:
+            aliases = "、".join(
+                reference.alias for reference in bundle.session_references
+            )
+            content = f"{content}\n\n引用会话：{aliases}"
+        self._mount_timeline(
+            Static(Text(content), classes="message-user"), self._active_runtime()
+        )
 
-    def _append_assistant(self, content: str) -> None:
-        self._mount_timeline(Markdown(content, classes="message-assistant"))
+    def _append_assistant(
+        self, content: str, runtime: PaneRuntime | None = None
+    ) -> None:
+        self._mount_timeline(
+            Markdown(content, classes="message-assistant"), runtime
+        )
 
-    def _append_notice(self, content: str, *, error: bool = False) -> None:
+    def _append_notice(
+        self,
+        content: str,
+        *,
+        error: bool = False,
+        runtime: PaneRuntime | None = None,
+    ) -> None:
         classes = "notice notice-error" if error else "notice"
-        self._mount_timeline(Static(Text(content), classes=classes))
+        self._mount_timeline(Static(Text(content), classes=classes), runtime)
 
-    def _append_tool(self, tool_call: ToolCall) -> None:
+    def _append_tool(self, tool_call: ToolCall, runtime: PaneRuntime) -> None:
         body = Static(Text("运行中…"))
         card = Collapsible(
             body,
             title=tool_title(tool_call, "●"),
             collapsed=True,
         )
-        self.tool_bodies[tool_call.id] = body
-        self.tool_cards[tool_call.id] = card
-        self._mount_timeline(card)
+        runtime.tool_bodies[tool_call.id] = body
+        runtime.tool_cards[tool_call.id] = card
+        self._mount_timeline(card, runtime)
 
     def _finish_tool(
-        self, tool_call: ToolCall, content: str, is_error: bool
+        self,
+        tool_call: ToolCall,
+        content: str,
+        is_error: bool,
+        runtime: PaneRuntime,
     ) -> None:
-        body = self.tool_bodies.get(tool_call.id)
-        card = self.tool_cards.get(tool_call.id)
+        body = runtime.tool_bodies.get(tool_call.id)
+        card = runtime.tool_cards.get(tool_call.id)
         if body is None or card is None:
-            self._append_notice(content, error=is_error)
+            self._append_notice(content, error=is_error, runtime=runtime)
             return
         card.title = tool_title(tool_call, "✗" if is_error else "✓")
         card.add_class("tool-failed" if is_error else "tool-succeeded")
         body.update(Text(tool_result_summary(content, is_error)))
+        for item in self.panes.values():
+            self._update_pane_header(item, "运行中" if item.busy else "就绪")
 
-    def _finish_turn(self, output: str, succeeded: bool) -> None:
-        if output != self.rendered_output:
-            self._append_assistant(output)
-        self.rendered_output = None
+    def _finish_turn(self, output: str, succeeded: bool, pane_id: str) -> None:
+        runtime = self.panes[pane_id]
+        if output != runtime.rendered_output:
+            self._append_assistant(output, runtime)
+        runtime.rendered_output = None
         if not succeeded:
-            self._append_notice("本轮未正常完成。", error=True)
-        self._set_busy(False, "就绪")
+            self._append_notice("本轮未正常完成。", error=True, runtime=runtime)
+        self._set_pane_busy(runtime, False, "就绪")
 
-    def _finish_with_error(self, message: str) -> None:
-        if self.streaming_markdown is not None:
-            partial = self.streaming_buffer
-            self.streaming_markdown.update(
+    def _finish_with_error(self, message: str, pane_id: str | None = None) -> None:
+        runtime = self.panes[pane_id] if pane_id is not None else self._active_runtime()
+        if runtime.streaming_markdown is not None:
+            partial = runtime.streaming_buffer
+            runtime.streaming_markdown.update(
                 f"{partial}\n\n_流式响应中断。_"
                 if partial
                 else "_模型请求失败。_"
             )
-            self.streaming_markdown = None
-            self.streaming_buffer = ""
-        self._append_notice(message, error=True)
-        self._set_busy(False, "错误")
+            runtime.streaming_markdown = None
+            runtime.streaming_buffer = ""
+        self._append_notice(message, error=True, runtime=runtime)
+        self._set_pane_busy(runtime, False, "错误")
 
     def _set_busy(self, busy: bool, status: str) -> None:
-        self.busy = busy
+        self._set_pane_busy(self._active_runtime(), busy, status)
+
+    def _set_pane_busy(
+        self, runtime: PaneRuntime, busy: bool, status: str
+    ) -> None:
+        runtime.busy = busy
+        self._update_pane_header(runtime, status)
+        if runtime.pane_id != self.active_pane_id:
+            return
         prompt = self.query_one(PromptArea)
         prompt.disabled = busy
         self._update_status(status)
@@ -816,46 +1128,77 @@ class LitCodeTUI(App[None]):
             prompt.focus()
             self.refresh_completions()
 
+    def _update_pane_status(self, runtime: PaneRuntime, status: str) -> None:
+        self._update_pane_header(runtime, status)
+        if runtime.pane_id == self.active_pane_id:
+            self._update_status(status)
+
+    def _update_pane_header(self, runtime: PaneRuntime, status: str) -> None:
+        try:
+            header = self.query_one(f"#view-{runtime.pane_id} .pane-header", Static)
+        except Exception:
+            return
+        info = self.store.session_info(runtime.session.session_id)
+        header.update(Text(f"{info.alias} · {info.title} · {status}"))
+
     def _update_status(self, activity: str) -> None:
+        info = self.store.session_info(self.session.session_id)
         self.query_one("#status", Static).update(
             Text(
                 f"{self.settings.workspace}  ·  "
-                f"{self.settings.model_profile} / {self.model.model}  ·  {activity}"
+                f"{info.alias}  ·  {self.settings.model_profile} / "
+                f"{self.model.model}  ·  {activity}"
             )
         )
 
-    def _mount_timeline(self, widget: Static | Markdown | Collapsible) -> None:
-        timeline = self.query_one("#timeline", VerticalScroll)
+    def _timeline(self, runtime: PaneRuntime) -> VerticalScroll:
+        timeline_id = (
+            "timeline"
+            if runtime.pane_id == "pane-1"
+            else f"timeline-{runtime.pane_id}"
+        )
+        return self.query_one(f"#{timeline_id}", VerticalScroll)
+
+    def _mount_timeline(
+        self,
+        widget: Static | Markdown | Collapsible,
+        runtime: PaneRuntime | None = None,
+    ) -> None:
+        runtime = runtime or self._active_runtime()
+        timeline = self._timeline(runtime)
         timeline.mount(widget)
         timeline.scroll_end(animate=False)
 
-    def _start_streaming_message(self) -> None:
-        self.streaming_buffer = ""
-        self.rendered_output = None
-        self.streaming_markdown = Markdown(
+    def _start_streaming_message(self, runtime: PaneRuntime) -> None:
+        runtime.streaming_buffer = ""
+        runtime.rendered_output = None
+        runtime.streaming_markdown = Markdown(
             "_正在等待模型响应…_", classes="message-assistant"
         )
-        self._mount_timeline(self.streaming_markdown)
+        self._mount_timeline(runtime.streaming_markdown, runtime)
 
-    def _append_stream_delta(self, content: str) -> None:
-        if self.streaming_markdown is None:
-            self._start_streaming_message()
-        self.streaming_buffer += content
-        assert self.streaming_markdown is not None
-        self.streaming_markdown.update(f"{self.streaming_buffer} ▍")
-        self._update_status("正在接收模型输出…")
+    def _append_stream_delta(self, content: str, runtime: PaneRuntime) -> None:
+        if runtime.streaming_markdown is None:
+            self._start_streaming_message(runtime)
+        runtime.streaming_buffer += content
+        assert runtime.streaming_markdown is not None
+        runtime.streaming_markdown.update(f"{runtime.streaming_buffer} ▍")
+        self._update_pane_status(runtime, "正在接收模型输出…")
 
     def _end_streaming_message(
-        self, content: str | None, has_tool_calls: bool
+        self,
+        content: str | None,
+        has_tool_calls: bool,
+        runtime: PaneRuntime,
     ) -> None:
-        widget = self.streaming_markdown
-        self.streaming_markdown = None
-        self.streaming_buffer = ""
+        widget = runtime.streaming_markdown
+        runtime.streaming_markdown = None
+        runtime.streaming_buffer = ""
         if widget is None:
             return
         if content:
             widget.update(content)
-            self.rendered_output = content
+            runtime.rendered_output = content
             return
         if has_tool_calls:
             widget.remove()
@@ -894,6 +1237,14 @@ class LitCodeTUI(App[None]):
             descriptions = {item.name: item.description for item in COMMANDS}
             matches = _fuzzy_matches(context.query, candidates, 8)
             labels = [f"{name:<10} {descriptions[name]}" for name in matches]
+        elif context.kind == "session":
+            sessions = self.store.list_sessions(self.settings.workspace)
+            candidates = [item.alias for item in sessions]
+            descriptions = {
+                item.alias: f"{item.title} · {item.model}" for item in sessions
+            }
+            matches = _fuzzy_matches(context.query, candidates, 12)
+            labels = [f"{alias}  {descriptions[alias]}" for alias in matches]
         else:
             paths = [*self.directory_paths, *self.file_paths]
             matches = _fuzzy_matches(context.query, paths, 30)
@@ -941,6 +1292,8 @@ class LitCodeTUI(App[None]):
         is_directory = context.kind == "file" and value.endswith("/")
         if context.kind == "command":
             replacement = f"{value} "
+        elif context.kind == "session":
+            replacement = f"#{{{value}}}"
         elif is_directory:
             replacement = f"@{{{value}"
         else:
@@ -983,6 +1336,15 @@ def _completion_context(prompt: PromptArea) -> CompletionContext | None:
             reference.group(2),
             row,
             reference.start(1),
+            column,
+        )
+    session_reference = re.search(r"(?:^|\s)(#\{?([^}\s]*))$", prefix)
+    if session_reference:
+        return CompletionContext(
+            "session",
+            session_reference.group(2),
+            row,
+            session_reference.start(1),
             column,
         )
     return None

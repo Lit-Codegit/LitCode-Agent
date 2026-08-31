@@ -11,10 +11,12 @@
     "maxIterations": 20,
     "maxOutputChars": 20000,
     "maxReferenceFileChars": 32768,
-    "maxReferenceChars": 131072
+    "maxReferenceChars": 131072,
+    "maxSessionReferenceChars": 4096
   },
   "permissions": {
-    "dangerousCommands": "confirm"
+    "dangerousCommands": "confirm",
+    "sessionMessages": "confirm"
   },
   "tools": {
     "command": {

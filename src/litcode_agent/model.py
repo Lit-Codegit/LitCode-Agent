@@ -191,3 +191,13 @@ class OpenAIChatModel:
         if not model.strip():
             raise ValueError("model must not be empty")
         self.model = model.strip()
+
+    def clone_for_model(self, model: str | None = None) -> OpenAIChatModel:
+        """Share the thread-safe SDK client while keeping model selection local."""
+
+        clone = object.__new__(OpenAIChatModel)
+        clone.client = self.client
+        clone.model = self.model
+        if model is not None:
+            clone.select_model(model)
+        return clone

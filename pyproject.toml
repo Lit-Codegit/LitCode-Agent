@@ -12,6 +12,7 @@ license = "MIT"
 authors = [{ name = "LitCode-Agent contributors" }]
 dependencies = [
   "openai>=2.0,<3",
+  "pyyaml>=6.0,<7",
   "rich>=14.0,<15",
   "textual>=6.0,<8",
 ]

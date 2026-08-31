@@ -40,7 +40,9 @@ class Settings:
     max_output_chars: int = 20_000
     max_reference_file_chars: int = 32_768
     max_reference_chars: int = 131_072
+    max_session_reference_chars: int = 4_096
     command_policy: CommandPolicy = "confirm"
+    session_message_policy: CommandPolicy = "confirm"
     read_roots: tuple[ReadRoot, ...] = ()
     session_database: Path | None = None
     hooks: HookSettings = HookSettings()
@@ -151,11 +153,14 @@ class Settings:
                 "maxOutputChars",
                 "maxReferenceFileChars",
                 "maxReferenceChars",
+                "maxSessionReferenceChars",
             },
             "agent",
         )
         _reject_unknown_keys(
-            permissions, {"dangerousCommands", "readRoots"}, "permissions"
+            permissions,
+            {"dangerousCommands", "sessionMessages", "readRoots"},
+            "permissions",
         )
         _reject_unknown_keys(tools, {"command"}, "tools")
         _reject_unknown_keys(
@@ -218,6 +223,13 @@ class Settings:
             "agent.maxReferenceChars",
             131_072,
         )
+        max_session_reference_chars = _environment_or_positive_int(
+            environ,
+            "LITCODE_MAX_SESSION_REFERENCE_CHARS",
+            agent_config.get("maxSessionReferenceChars"),
+            "agent.maxSessionReferenceChars",
+            4_096,
+        )
         if max_reference_file_chars > max_reference_chars:
             raise ConfigurationError(
                 "agent.maxReferenceFileChars must not exceed "
@@ -244,6 +256,20 @@ class Settings:
             raise ConfigurationError(
                 f"{policy_name} must be confirm, deny, or allow"
             )
+        session_policy_value = (
+            environ.get("LITCODE_SESSION_MESSAGE_POLICY")
+            if "LITCODE_SESSION_MESSAGE_POLICY" in environ
+            else permissions.get("sessionMessages", "confirm")
+        )
+        if session_policy_value not in {"confirm", "deny", "allow"}:
+            session_policy_name = (
+                "LITCODE_SESSION_MESSAGE_POLICY"
+                if "LITCODE_SESSION_MESSAGE_POLICY" in environ
+                else "permissions.sessionMessages"
+            )
+            raise ConfigurationError(
+                f"{session_policy_name} must be confirm, deny, or allow"
+            )
         disabled = raw.get("disableAllHooks", False)
         if not isinstance(disabled, bool):
             raise ConfigurationError("disableAllHooks must be a boolean")
@@ -263,7 +289,9 @@ class Settings:
             max_output_chars=max_output_chars,
             max_reference_file_chars=max_reference_file_chars,
             max_reference_chars=max_reference_chars,
+            max_session_reference_chars=max_session_reference_chars,
             command_policy=cast(CommandPolicy, policy_value),
+            session_message_policy=cast(CommandPolicy, session_policy_value),
             read_roots=read_roots,
             session_database=workspace / ".litcode" / "sessions.db",
             hooks=_parse_hooks(raw.get("hooks"), disabled),
@@ -286,7 +314,9 @@ class Settings:
             "max_output_chars": self.max_output_chars,
             "max_reference_file_chars": self.max_reference_file_chars,
             "max_reference_chars": self.max_reference_chars,
+            "max_session_reference_chars": self.max_session_reference_chars,
             "command_policy": self.command_policy,
+            "session_message_policy": self.session_message_policy,
             "read_roots": [
                 {
                     "alias": root.alias,
