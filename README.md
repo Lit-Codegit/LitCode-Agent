@@ -28,11 +28,15 @@ uv run pytest
 uv run litcode --help
 ```
 
-项目配置位于 `.litcode/settings.json`。API Key 不直接写入配置文件；配置只声明读取哪个环境变量：
+项目配置位于 `.litcode/settings.json`。API Key 不直接写入项目配置；配置只声明凭据名。可以通过环境变量提供密钥：
 
 ```bash
 export DEEPSEEK_API_KEY="你的密钥"
 ```
+
+也可以运行 `uv run litcode auth login DEEPSEEK_API_KEY`，将密钥保存到用户级
+`~/.local/share/litcode/auth.json`。该文件权限为 `0600`，不会进入项目仓库；
+同名环境变量存在时仍优先使用环境变量。
 
 检查配置，输出中不会出现密钥：
 

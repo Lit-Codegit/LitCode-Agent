@@ -1,5 +1,7 @@
 from pathlib import Path
 from io import StringIO
+import json
+import stat
 
 import litcode_agent.cli as cli
 from litcode_agent.cli import main
@@ -33,6 +35,29 @@ def test_doctor_prints_safe_configuration(tmp_path: Path, monkeypatch) -> None:
 
     assert "example-model" in output.getvalue()
     assert "do-not-print" not in output.getvalue()
+
+
+def test_auth_login_stores_key_in_private_user_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    user_home = tmp_path / "user-home"
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "stored-secret")
+    ui, output = make_ui()
+
+    assert main(["auth", "login", "PRIMARY_KEY"], ui) == 0
+
+    auth_file = user_home / ".local" / "share" / "litcode" / "auth.json"
+    stored = json.loads(auth_file.read_text(encoding="utf-8"))
+    assert stored["credentials"]["PRIMARY_KEY"] == {
+        "type": "api",
+        "key": "stored-secret",
+    }
+    assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(auth_file.parent.stat().st_mode) == 0o700
+    assert "stored-secret" not in output.getvalue()
+    assert "litcode/auth.json" in output.getvalue()
+    assert "0600" in output.getvalue()
 
 
 def test_run_wires_configuration_model_tools_and_agent(

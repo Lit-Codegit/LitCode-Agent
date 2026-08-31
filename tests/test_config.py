@@ -155,6 +155,152 @@ def test_loads_project_and_local_json_with_environment_precedence(
     )
 
 
+def test_loads_api_key_from_user_credential_store(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultModel": "primary",
+                "models": {
+                    "primary": {
+                        "model": "model",
+                        "apiKeyEnv": "PRIMARY_KEY",
+                    }
+                },
+            }
+        )
+    )
+    user_home = tmp_path / "user-home"
+    auth_file = user_home / ".local" / "share" / "litcode" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.parent.chmod(0o700)
+    auth_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credentials": {
+                    "PRIMARY_KEY": {"type": "api", "key": "stored-secret"}
+                },
+            }
+        )
+    )
+    auth_file.chmod(0o600)
+
+    settings = Settings.load(tmp_path, {"HOME": str(user_home)})
+
+    assert settings.api_key == "stored-secret"
+    assert settings.safe_summary()["api_key_source"] == "user credential store"
+
+
+def test_environment_api_key_overrides_user_credential_store(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultModel": "primary",
+                "models": {"primary": {"model": "model"}},
+            }
+        )
+    )
+    user_home = tmp_path / "user-home"
+    auth_file = user_home / ".local" / "share" / "litcode" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.parent.chmod(0o700)
+    auth_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credentials": {
+                    "OPENAI_API_KEY": {"type": "api", "key": "stored-secret"}
+                },
+            }
+        )
+    )
+    auth_file.chmod(0o600)
+
+    settings = Settings.load(
+        tmp_path,
+        {
+            "HOME": str(user_home),
+            "OPENAI_API_KEY": "environment-secret",
+        },
+    )
+
+    assert settings.api_key == "environment-secret"
+    assert settings.safe_summary()["api_key_source"] == "environment"
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o700, 0o400])
+def test_rejects_credential_file_without_exact_private_mode(
+    tmp_path: Path, mode: int
+) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultModel": "primary",
+                "models": {"primary": {"model": "model"}},
+            }
+        )
+    )
+    user_home = tmp_path / "user-home"
+    auth_file = user_home / ".local" / "share" / "litcode" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.parent.chmod(0o700)
+    auth_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credentials": {
+                    "OPENAI_API_KEY": {"type": "api", "key": "secret"}
+                },
+            }
+        )
+    )
+    auth_file.chmod(mode)
+
+    with pytest.raises(ConfigurationError, match="permissions must be 0600"):
+        Settings.load(tmp_path, {"HOME": str(user_home)})
+
+
+@pytest.mark.parametrize("unsafe_kind", ["malformed", "symlink"])
+def test_rejects_unsafe_credential_store(
+    tmp_path: Path, unsafe_kind: str
+) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultModel": "primary",
+                "models": {"primary": {"model": "model"}},
+            }
+        )
+    )
+    user_home = tmp_path / "user-home"
+    auth_file = user_home / ".local" / "share" / "litcode" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.parent.chmod(0o700)
+    if unsafe_kind == "malformed":
+        auth_file.write_text("not-json", encoding="utf-8")
+        auth_file.chmod(0o600)
+        expected = "cannot read credential file"
+    else:
+        target = tmp_path / "elsewhere.json"
+        target.write_text('{"version": 1, "credentials": {}}', encoding="utf-8")
+        target.chmod(0o600)
+        auth_file.symlink_to(target)
+        expected = "regular file"
+
+    with pytest.raises(ConfigurationError, match=expected):
+        Settings.load(tmp_path, {"HOME": str(user_home)})
+
+
 def test_rejects_direct_api_key_in_tracked_configuration(tmp_path: Path) -> None:
     config_dir = tmp_path / ".litcode"
     config_dir.mkdir()

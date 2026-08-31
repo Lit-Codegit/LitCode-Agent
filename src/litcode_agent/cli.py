@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -12,6 +13,7 @@ from typing import Sequence
 from litcode_agent import __version__
 from litcode_agent.agent import Agent
 from litcode_agent.config import ConfigurationError, Settings
+from litcode_agent.credentials import CredentialError, save_api_key
 from litcode_agent.hooks import HookRunner
 from litcode_agent.model import ModelError, OpenAIChatModel
 from litcode_agent.prompt import PromptBuilder
@@ -20,18 +22,26 @@ from litcode_agent.tools import build_default_registry
 from litcode_agent.tui import run_tui
 from litcode_agent.ui import TerminalUI
 
-COMMANDS = {"doctor", "models", "run", "chat"}
+COMMANDS = {"auth", "doctor", "models", "run", "chat"}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="litcode",
-        usage="litcode [PATH] | litcode {doctor,models,run,chat} ...",
+        usage="litcode [PATH] | litcode {auth,doctor,models,run,chat} ...",
         description="一个透明、可解释的本地编程智能体。",
         epilog="不带参数时打开当前目录；传入路径时打开该目录的全屏 TUI。",
     )
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    auth = subparsers.add_parser("auth", help="管理用户级 API 凭据")
+    auth_commands = auth.add_subparsers(dest="auth_command", required=True)
+    auth_login = auth_commands.add_parser("login", help="安全保存 API Key")
+    auth_login.add_argument(
+        "credential",
+        help="与模型配置 apiKeyEnv 相同的凭据名称",
+    )
 
     doctor = subparsers.add_parser("doctor", help="校验配置且不显示密钥")
     _add_common_options(doctor)
@@ -84,10 +94,12 @@ def main(
 ) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(_normalize_args(raw_args))
+    terminal = ui or TerminalUI()
+    if args.command == "auth":
+        return _auth_login(args, terminal)
     if args.command == "chat":
         args.workspace = args.path or args.workspace or Path.cwd()
     settings = _load_settings(args)
-    terminal = ui or TerminalUI()
 
     if args.command == "doctor":
         terminal.console.print_json(
@@ -136,6 +148,17 @@ def main(
     if args.command == "chat":
         return _chat(agent, model, settings, terminal)
     raise AssertionError(f"unhandled command: {args.command}")
+
+
+def _auth_login(args: argparse.Namespace, terminal: TerminalUI) -> int:
+    try:
+        key = getpass.getpass(f"输入 {args.credential}（不会回显）：")
+        path = save_api_key(args.credential, key, os.environ)
+    except (CredentialError, EOFError, KeyboardInterrupt) as error:
+        terminal.show_error(str(error) or "凭据输入已取消")
+        return 1
+    terminal.show_info(f"凭据 {args.credential} 已保存到 {path}（权限 0600）。")
+    return 0
 
 
 def _load_settings(args: argparse.Namespace) -> Settings:

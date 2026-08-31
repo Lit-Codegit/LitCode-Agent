@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping, cast
 
+from litcode_agent.credentials import CredentialError, load_api_key
 from litcode_agent.hooks import HookCommand, HookGroup, HookSettings
 
 CommandPolicy = Literal["confirm", "deny", "allow"]
@@ -35,6 +36,7 @@ class Settings:
     model_profile: str = "environment"
     base_url: str | None = None
     api_key_env: str = "OPENAI_API_KEY"
+    api_key_source: str = "environment"
     max_iterations: int = 20
     command_timeout_seconds: float = 30.0
     max_output_chars: int = 20_000
@@ -73,6 +75,7 @@ class Settings:
             os.environ if environ is None else environ,
             merged,
             tuple(loaded),
+            use_credential_store=True,
         )
 
     @classmethod
@@ -91,6 +94,7 @@ class Settings:
             os.environ if environ is None else environ,
             {},
             (),
+            use_credential_store=False,
         )
 
     @classmethod
@@ -100,6 +104,8 @@ class Settings:
         environ: Mapping[str, str],
         raw: Mapping[str, object],
         config_files: tuple[Path, ...],
+        *,
+        use_credential_store: bool,
     ) -> Settings:
         _reject_unknown_keys(
             raw,
@@ -172,6 +178,13 @@ class Settings:
             f"models.{model_profile}.apiKeyEnv",
         ) or "OPENAI_API_KEY"
         api_key = environ.get(api_key_env, "").strip()
+        api_key_source = "environment"
+        if not api_key and use_credential_store:
+            try:
+                api_key = load_api_key(api_key_env, environ)
+            except CredentialError as error:
+                raise ConfigurationError(str(error)) from error
+            api_key_source = "user credential store"
         model = (
             environ.get("LITCODE_MODEL", "").strip()
             or _optional_string(
@@ -284,6 +297,7 @@ class Settings:
             model_profile=model_profile,
             base_url=base_url or None,
             api_key_env=api_key_env,
+            api_key_source=api_key_source,
             max_iterations=max_iterations,
             command_timeout_seconds=command_timeout,
             max_output_chars=max_output_chars,
@@ -309,6 +323,7 @@ class Settings:
             "base_url": self.base_url or "provider default",
             "api_key_env": self.api_key_env,
             "api_key_configured": bool(self.api_key),
+            "api_key_source": self.api_key_source,
             "max_iterations": self.max_iterations,
             "command_timeout_seconds": self.command_timeout_seconds,
             "max_output_chars": self.max_output_chars,

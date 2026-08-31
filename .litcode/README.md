@@ -5,7 +5,8 @@
 1. 内置默认值
 2. `.litcode/settings.json`
 3. `.litcode/settings.local.json`
-4. 环境变量
+4. 用户级凭据文件（仅 API Key）
+5. 环境变量
 
 ## 模型配置
 
@@ -27,11 +28,21 @@
 }
 ```
 
-`defaultModel` 选择 `models` 中的默认配置档。`apiKeyEnv` 是环境变量名称，不是密钥本身。真实密钥应在 shell 中设置：
+`defaultModel` 选择 `models` 中的默认配置档。`apiKeyEnv` 是凭据名称，不是密钥本身。真实密钥可以在 shell 中设置：
 
 ```bash
 export PRIMARY_API_KEY="你的密钥"
 ```
+
+也可以交互保存到用户级凭据文件：
+
+```bash
+uv run litcode auth login PRIMARY_API_KEY
+```
+
+固定路径是 `~/.local/share/litcode/auth.json`。文件以明文 JSON 保存，但目录权限为
+`0700`、文件权限为 `0600`；项目配置仍拒绝
+`apiKey` 字段。同名环境变量优先于凭据文件。
 
 `LITCODE_DEFAULT_MODEL=fast` 可以临时切换配置档；`LITCODE_MODEL`、`OPENAI_BASE_URL`、`LITCODE_MAX_ITERATIONS`、`LITCODE_MAX_OUTPUT_CHARS`、`LITCODE_COMMAND_TIMEOUT_SECONDS` 和 `LITCODE_COMMAND_POLICY` 可临时覆盖选中配置档中的具体值。
 
