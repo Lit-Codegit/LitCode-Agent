@@ -60,6 +60,51 @@ def test_auth_login_stores_key_in_private_user_file(
     assert "0600" in output.getvalue()
 
 
+def test_auth_login_uses_selected_project_credential_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultModel": "deepseek",
+                "models": {
+                    "deepseek": {
+                        "model": "deepseek-v4-flash",
+                        "apiKeyEnv": "DEEPSEEK_API_KEY",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    user_home = tmp_path / "user-home"
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "stored-secret")
+    ui, _ = make_ui()
+
+    assert main(["auth", "login", "--workspace", str(tmp_path)], ui) == 0
+
+    auth_file = user_home / ".local" / "share" / "litcode" / "auth.json"
+    stored = json.loads(auth_file.read_text(encoding="utf-8"))
+    assert set(stored["credentials"]) == {"DEEPSEEK_API_KEY"}
+
+
+def test_auth_login_rejects_secret_as_name_before_prompt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def unexpected_prompt(prompt: str) -> str:
+        raise AssertionError("invalid credential name must fail before prompting")
+
+    monkeypatch.setattr(cli.getpass, "getpass", unexpected_prompt)
+    ui, output = make_ui()
+
+    assert main(["auth", "login", "sk-must-not-be-a-name"], ui) == 1
+
+    assert "environment variable name" in output.getvalue()
+
+
 def test_run_wires_configuration_model_tools_and_agent(
     tmp_path: Path, monkeypatch
 ) -> None:

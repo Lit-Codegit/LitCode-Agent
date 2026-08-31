@@ -37,8 +37,11 @@ export PRIMARY_API_KEY="你的密钥"
 也可以交互保存到用户级凭据文件：
 
 ```bash
-uv run litcode auth login PRIMARY_API_KEY
+uv run litcode auth login
 ```
+
+在项目目录省略名称时，命令会从当前模型配置档自动识别 `apiKeyEnv`；也可在命令末尾
+显式给出 `PRIMARY_API_KEY`。
 
 固定路径是 `~/.local/share/litcode/auth.json`。文件以明文 JSON 保存，但目录权限为
 `0700`、文件权限为 `0600`；项目配置仍拒绝

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import tempfile
 from pathlib import Path
@@ -50,10 +51,8 @@ def save_api_key(
 ) -> Path:
     """原子更新一个 API 凭据，并确保目录和文件仅当前用户可访问。"""
 
-    normalized_name = name.strip()
+    normalized_name = validate_credential_name(name)
     normalized_key = key.strip()
-    if not normalized_name:
-        raise CredentialError("credential name is required")
     if not normalized_key:
         raise CredentialError("API key is required")
     path = credential_file(environ)
@@ -87,6 +86,17 @@ def save_api_key(
         if temporary_name is not None:
             Path(temporary_name).unlink(missing_ok=True)
     return path
+
+
+def validate_credential_name(name: str) -> str:
+    """Validate and normalize the environment-style credential identifier."""
+
+    normalized = name.strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized):
+        raise CredentialError(
+            "credential name must be an environment variable name"
+        )
+    return normalized
 
 
 def _read_store(path: Path) -> dict[str, object]:

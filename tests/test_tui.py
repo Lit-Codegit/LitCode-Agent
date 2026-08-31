@@ -513,6 +513,42 @@ def test_ctrl_w_direction_is_portable_split_fallback(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_repeated_ctrl_w_cycles_panes_until_sequence_stops(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(160, 44)) as pilot:
+            app.action_split("right")
+            app.action_split("down")
+            await pilot.pause()
+            app.action_focus_pane("left")
+            assert app.active_pane_id == "pane-1"
+
+            await pilot.press("ctrl+w", "ctrl+w", "ctrl+w")
+
+            assert app.active_pane_id == "pane-3"
+            assert app.pane_leader_active
+
+            await pilot.pause(1.3)
+            assert not app.pane_leader_active
+
+    asyncio.run(exercise())
+
+
+def test_expired_ctrl_w_prefix_does_not_consume_a_late_key(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(140, 40)):
+            app.action_pane_leader()
+            app._pane_leader_until = 0.0
+
+            assert not app.consume_pane_leader_key("right")
+            assert len(app.panes) == 1
+
+    asyncio.run(exercise())
+
+
 def test_closing_pane_detaches_without_ending_session(tmp_path: Path) -> None:
     async def exercise() -> None:
         app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]

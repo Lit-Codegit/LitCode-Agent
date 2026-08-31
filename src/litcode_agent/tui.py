@@ -489,7 +489,7 @@ class LitCodeTUI(App[None]):
         first = self.sessions.active
         self.agent = first.agent
         self.panes = {first.pane_id: self._pane_runtime(first)}
-        self._pane_leader = False
+        self._pane_leader_until = 0.0
         self._exit_armed_until = 0.0
 
     def compose(self) -> ComposeResult:
@@ -585,19 +585,32 @@ class LitCodeTUI(App[None]):
             self._render_runtime_history(runtime)
 
     def action_pane_leader(self) -> None:
-        self._pane_leader = True
-        self._update_status(
-            "方向键分屏 · h/j/k/l 聚焦 · w 轮换 · Esc 取消"
-        )
+        now = time.monotonic()
+        if self.pane_leader_active:
+            self.action_cycle_pane()
+        else:
+            self._update_status(
+                "方向键分屏 · h/j/k/l 聚焦 · 再按 Ctrl+W 轮换"
+            )
+        self._pane_leader_until = now + 1.2
+        self.set_timer(1.2, self._reset_pane_leader)
+
+    def _reset_pane_leader(self) -> None:
+        if time.monotonic() < self._pane_leader_until:
+            return
+        self._pane_leader_until = 0.0
+
+    def _finish_pane_leader(self) -> None:
+        self._pane_leader_until = 0.0
 
     @property
     def pane_leader_active(self) -> bool:
-        return self._pane_leader
+        return time.monotonic() <= self._pane_leader_until
 
     def consume_pane_leader_key(self, key: str) -> bool:
-        if not self._pane_leader:
+        if not self.pane_leader_active:
             return False
-        self._pane_leader = False
+        self._finish_pane_leader()
         if key in {"left", "right", "up", "down"}:
             self.action_split(key)
             return True

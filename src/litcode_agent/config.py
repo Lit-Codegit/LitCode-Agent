@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping, cast
 
-from litcode_agent.credentials import CredentialError, load_api_key
+from litcode_agent.credentials import (
+    CredentialError,
+    load_api_key,
+    validate_credential_name,
+)
 from litcode_agent.hooks import HookCommand, HookGroup, HookSettings
 
 CommandPolicy = Literal["confirm", "deny", "allow"]
@@ -61,20 +65,12 @@ class Settings:
         root = workspace.expanduser().resolve()
         if not root.is_dir():
             raise ConfigurationError(f"workspace is not a directory: {root}")
-        merged: dict[str, object] = {}
-        loaded: list[Path] = []
-        for path in (
-            root / ".litcode" / "settings.json",
-            root / ".litcode" / "settings.local.json",
-        ):
-            if path.is_file():
-                merged = _deep_merge(merged, _read_json_object(path))
-                loaded.append(path)
+        merged, loaded = _load_project_config(root)
         return cls._from_values(
             root,
             os.environ if environ is None else environ,
             merged,
-            tuple(loaded),
+            loaded,
             use_credential_store=True,
         )
 
@@ -96,6 +92,22 @@ class Settings:
             (),
             use_credential_store=False,
         )
+
+    @classmethod
+    def configured_api_key_name(
+        cls,
+        workspace: Path,
+        environ: Mapping[str, str] | None = None,
+    ) -> str:
+        """返回当前模型配置档声明的凭据名称，不要求密钥已经存在。"""
+
+        root = workspace.expanduser().resolve()
+        if not root.is_dir():
+            raise ConfigurationError(f"workspace is not a directory: {root}")
+        merged, _ = _load_project_config(root)
+        values = os.environ if environ is None else environ
+        profile, model_config = _selected_model_config(merged, values)
+        return _api_key_name(model_config, profile)
 
     @classmethod
     def _from_values(
@@ -120,33 +132,11 @@ class Settings:
             },
             "settings",
         )
-        models_config = _object(raw.get("models"), "models")
         agent_config = _object(raw.get("agent"), "agent")
         permissions = _object(raw.get("permissions"), "permissions")
         tools = _object(raw.get("tools"), "tools")
         command_config = _object(tools.get("command"), "tools.command")
-        configured_default = _optional_string(
-            raw.get("defaultModel"), "defaultModel"
-        )
-        model_profile = (
-            environ.get("LITCODE_DEFAULT_MODEL", "").strip()
-            or configured_default
-            or "environment"
-        )
-        if models_config:
-            if model_profile not in models_config:
-                raise ConfigurationError(
-                    f"default model profile is not defined in models: {model_profile}"
-                )
-            model_config = _object(
-                models_config[model_profile], f"models.{model_profile}"
-            )
-        else:
-            if configured_default is not None:
-                raise ConfigurationError(
-                    "models must define the profile selected by defaultModel"
-                )
-            model_config = {}
+        model_profile, model_config = _selected_model_config(raw, environ)
         _reject_unknown_keys(
             model_config,
             {"model", "baseURL", "apiKeyEnv"},
@@ -173,10 +163,7 @@ class Settings:
             command_config, {"timeoutSeconds"}, "tools.command"
         )
 
-        api_key_env = _optional_string(
-            model_config.get("apiKeyEnv"),
-            f"models.{model_profile}.apiKeyEnv",
-        ) or "OPENAI_API_KEY"
+        api_key_env = _api_key_name(model_config, model_profile)
         api_key = environ.get(api_key_env, "").strip()
         api_key_source = "environment"
         if not api_key and use_credential_store:
@@ -356,6 +343,54 @@ def _read_json_object(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ConfigurationError(f"configuration root must be an object: {path}")
     return value
+
+
+def _load_project_config(
+    workspace: Path,
+) -> tuple[dict[str, object], tuple[Path, ...]]:
+    merged: dict[str, object] = {}
+    loaded: list[Path] = []
+    for path in (
+        workspace / ".litcode" / "settings.json",
+        workspace / ".litcode" / "settings.local.json",
+    ):
+        if path.is_file():
+            merged = _deep_merge(merged, _read_json_object(path))
+            loaded.append(path)
+    return merged, tuple(loaded)
+
+
+def _selected_model_config(
+    raw: Mapping[str, object], environ: Mapping[str, str]
+) -> tuple[str, dict[str, object]]:
+    models = _object(raw.get("models"), "models")
+    configured_default = _optional_string(raw.get("defaultModel"), "defaultModel")
+    profile = (
+        environ.get("LITCODE_DEFAULT_MODEL", "").strip()
+        or configured_default
+        or "environment"
+    )
+    if models:
+        if profile not in models:
+            raise ConfigurationError(
+                f"default model profile is not defined in models: {profile}"
+            )
+        return profile, _object(models[profile], f"models.{profile}")
+    if configured_default is not None:
+        raise ConfigurationError(
+            "models must define the profile selected by defaultModel"
+        )
+    return profile, {}
+
+
+def _api_key_name(model_config: Mapping[str, object], profile: str) -> str:
+    configured = _optional_string(
+        model_config.get("apiKeyEnv"), f"models.{profile}.apiKeyEnv"
+    )
+    try:
+        return validate_credential_name(configured or "OPENAI_API_KEY")
+    except CredentialError as error:
+        raise ConfigurationError(str(error)) from error
 
 
 def _parse_read_roots(workspace: Path, value: object) -> tuple[ReadRoot, ...]:

@@ -34,7 +34,8 @@ uv run litcode --help
 export DEEPSEEK_API_KEY="你的密钥"
 ```
 
-也可以运行 `uv run litcode auth login DEEPSEEK_API_KEY`，将密钥保存到用户级
+也可以在项目目录运行 `uv run litcode auth login`，程序会从当前模型配置档自动识别
+`apiKeyEnv`；也可显式运行 `uv run litcode auth login DEEPSEEK_API_KEY`。密钥保存到用户级
 `~/.local/share/litcode/auth.json`。该文件权限为 `0600`，不会进入项目仓库；
 同名环境变量存在时仍优先使用环境变量。
 

@@ -13,7 +13,11 @@ from typing import Sequence
 from litcode_agent import __version__
 from litcode_agent.agent import Agent
 from litcode_agent.config import ConfigurationError, Settings
-from litcode_agent.credentials import CredentialError, save_api_key
+from litcode_agent.credentials import (
+    CredentialError,
+    save_api_key,
+    validate_credential_name,
+)
 from litcode_agent.hooks import HookRunner
 from litcode_agent.model import ModelError, OpenAIChatModel
 from litcode_agent.prompt import PromptBuilder
@@ -40,7 +44,14 @@ def build_parser() -> argparse.ArgumentParser:
     auth_login = auth_commands.add_parser("login", help="安全保存 API Key")
     auth_login.add_argument(
         "credential",
+        nargs="?",
         help="与模型配置 apiKeyEnv 相同的凭据名称",
+    )
+    auth_login.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path.cwd(),
+        help="用于自动识别 apiKeyEnv 的工作区（默认：当前目录）",
     )
 
     doctor = subparsers.add_parser("doctor", help="校验配置且不显示密钥")
@@ -152,12 +163,22 @@ def main(
 
 def _auth_login(args: argparse.Namespace, terminal: TerminalUI) -> int:
     try:
-        key = getpass.getpass(f"输入 {args.credential}（不会回显）：")
-        path = save_api_key(args.credential, key, os.environ)
-    except (CredentialError, EOFError, KeyboardInterrupt) as error:
+        credential = (
+            validate_credential_name(args.credential)
+            if args.credential
+            else Settings.configured_api_key_name(args.workspace, os.environ)
+        )
+        key = getpass.getpass(f"输入 {credential}（不会回显）：")
+        path = save_api_key(credential, key, os.environ)
+    except (
+        ConfigurationError,
+        CredentialError,
+        EOFError,
+        KeyboardInterrupt,
+    ) as error:
         terminal.show_error(str(error) or "凭据输入已取消")
         return 1
-    terminal.show_info(f"凭据 {args.credential} 已保存到 {path}（权限 0600）。")
+    terminal.show_info(f"凭据 {credential} 已保存到 {path}（权限 0600）。")
     return 0
 
 
