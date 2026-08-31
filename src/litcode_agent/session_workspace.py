@@ -69,6 +69,12 @@ class SessionWorkspace:
         self.active_pane_id = target
         return self.active
 
+    def focus_next(self) -> PaneSession:
+        pane_ids = self.layout.pane_ids()
+        index = pane_ids.index(self.active_pane_id)
+        self.active_pane_id = pane_ids[(index + 1) % len(pane_ids)]
+        return self.active
+
     def close_active_pane(self) -> tuple[str, PaneSession]:
         if len(self.panes) == 1:
             raise ValueError("cannot close the final pane")

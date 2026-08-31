@@ -15,6 +15,7 @@ from litcode_agent.tui import (
     LitCodeTUI,
     ModelPicker,
     PromptArea,
+    run_tui,
 )
 
 
@@ -45,7 +46,11 @@ def test_tui_mounts_status_timeline_and_fixed_prompt(tmp_path: Path) -> None:
     async def exercise() -> None:
         app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
         async with app.run_test(size=(120, 40)):
-            assert "model-a" in str(app.query_one("#status", Static).render())
+            header = str(app.query_one(".pane-header", Static).render())
+            assert "新会话" in header
+            assert "model-a" in header
+            assert app.store.session_info(app.session.session_id).alias not in header
+            assert len(app.query("#status")) == 0
             assert app.query_one(PromptArea).has_focus
             assert any(
                 "会话已启动" in str(widget.render())
@@ -53,6 +58,90 @@ def test_tui_mounts_status_timeline_and_fixed_prompt(tmp_path: Path) -> None:
             )
 
     asyncio.run(exercise())
+
+
+def test_enter_sends_and_shift_enter_inserts_newline(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        model = FakeModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = "第一行"
+            prompt.move_cursor(prompt.document.end)
+            await pilot.press("shift+enter")
+            await pilot.pause()
+
+            assert prompt.text == "第一行\n"
+            assert model.requests == []
+
+            prompt.text += "第二行"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if model.requests and not app.busy:
+                    break
+
+            assert model.requests[0][-1]["content"] == "第一行\n第二行"
+
+    asyncio.run(exercise())
+
+
+def test_prompt_history_recalls_messages_and_restores_draft(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        model = FakeModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = "第一条"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if model.requests and not app.busy:
+                    break
+
+            prompt.text = "未发送草稿"
+            prompt.move_cursor((0, 0))
+            await pilot.press("up")
+            assert prompt.text == "第一条"
+
+            await pilot.press("down")
+            assert prompt.text == "未发送草稿"
+
+            prompt.text = "第一行\n中间行\n最后行"
+            prompt.move_cursor((1, 0))
+            await pilot.press("up")
+            assert prompt.text == "第一行\n中间行\n最后行"
+            assert prompt.cursor_location == (0, 0)
+
+    asyncio.run(exercise())
+
+
+def test_ctrl_c_requires_second_press_to_exit(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("ctrl+c")
+            assert not app._exit
+
+            await pilot.press("ctrl+c")
+            assert app._exit
+
+    asyncio.run(exercise())
+
+
+def test_run_tui_leaves_mouse_to_terminal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    options: dict[str, object] = {}
+
+    def fake_run(app: LitCodeTUI, **kwargs: object) -> None:
+        options.update(kwargs)
+        app.store.close()
+
+    monkeypatch.setattr(LitCodeTUI, "run", fake_run)
+
+    assert run_tui(settings(tmp_path), FakeModel()) == 0  # type: ignore[arg-type]
+    assert options == {"mouse": False}
 
 
 def test_tui_explains_portable_split_shortcut_on_start(tmp_path: Path) -> None:
@@ -76,7 +165,7 @@ def test_tui_submits_prompt_in_background_and_renders_answer(
         async with app.run_test(size=(120, 40)) as pilot:
             prompt = app.query_one(PromptArea)
             prompt.text = "检查项目"
-            await pilot.press("ctrl+enter")
+            await pilot.press("enter")
             for _ in range(20):
                 await pilot.pause(0.02)
                 if not app.busy and model.requests:
@@ -130,7 +219,7 @@ def test_tui_denies_dangerous_command_in_modal(tmp_path: Path) -> None:
         async with app.run_test(size=(120, 40)) as pilot:
             prompt = app.query_one(PromptArea)
             prompt.text = "执行危险命令"
-            await pilot.press("ctrl+enter")
+            await pilot.press("enter")
             for _ in range(30):
                 await pilot.pause(0.02)
                 if isinstance(app.screen, ConfirmCommand):
@@ -191,7 +280,7 @@ def test_tui_manual_compaction_keeps_session_available(tmp_path: Path) -> None:
         async with app.run_test(size=(120, 40)) as pilot:
             prompt = app.query_one(PromptArea)
             prompt.text = "问题"
-            await pilot.press("ctrl+enter")
+            await pilot.press("enter")
             for _ in range(30):
                 await pilot.pause(0.02)
                 if not app.busy:
@@ -231,7 +320,7 @@ def test_at_completion_references_workspace_file_in_model_prompt(
             await pilot.press("enter")
             assert prompt.text == "检查 @{main.py}"
 
-            await pilot.press("ctrl+enter")
+            await pilot.press("enter")
             for _ in range(30):
                 await pilot.pause(0.02)
                 if model.requests and not app.busy:
@@ -299,7 +388,7 @@ def test_hash_completion_inserts_session_alias_and_sends_capsule(
             await pilot.press("enter")
             assert prompt.text == f"参考 #{{{alias}}}"
 
-            await pilot.press("ctrl+enter")
+            await pilot.press("enter")
             for _ in range(30):
                 await pilot.pause(0.02)
                 if model.requests and not app.busy:
@@ -328,7 +417,7 @@ def test_tui_advertises_skill_metadata_without_eager_body(tmp_path: Path) -> Non
         async with app.run_test(size=(120, 40)) as pilot:
             prompt = app.query_one(PromptArea)
             prompt.text = "检查代码"
-            await pilot.press("ctrl+enter")
+            await pilot.press("enter")
             for _ in range(30):
                 await pilot.pause(0.02)
                 if model.requests and not app.busy:
@@ -371,7 +460,7 @@ def test_split_panes_run_concurrently_and_keep_streams_isolated(
             app._handle_command("/focus left")
             prompt = app.query_one(PromptArea)
             prompt.text = "慢任务"
-            await pilot.press("ctrl+enter")
+            await pilot.press("enter")
             for _ in range(30):
                 await pilot.pause(0.02)
                 if slow_started.is_set():
@@ -381,7 +470,7 @@ def test_split_panes_run_concurrently_and_keep_streams_isolated(
             app._handle_command("/focus right")
             assert not prompt.disabled
             prompt.text = "快任务"
-            await pilot.press("ctrl+enter")
+            await pilot.press("enter")
             for _ in range(30):
                 await pilot.pause(0.02)
                 if not app.panes["pane-2"].busy:
@@ -413,6 +502,12 @@ def test_ctrl_w_direction_is_portable_split_fallback(tmp_path: Path) -> None:
             await pilot.pause()
 
             assert len(app.panes) == 2
+            assert app.active_pane_id == "pane-2"
+
+            await pilot.press("ctrl+w", "h")
+            assert app.active_pane_id == "pane-1"
+
+            await pilot.press("ctrl+w", "w")
             assert app.active_pane_id == "pane-2"
 
     asyncio.run(exercise())
@@ -490,7 +585,7 @@ def test_tool_card_is_collapsed_with_key_argument_and_bounded_summary(
         async with app.run_test(size=(120, 40)) as pilot:
             prompt = app.query_one(PromptArea)
             prompt.text = "读取文件"
-            await pilot.press("ctrl+enter")
+            await pilot.press("enter")
             for _ in range(30):
                 await pilot.pause(0.02)
                 if not app.busy and "read" in app._active_runtime().tool_cards:
@@ -526,7 +621,7 @@ def test_tui_renders_first_stream_delta_before_completion(tmp_path: Path) -> Non
         async with app.run_test(size=(120, 40)) as pilot:
             prompt = app.query_one(PromptArea)
             prompt.text = "测试流式"
-            await pilot.press("ctrl+enter")
+            await pilot.press("enter")
             for _ in range(30):
                 await pilot.pause(0.02)
                 if (

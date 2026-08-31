@@ -182,6 +182,26 @@ def test_session_store_serializes_concurrent_inbox_writes(tmp_path: Path) -> Non
     assert len(store.inbox(target)) == 40
 
 
+def test_inbox_is_visible_across_independent_store_connections(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "sessions.db"
+    sender_store = SessionStore(database)
+    source = sender_store.create(tmp_path, "model-a", [])
+    receiver_store = SessionStore(database)
+    target = receiver_store.create(tmp_path, "model-b", [])
+    target_alias = receiver_store.session_info(target).alias
+
+    sender_store.send_to_session(
+        tmp_path, source, target_alias, "请检查另一个终端的结果"
+    )
+
+    messages = receiver_store.inbox(target)
+    assert len(messages) == 1
+    assert messages[0].source_session_id == source
+    assert messages[0].content == "请检查另一个终端的结果"
+
+
 def test_session_reference_snapshot_is_immutable_and_traceable(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     target = store.create(tmp_path, "model", [])

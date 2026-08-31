@@ -66,6 +66,8 @@ TUI 中央是可滚动的对话和工具时间线，底部是固定的多行输�
 
 每个会话拥有类似 `260830-1432-K7M` 的稳定 alias：前半是本地创建时间，后三位使用易辨认的 Crockford Base32 ASCII 字符。`#` 默认只注入会话 capsule；模型需要细节时可用 `read_session_context` 按 query 读取有界片段。实际 capsule 及来源版本会持久化，不会随来源会话后来变化。
 
+pane 标题只显示“标题 · 月日时间 · 模型”，不展示碰撞码；完整 alias 只用于 `#` 候选和稳定寻址。
+
 项目 Skill 放在 `.agents/skills/<name>/SKILL.md`。LitCode 启动时只把合法 Skill 的 `name` 和 `description` 放入目录；模型调用 `load_skill` 后才加载正文，`scripts/`、`references/` 和 `assets/` 仍只列文件名、按需读取。Skill 不会自动取得额外文件或命令权限。
 
 会话保存在本地 `.litcode/sessions.db` 中，该文件已被 Git 忽略。每个完成的用户轮次自动建立检查点。`/compact` 只建立摘要视图，不删除原始消息。`/rewind` 会让用户选择是否同时恢复 Agent 通过 `apply_patch` 编辑的文件；如果文件后来被其他人修改，恢复会拒绝覆盖。
@@ -74,13 +76,17 @@ TUI 中央是可滚动的对话和工具时间线，底部是固定的多行输�
 
 快捷键：
 
-- `Ctrl+Enter`：发送，多行输入中的 `Enter` 保留为换行；
+- `Enter`：发送；`Shift+Enter` 换行，`Ctrl+Enter` 作为换行 fallback；
+- 输入框第一行按 `↑`、最后一行按 `↓`：回看或返回历史输入，并保留当前草稿；
 - `F2`：查询并选择 API 模型；
 - `Cmd+方向键`：向对应方向创建会话 pane；这是 best-effort 入口，多数 macOS 终端会拦截 Cmd，不应作为唯一入口；
 - `Cmd+Shift+方向键`：移动 pane 焦点；
 - `Ctrl+W` 后按方向键：可靠的分屏入口；也可直接输入 `/split right`；
+- `Ctrl+W` 后按 `h/j/k/l`：聚焦左/下/上/右 pane；后按 `w` 轮换 pane；
 - `Ctrl+L`：清空当前会话；
-- `Ctrl+C`：任务运行时请求停止，空闲时退出。
+- `Ctrl+C`：第一次请求停止或提示退出，1.5 秒内第二次退出。
+
+TUI 不启用鼠标报告，拖选文本、复制和右键粘贴交由终端原生处理；具体“选择即复制”和右键行为取决于终端设置。
 
 斜杠命令：
 

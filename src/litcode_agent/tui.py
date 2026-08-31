@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from rich.text import Text
 from textual import events, on
@@ -30,7 +32,12 @@ from textual.widgets.option_list import Option
 
 from litcode_agent.agent import Agent, AgentEvent, AgentSession
 from litcode_agent.config import Settings
-from litcode_agent.model import ModelError, OpenAIChatModel, ToolCall
+from litcode_agent.model import (
+    Message as ModelMessage,
+    ModelError,
+    OpenAIChatModel,
+    ToolCall,
+)
 from litcode_agent.pane_layout import PaneBranch, PaneLayout, PaneLeaf, PaneNode
 from litcode_agent.references import (
     ReferenceBundle,
@@ -39,7 +46,7 @@ from litcode_agent.references import (
     list_reference_entries,
 )
 from litcode_agent.prompt import PromptBuilder
-from litcode_agent.session_store import Checkpoint, SessionStore
+from litcode_agent.session_store import Checkpoint, SessionInfo, SessionStore
 from litcode_agent.session_workspace import PaneSession, SessionWorkspace
 from litcode_agent.skills import SkillCatalog
 from litcode_agent.tool_display import tool_result_summary, tool_title
@@ -93,12 +100,23 @@ class PaneRuntime:
     streaming_markdown: Markdown | None = None
     streaming_buffer: str = ""
     rendered_output: str | None = None
+    prompt_history: list[str] = field(default_factory=list)
+    prompt_history_index: int | None = None
+    prompt_draft: str = ""
 
 
 class PromptArea(TextArea):
-    """以 Ctrl+Enter 提交的固定多行输入框。"""
+    """Enter 发送、组合键换行，并支持 shell 风格历史。"""
 
-    BINDINGS = [Binding("ctrl+enter", "submit", "发送", show=True)]
+    BINDINGS = [
+        Binding("enter", "submit", "发送", show=True),
+        Binding(
+            "shift+enter,ctrl+enter",
+            "newline",
+            "换行",
+            show=False,
+        ),
+    ]
 
     class Submitted(Message):
         def __init__(self, value: str) -> None:
@@ -108,23 +126,56 @@ class PromptArea(TextArea):
     def action_submit(self) -> None:
         value = self.text.strip()
         if value:
+            app = self.app
+            if isinstance(app, LitCodeTUI):
+                app.record_prompt(value)
             self.text = ""
             self.post_message(self.Submitted(value))
 
+    def action_newline(self) -> None:
+        start, end = self.selection
+        result = self.replace(
+            "\n", start, end, maintain_selection_offset=False
+        )
+        self.move_cursor(result.end_location)
+
     def on_key(self, event: events.Key) -> None:
         app = self.app
-        if not isinstance(app, LitCodeTUI) or not app.completion_visible:
+        if not isinstance(app, LitCodeTUI):
             return
-        if event.key in {"up", "down"}:
-            app.move_completion(-1 if event.key == "up" else 1)
-        elif event.key in {"enter", "tab"}:
-            app.accept_completion()
-        elif event.key == "escape":
-            app.hide_completions()
-        else:
+        if app.pane_leader_active and app.consume_pane_leader_key(event.key):
+            event.prevent_default()
+            event.stop()
             return
-        event.prevent_default()
-        event.stop()
+        if app.completion_visible:
+            if event.key in {"up", "down"}:
+                app.move_completion(-1 if event.key == "up" else 1)
+            elif event.key in {"enter", "tab"}:
+                app.accept_completion()
+            elif event.key == "escape":
+                app.hide_completions()
+            else:
+                return
+            event.prevent_default()
+            event.stop()
+            return
+        if event.key == "enter":
+            self.action_submit()
+            event.prevent_default()
+            event.stop()
+            return
+        if event.key == "up" and self.cursor_at_first_line:
+            if app.navigate_prompt_history(-1):
+                event.prevent_default()
+                event.stop()
+            return
+        if event.key == "down" and self.cursor_at_last_line:
+            if app.navigate_prompt_history(1):
+                event.prevent_default()
+                event.stop()
+            return
+        if event.key not in {"up", "down"}:
+            app.reset_prompt_history_navigation()
 
 
 class ModelPicker(ModalScreen[str | None]):
@@ -272,13 +323,6 @@ class LitCodeTUI(App[None]):
     Screen {
         layout: vertical;
         background: $surface;
-    }
-    #status {
-        height: 3;
-        padding: 0 1;
-        content-align: left middle;
-        background: $panel;
-        border-bottom: solid $primary;
     }
     #pane-area, .split-horizontal, .split-vertical {
         height: 1fr;
@@ -446,14 +490,14 @@ class LitCodeTUI(App[None]):
         self.agent = first.agent
         self.panes = {first.pane_id: self._pane_runtime(first)}
         self._pane_leader = False
+        self._exit_armed_until = 0.0
 
     def compose(self) -> ComposeResult:
-        yield Static(id="status")
         yield Vertical(self._pane_widget(self._active_runtime()), id="pane-area")
         with Vertical(id="composer"):
             yield OptionList(id="completion", compact=True, markup=False)
             yield Label(
-                "输入任务，使用 / 命令、@ 文件或 # 会话 · Ctrl+Enter 发送",
+                "Enter 发送 · Shift+Enter 换行 · ↑↓ 历史 · / @ # 补全",
                 id="prompt-label",
             )
             yield PromptArea(id="prompt", language=None)
@@ -472,13 +516,20 @@ class LitCodeTUI(App[None]):
 
     @staticmethod
     def _pane_runtime(pane: PaneSession) -> PaneRuntime:
-        return PaneRuntime(pane.pane_id, pane.agent, pane.model, pane.session)
+        runtime = PaneRuntime(pane.pane_id, pane.agent, pane.model, pane.session)
+        runtime.prompt_history = _message_prompt_history(pane.session.messages)
+        return runtime
 
     def _sync_runtime(self, pane: PaneSession) -> PaneRuntime:
         runtime = self.panes[pane.pane_id]
+        session_changed = runtime.session.session_id != pane.session.session_id
         runtime.agent = pane.agent
         runtime.model = pane.model
         runtime.session = pane.session
+        if session_changed:
+            runtime.prompt_history = _message_prompt_history(pane.session.messages)
+            runtime.prompt_history_index = None
+            runtime.prompt_draft = ""
         self.agent = pane.agent
         self.model = pane.model
         return runtime
@@ -507,7 +558,7 @@ class LitCodeTUI(App[None]):
         )
         return Vertical(
             Static(
-                Text(f"{info.alias} · {info.title} · {info.model}{unread_label}"),
+                Text(f"{_session_label(info)}{unread_label}"),
                 classes="pane-header",
             ),
             VerticalScroll(id=timeline_id, classes="pane-timeline"),
@@ -535,22 +586,45 @@ class LitCodeTUI(App[None]):
 
     def action_pane_leader(self) -> None:
         self._pane_leader = True
-        self._update_status("分屏：现在按方向键创建 pane；Esc 取消")
+        self._update_status(
+            "方向键分屏 · h/j/k/l 聚焦 · w 轮换 · Esc 取消"
+        )
+
+    @property
+    def pane_leader_active(self) -> bool:
+        return self._pane_leader
+
+    def consume_pane_leader_key(self, key: str) -> bool:
+        if not self._pane_leader:
+            return False
+        self._pane_leader = False
+        if key in {"left", "right", "up", "down"}:
+            self.action_split(key)
+            return True
+        focus_directions = {
+            "h": "left",
+            "j": "down",
+            "k": "up",
+            "l": "right",
+        }
+        if key in focus_directions:
+            self.action_focus_pane(focus_directions[key])
+            return True
+        if key == "w":
+            self.action_cycle_pane()
+            return True
+        self._update_status("就绪")
+        return True
 
     def on_key(self, event: events.Key) -> None:
-        if not self._pane_leader:
+        if not self.pane_leader_active:
             return
-        self._pane_leader = False
-        if event.key in {"left", "right", "up", "down"}:
-            self.action_split(event.key)
+        if self.consume_pane_leader_key(event.key):
             event.prevent_default()
             event.stop()
-            return
-        self._update_status("已取消分屏前缀")
 
     def on_mount(self) -> None:
         self.ui_thread_id = threading.get_ident()
-        self._update_status("就绪")
         self._append_notice(
             "会话已启动。输入 /help 查看命令，"
             "工具调用会显示在时间线中。"
@@ -558,6 +632,10 @@ class LitCodeTUI(App[None]):
         self._append_notice(
             "分屏：Ctrl+W 后按方向键，或输入 /split right。"
             "多数 macOS 终端不会把 Cmd 组合键传给应用。"
+        )
+        self._append_notice(
+            "切换 pane：Ctrl+W 后按 h/j/k/l 聚焦，按 w 轮换；"
+            "也可输入 /focus left。"
         )
         for issue in self.skills.issues:
             self._append_notice(f"Skill 加载失败：{issue}", error=True)
@@ -739,15 +817,29 @@ class LitCodeTUI(App[None]):
     def _show_help(self) -> None:
         self._append_notice(
             " · ".join(f"{item.name} {item.description}" for item in COMMANDS)
-            + " · Ctrl+Enter 发送"
+            + " · Enter 发送 · Shift+Enter 换行"
         )
 
     def action_cancel_or_quit(self) -> None:
+        now = time.monotonic()
+        if now <= self._exit_armed_until:
+            for runtime in self.panes.values():
+                runtime.cancel_requested.set()
+            self.exit()
+            return
+        self._exit_armed_until = now + 1.5
+        self.set_timer(1.5, self._reset_exit_arm)
         if self.busy:
             self._active_runtime().cancel_requested.set()
-            self._update_status("正在停止；等待当前阻塞调用返回…")
+            self._update_status("正在停止；再次 Ctrl+C 退出")
             return
-        self.exit()
+        self._update_status("再次 Ctrl+C 退出")
+
+    def _reset_exit_arm(self) -> None:
+        if time.monotonic() < self._exit_armed_until:
+            return
+        self._exit_armed_until = 0.0
+        self._update_status("运行中" if self.busy else "就绪")
 
     def action_split(self, direction: str) -> None:
         if direction not in {"left", "right", "up", "down"}:
@@ -792,6 +884,59 @@ class LitCodeTUI(App[None]):
         if not runtime.busy:
             prompt.focus()
         self._update_status("运行中" if runtime.busy else "就绪")
+
+    def action_cycle_pane(self) -> None:
+        if len(self.panes) == 1:
+            self._append_notice("当前只有一个 pane。")
+            return
+        previous = self.active_pane_id
+        pane = self.sessions.focus_next()
+        try:
+            self.query_one(f"#view-{previous}").remove_class("pane-active")
+            self.query_one(f"#view-{pane.pane_id}").add_class("pane-active")
+        except Exception:
+            pass
+        runtime = self._sync_runtime(pane)
+        prompt = self.query_one(PromptArea)
+        prompt.disabled = runtime.busy
+        if not runtime.busy:
+            prompt.focus()
+        self._update_status("运行中" if runtime.busy else "就绪")
+
+    def record_prompt(self, value: str) -> None:
+        runtime = self._active_runtime()
+        if not runtime.prompt_history or runtime.prompt_history[-1] != value:
+            runtime.prompt_history.append(value)
+        runtime.prompt_history_index = None
+        runtime.prompt_draft = ""
+
+    def navigate_prompt_history(self, direction: int) -> bool:
+        runtime = self._active_runtime()
+        history = runtime.prompt_history
+        if not history or direction not in {-1, 1}:
+            return False
+        prompt = self.query_one(PromptArea)
+        index = runtime.prompt_history_index
+        if direction == -1:
+            if index is None:
+                runtime.prompt_draft = prompt.text
+                index = len(history) - 1
+            elif index > 0:
+                index -= 1
+        elif index is None:
+            return False
+        elif index < len(history) - 1:
+            index += 1
+        else:
+            index = None
+        runtime.prompt_history_index = index
+        prompt.text = runtime.prompt_draft if index is None else history[index]
+        prompt.move_cursor(prompt.document.end)
+        return True
+
+    def reset_prompt_history_navigation(self) -> None:
+        runtime = self._active_runtime()
+        runtime.prompt_history_index = None
 
     def action_close_pane(self) -> None:
         if len(self.panes) == 1:
@@ -1149,17 +1294,16 @@ class LitCodeTUI(App[None]):
         except Exception:
             return
         info = self.store.session_info(runtime.session.session_id)
-        header.update(Text(f"{info.alias} · {info.title} · {status}"))
+        unread = len(self.store.inbox(runtime.session.session_id))
+        details = _session_label(info)
+        if unread:
+            details += f" · 未读 {unread}"
+        if status not in {"就绪", "新 pane"}:
+            details += f" · {status}"
+        header.update(Text(details))
 
     def _update_status(self, activity: str) -> None:
-        info = self.store.session_info(self.session.session_id)
-        self.query_one("#status", Static).update(
-            Text(
-                f"{self.settings.workspace}  ·  "
-                f"{info.alias}  ·  {self.settings.model_profile} / "
-                f"{self.model.model}  ·  {activity}"
-            )
-        )
+        self._update_pane_header(self._active_runtime(), activity)
 
     def _timeline(self, runtime: PaneRuntime) -> VerticalScroll:
         timeline_id = (
@@ -1380,7 +1524,9 @@ def _fuzzy_matches(
 
 
 def run_tui(settings: Settings, model: OpenAIChatModel) -> int:
-    LitCodeTUI(settings, model).run()
+    # Let the terminal own drag-selection and context-menu paste. Textual mouse
+    # reporting otherwise consumes those gestures before the terminal sees them.
+    LitCodeTUI(settings, model).run(mouse=False)
     return 0
 
 
@@ -1388,6 +1534,34 @@ def _model_label(model: str, current: str) -> str:
     return f"{model}  （当前）" if model == current else model
 
 
+def _session_label(info: SessionInfo) -> str:
+    """Keep the collision suffix for references, not the primary UI label."""
+
+    try:
+        created = datetime.strptime(info.alias[:11], "%y%m%d-%H%M")
+        timestamp = created.strftime("%m-%d %H:%M")
+    except ValueError:
+        timestamp = info.alias
+    return f"{info.title} · {timestamp} · {info.model}"
+
+
 def _display_user_content(content: str) -> str:
-    marker = "\n\n以下是用户明确引用的本地文件快照。"
-    return content.partition(marker)[0]
+    markers = (
+        "\n\n以下是用户明确引用的本地文件快照。",
+        "\n\n以下是用户明确引用的其他会话快照。",
+    )
+    boundaries = [content.find(marker) for marker in markers]
+    visible = [boundary for boundary in boundaries if boundary >= 0]
+    return content[: min(visible)] if visible else content
+
+
+def _message_prompt_history(messages: list[ModelMessage]) -> list[str]:
+    history: list[str] = []
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") != "user" or not isinstance(content, str):
+            continue
+        visible = _display_user_content(content).strip()
+        if visible and (not history or history[-1] != visible):
+            history.append(visible)
+    return history
