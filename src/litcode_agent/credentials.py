@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
@@ -61,7 +62,102 @@ def save_api_key(
     if not isinstance(credentials, dict):
         raise CredentialError(f"invalid credentials object: {path}")
     credentials[normalized_name] = {"type": "api", "key": normalized_key}
+    _write_store(path, existing)
+    return path
 
+
+@dataclass(frozen=True, slots=True)
+class LastClient:
+    """用户级记忆的最后一次使用的端点；不含任何密钥。"""
+
+    api_key_env: str
+    base_url: str | None
+    model: str | None
+
+    def to_values(self) -> dict[str, object]:
+        return {
+            "apiKeyEnv": self.api_key_env,
+            "baseURL": self.base_url,
+            "model": self.model,
+        }
+
+
+def save_last_client(
+    client: LastClient,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """原子记忆最后的端点选择，仍只写入用户级 0600 文件。"""
+
+    if not client.api_key_env.strip() or not client.model:
+        raise CredentialError("last client requires apiKeyEnv and model")
+    path = credential_file(environ)
+    existing = _read_store(path)
+    existing["lastClient"] = client.to_values()
+    _write_store(path, existing)
+    return path
+
+
+def load_last_client(
+    environ: Mapping[str, str] | None = None,
+) -> LastClient | None:
+    """读取用户级记忆的端点；缺失或不合法时返回 None。"""
+
+    path = credential_file(environ)
+    try:
+        store = _read_store(path)
+    except CredentialError:
+        return None
+    raw = store.get("lastClient")
+    if not isinstance(raw, dict):
+        return None
+    api_key_env = raw.get("apiKeyEnv")
+    if not isinstance(api_key_env, str) or not api_key_env.strip():
+        return None
+    base_url = raw.get("baseURL")
+    if base_url is not None and not isinstance(base_url, str):
+        return None
+    model = raw.get("model")
+    if model is not None and not isinstance(model, str):
+        return None
+    try:
+        validate_credential_name(api_key_env)
+    except CredentialError:
+        return None
+    return LastClient(
+        api_key_env=api_key_env.strip(),
+        base_url=base_url,
+        model=model.strip() if isinstance(model, str) else None,
+    )
+
+
+def credential_available(
+    name: str,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """凭据名是否已有密钥：环境变量优先，其次用户级存储。"""
+
+    values = os.environ if environ is None else environ
+    if values.get(name, "").strip():
+        return True
+    path = credential_file(values)
+    try:
+        return bool(load_api_key(name, values))
+    except CredentialError:
+        return False
+
+
+def validate_credential_name(name: str) -> str:
+    """Validate and normalize the environment-style credential identifier."""
+
+    normalized = name.strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized):
+        raise CredentialError(
+            "credential name must be an environment variable name"
+        )
+    return normalized
+
+
+def _write_store(path: Path, store: dict[str, object]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.name == "posix":
         path.parent.chmod(0o700)
@@ -76,7 +172,7 @@ def save_api_key(
         ) as temporary:
             temporary_name = temporary.name
             os.chmod(temporary_name, 0o600)
-            json.dump(existing, temporary, ensure_ascii=False, indent=2)
+            json.dump(store, temporary, ensure_ascii=False, indent=2)
             temporary.write("\n")
         os.replace(temporary_name, path)
         temporary_name = None
@@ -85,18 +181,6 @@ def save_api_key(
     finally:
         if temporary_name is not None:
             Path(temporary_name).unlink(missing_ok=True)
-    return path
-
-
-def validate_credential_name(name: str) -> str:
-    """Validate and normalize the environment-style credential identifier."""
-
-    normalized = name.strip()
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized):
-        raise CredentialError(
-            "credential name must be an environment variable name"
-        )
-    return normalized
 
 
 def _read_store(path: Path) -> dict[str, object]:

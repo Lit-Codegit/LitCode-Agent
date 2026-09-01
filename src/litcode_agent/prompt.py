@@ -5,15 +5,18 @@ from __future__ import annotations
 import platform
 from html import escape
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
+from litcode_agent.scheduler import local_timezone_name
 from litcode_agent.skills import SkillMetadata
 
 
 BASE_BEHAVIOR = """You are LitCode Agent, a careful coding assistant.
 Inspect relevant files before editing. Make the smallest changes that solve the
 task, verify them, and report evidence. Treat tool errors as feedback. Never
-claim a command succeeded unless its result says so."""
+claim a command succeeded unless its result says so. Never create, change, or
+cancel a scheduled task unless the current user message explicitly requests it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +42,11 @@ class PromptBuilder:
         result.append(
             PromptSection(
                 "environment",
-                f"Workspace: {self.workspace}\nPlatform: {platform.system()}",
+                (
+                    f"Workspace: {self.workspace}\nPlatform: {platform.system()}\n"
+                    f"Current local time: {datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+                    f"Default IANA timezone: {local_timezone_name()}"
+                ),
                 "runtime",
             )
         )

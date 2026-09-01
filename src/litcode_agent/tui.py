@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import threading
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 from rich.text import Text
 from textual import events, on
@@ -34,11 +38,25 @@ from textual.widgets.option_list import Option
 
 from litcode_agent.agent import Agent, AgentEvent, AgentSession
 from litcode_agent.config import Settings
+from litcode_agent.credentials import (
+    CredentialError,
+    LastClient,
+    credential_available,
+    save_api_key,
+    save_last_client,
+    validate_credential_name,
+)
 from litcode_agent.model import (
     Message as ModelMessage,
     ModelError,
     OpenAIChatModel,
     ToolCall,
+    fetch_model_list,
+)
+from litcode_agent.providers import (
+    Provider,
+    ordered_providers,
+    provider_by_id,
 )
 from litcode_agent.pane_layout import PaneBranch, PaneLayout, PaneLeaf, PaneNode
 from litcode_agent.references import (
@@ -48,13 +66,18 @@ from litcode_agent.references import (
     list_reference_entries,
     SESSION_REFERENCE_PATTERN,
 )
+from litcode_agent.scheduler import Scheduler, describe_task, local_timezone_name
 from litcode_agent.prompt import PromptBuilder
 from litcode_agent.session_store import Checkpoint, SessionInfo, SessionStore, SessionTurn
-from litcode_agent.session_runtime import SessionRuntime
+from litcode_agent.session_runtime import SessionRuntime, SessionRuntimeError
 from litcode_agent.session_workspace import PaneSession, SessionWorkspace
 from litcode_agent.skills import SkillCatalog
 from litcode_agent.tool_display import (
     change_result_summary,
+    subagent_completion_summary,
+    subagent_result_summary,
+    subagent_running_summary,
+    subagent_title,
     tool_result_summary,
     tool_title,
 )
@@ -74,6 +97,12 @@ class CommandSpec:
 COMMANDS = (
     CommandSpec("/help", "显示命令帮助", "help"),
     CommandSpec("/model", "查询并选择模型", "model", ("/models",)),
+    CommandSpec(
+        "/connect",
+        "连接或切换供应商，配置 API Key",
+        "connect",
+        ("/auth",),
+    ),
     CommandSpec("/new", "新建会话并切换当前 pane", "new"),
     CommandSpec("/clear", "新建空白会话", "clear"),
     CommandSpec(
@@ -90,9 +119,18 @@ COMMANDS = (
     CommandSpec("/focus", "按方向切换 pane", "focus"),
     CommandSpec("/close-pane", "关闭当前 pane", "close_pane"),
     CommandSpec("/nohup", "卸载当前会话并让它在后台继续", "nohup"),
-    CommandSpec("/subagent", "创建一个子会话并按需后台运行", "subagent"),
+    CommandSpec(
+        "/subagent",
+        "创建子会话；可用 --pane <方向> 立即分屏运行",
+        "subagent",
+    ),
     CommandSpec("/inbox", "查看当前会话收件箱", "inbox"),
     CommandSpec("/queue", "查看或管理当前会话队列", "queue"),
+    CommandSpec(
+        "/schedule",
+        "用自然语言创建定时 Agent 任务；list/cancel 可管理",
+        "schedule",
+    ),
     CommandSpec("/exit", "退出 LitCode", "exit", ("/quit",)),
 )
 
@@ -100,6 +138,10 @@ COMMANDS = (
 LIST_CARD_LINE_THRESHOLD = 12
 PICKER_LABEL_CELLS = 60
 PICKER_GUIDE_DEPTH = 3
+MODEL_ID_CUSTOM = "\0enter-model-id"
+SUBAGENT_SPINNER_FRAMES = (
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +164,17 @@ class _PendingQuestion:
 
 
 @dataclass(slots=True)
+class _SubagentCardState:
+    tool_call: ToolCall
+    model: str
+    started_at: float
+    invocation_id: str | None = None
+    child_session_id: str | None = None
+    alias: str | None = None
+    tool_finished: bool = False
+
+
+@dataclass(slots=True)
 class PaneRuntime:
     pane_id: str
     pane_slot: int
@@ -132,6 +185,7 @@ class PaneRuntime:
     cancel_requested: threading.Event = field(default_factory=threading.Event)
     tool_bodies: dict[str, PagedOutput] = field(default_factory=dict)
     tool_cards: dict[str, Collapsible] = field(default_factory=dict)
+    subagent_cards: dict[str, _SubagentCardState] = field(default_factory=dict)
     streaming_markdown: Markdown | None = None
     streaming_buffer: str = ""
     rendered_output: str | None = None
@@ -332,17 +386,40 @@ class ModelPicker(ModalScreen[str | None]):
 
     BINDINGS = [Binding("escape", "cancel", "取消")]
 
-    def __init__(self, models: tuple[str, ...], current: str) -> None:
+    def __init__(
+        self,
+        models: tuple[str, ...],
+        current: str,
+        show_custom: bool = False,
+    ) -> None:
         super().__init__()
         self.models = models
         self.current = current
+        self.show_custom = show_custom
 
     def compose(self) -> ComposeResult:
-        initial = self.models.index(self.current) if self.current in self.models else 0
-        items = [
-            ListItem(Label(Text(_model_label(model, self.current))))
-            for model in self.models
-        ]
+        offset = 1 if self.show_custom else 0
+        initial = (
+            0
+            if self.show_custom and not self.models
+            else self.models.index(self.current) + offset
+            if self.current in self.models
+            else 0
+        )
+        items = []
+        if self.show_custom:
+            items.append(
+                ListItem(Label(Text("✚ 输入模型 ID", style="cyan")))
+            )
+            items.extend(
+                ListItem(Label(Text(_model_label(model, self.current))))
+                for model in self.models
+            )
+        else:
+            items = [
+                ListItem(Label(Text(_model_label(model, self.current))))
+                for model in self.models
+            ]
         with Vertical(id="model-dialog"):
             yield Label("选择模型", classes="dialog-title")
             yield ListView(*items, initial_index=initial, id="model-list")
@@ -350,8 +427,211 @@ class ModelPicker(ModalScreen[str | None]):
 
     @on(ListView.Selected)
     def select_model(self, event: ListView.Selected) -> None:
-        if event.list_view.index is not None:
+        if event.list_view.index is None:
+            return
+        if self.show_custom:
+            if event.list_view.index == 0:
+                self.dismiss(MODEL_ID_CUSTOM)
+                return
+            self.dismiss(
+                self.models[event.list_view.index - 1]
+                if 1 <= event.list_view.index <= len(self.models)
+                else None
+            )
+            return
+        if event.list_view.index < len(self.models):
             self.dismiss(self.models[event.list_view.index])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ProviderPicker(ModalScreen[str | None]):
+    """选择要连接的供应商；返回 provider id 或自定义入口标记。
+
+    交互形状借鉴 OpenCode 的 Connect a provider 弹窗：Popular 排序、已存
+    密钥的供应商标记 ✓、末尾提供自定义 OpenAI 兼容端点入口。
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "取消")]
+
+    def __init__(
+        self,
+        *,
+        current_provider: Provider | None,
+        environ: Mapping[str, str],
+    ) -> None:
+        super().__init__()
+        rows: list[tuple[str, str]] = []
+        for provider in ordered_providers():
+            rows.append(
+                (
+                    f"provider:{provider.id}",
+                    _provider_label(
+                        provider,
+                        current_provider,
+                        environ,
+                    ),
+                )
+            )
+        rows.append(
+            ("custom", "自定义 OpenAI 兼容端点（任意 base URL / 凭据名）")
+        )
+        self.choices = tuple(rows)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="model-dialog"):
+            yield Label("连接供应商", classes="dialog-title")
+            yield ListView(
+                *(ListItem(Label(label)) for _, label in self.choices),
+                initial_index=0,
+                id="model-list",
+            )
+            yield Label("Enter 选择 · Esc 取消", classes="dialog-help")
+
+    @on(ListView.Selected)
+    def selected(self, event: ListView.Selected) -> None:
+        if event.list_view.index is not None:
+            self.dismiss(self.choices[event.list_view.index][0])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SecretPrompt(ModalScreen[str | None]):
+    """隐藏输入 API Key；形状借鉴 OpenCode 的 API key 输入框。"""
+
+    BINDINGS = [Binding("escape", "cancel", "取消")]
+
+    def __init__(self, provider: Provider) -> None:
+        super().__init__()
+        self.provider = provider
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="model-dialog"):
+            yield Label(
+                f"为 {self.provider.name} 粘贴 API Key", classes="dialog-title"
+            )
+            hint = (
+                f"密钥不进入项目配置，保存到用户级 0600 凭据文件。"
+                if self.provider.key_url is None
+                else f"取密钥：{self.provider.key_url}\n密钥不进入项目配置，保存到用户级 0600 凭据文件。"
+            )
+            yield Static(Text(hint), classes="dialog-help")
+            yield Input(
+                password=True,
+                placeholder="粘贴 API Key（不会显示）",
+                id="secret-input",
+            )
+            yield Label("Enter 保存并查询模型 · Esc 取消", classes="dialog-help")
+
+    def on_mount(self) -> None:
+        self.query_one("#secret-input", Input).focus()
+
+    @on(Input.Submitted, "#secret-input")
+    def secret_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        if value:
+            self.dismiss(value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+@dataclass(frozen=True, slots=True)
+class CustomEndpoint:
+    base_url: str
+    api_key_env: str
+    api_key: str
+
+
+class CustomEndpointPrompt(ModalScreen[CustomEndpoint | None]):
+    """自定义 OpenAI 兼容端点：base URL、凭据名和密钥一次填完。"""
+
+    BINDINGS = [Binding("escape", "cancel", "取消")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="model-dialog"):
+            yield Label("自定义 OpenAI 兼容端点", classes="dialog-title")
+            yield Input(
+                placeholder="base URL（如 http://127.0.0.1:8000/v1 或 https://…）",
+                id="custom-base",
+            )
+            yield Input(
+                placeholder="凭据名（默认 LITCODE_CUSTOM_API_KEY）",
+                id="custom-env",
+            )
+            yield Input(
+                password=True,
+                placeholder="API Key（无鉴权服务输入任意占位值）",
+                id="custom-key",
+            )
+            yield Static("", classes="dialog-help", id="custom-error")
+            yield Label("Enter 保存并查询模型 · Esc 取消", classes="dialog-help")
+
+    def on_mount(self) -> None:
+        self.query_one("#custom-base", Input).focus()
+
+    @on(Input.Submitted, "#custom-key")
+    def submitted(self, event: Input.Submitted) -> None:
+        base_url = self.query_one("#custom-base", Input).value.strip()
+        raw_env = self.query_one("#custom-env", Input).value.strip()
+        key = self.query_one("#custom-key", Input).value.strip()
+        error = self._validate(base_url, raw_env, key)
+        if error:
+            self.query_one("#custom-error", Static).update(
+                Text(error, style="error")
+            )
+            return
+        self.dismiss(
+            CustomEndpoint(
+                base_url,
+                raw_env or "LITCODE_CUSTOM_API_KEY",
+                key,
+            )
+        )
+
+    @staticmethod
+    def _validate(base_url: str, raw_env: str, key: str) -> str | None:
+        if not base_url:
+            return "base URL 不能为空。"
+        if not base_url.startswith(("http://", "https://")):
+            return "base URL 必须是 http:// 或 https:// 开头。"
+        if raw_env:
+            try:
+                validate_credential_name(raw_env)
+            except CredentialError:
+                return f"凭据名不合法：{raw_env}"
+        if not key:
+            return "API Key 不能为空（无鉴权服务输入任意占位值）。"
+        return None
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ModelIDPrompt(ModalScreen[str | None]):
+    """手动输入模型 ID；用于端点查询失败或列表都没有合适模型时。"""
+
+    BINDINGS = [Binding("escape", "cancel", "取消")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="model-dialog"):
+            yield Label("输入模型 ID", classes="dialog-title")
+            yield Input(
+                placeholder="模型 ID（查询失败时按后端示例手动填写）",
+                id="model-id-input",
+            )
+            yield Label("Enter 使用 · Esc 取消", classes="dialog-help")
+
+    def on_mount(self) -> None:
+        self.query_one("#model-id-input", Input).focus()
+
+    @on(Input.Submitted, "#model-id-input")
+    def submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        if value:
+            self.dismiss(value)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -416,14 +696,81 @@ class ChoicePicker(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class HistoryPicker(ModalScreen[str | None]):
+@dataclass(frozen=True, slots=True)
+class HistorySelection:
+    session_id: str
+    split: bool = False
+
+
+class HistoryTree(Tree[str]):
+    """Session tree with conventional left/right hierarchy navigation."""
+
+    BINDINGS = [
+        *Tree.BINDINGS,
+        Binding("left", "collapse_or_parent", "折叠 / 返回父会话", show=False),
+        Binding("right", "expand_or_child", "展开 / 进入子会话", show=False),
+    ]
+
+    def __init__(
+        self,
+        label_for: Callable[[str, int, int], Text],
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._label_for = label_for
+
+    def render_label(self, node, base_style, style) -> Text:
+        if not isinstance(node.data, str):
+            return super().render_label(node, base_style, style)
+        depth = 0
+        parent = node.parent
+        while parent is not None and parent is not self.root:
+            depth += 1
+            parent = parent.parent
+        viewport_width = self.scrollable_content_region.width or self.size.width
+        # Reserve two cells for our disclosure marker and two more for the
+        # cursor/scrollbar edge. Tree adds hierarchy guides outside this label.
+        width = max(24, viewport_width - 4)
+        label = self._label_for(node.data, depth, width)
+        label.stylize(style)
+        prefix = "▾ " if node.children and node.is_expanded else "▸ " if node.children else "  "
+        return Text.assemble((prefix, base_style), label)
+
+    def action_expand_or_child(self) -> None:
+        node = self.cursor_node
+        if node is None or not node.children:
+            return
+        if not node.is_expanded:
+            node.expand()
+            return
+        self.move_cursor(node.children[0])
+
+    def action_collapse_or_parent(self) -> None:
+        node = self.cursor_node
+        if node is None:
+            return
+        if node.children and node.is_expanded:
+            node.collapse()
+            return
+        parent = node.parent
+        if parent is not None and parent is not self.root:
+            self.move_cursor(parent)
+
+
+class HistoryPicker(ModalScreen[HistorySelection | None]):
     """树状历史会话选择器：筛选 + Enter 挂载，原会话转为后台运行。
 
     接口形状借鉴 OpenCode 的会话选择弹窗（搜索框 + 有界列表 + Enter 提交），
     但保留 LitCode 的会话树层级：子会话缩进展示，候选数有界并提示总数。
     """
 
-    BINDINGS = [Binding("escape", "cancel", "取消")]
+    BINDINGS = [
+        Binding("escape", "cancel", "取消"),
+        Binding("shift+enter", "open_in_split", "在新 pane 打开"),
+        Binding("slash", "focus_filter", "筛选", show=False),
+        Binding("tab", "toggle_focus", "切换焦点", show=False),
+    ]
 
     def __init__(
         self,
@@ -442,10 +789,16 @@ class HistoryPicker(ModalScreen[str | None]):
         self.terminal_id = terminal_id
         self.filter_text = query
         self.current_session_id = current_session_id
+        self.infos = {info.id: info for _, info in rows}
         self._pending_cursor = None
+        self._focus_tree_after_refresh = True
 
     def compose(self) -> ComposeResult:
-        session_tree = Tree("会话", id="history-tree")
+        session_tree = HistoryTree(
+            self._row_label,
+            "会话",
+            id="history-tree",
+        )
         session_tree.show_root = False
         session_tree.guide_depth = 3
         with Vertical(id="history-dialog"):
@@ -464,7 +817,7 @@ class HistoryPicker(ModalScreen[str | None]):
     @on(Tree.NodeSelected, "#history-tree")
     def tree_selected(self, event: Tree.NodeSelected) -> None:
         identifier = event.node.data if isinstance(event.node.data, str) else None
-        self.dismiss(identifier or self._first_visible_data())
+        self._dismiss_selection(identifier or self._first_visible_data())
 
     @on(Input.Changed, "#history-filter")
     def filter_changed(self, event: Input.Changed) -> None:
@@ -475,8 +828,37 @@ class HistoryPicker(ModalScreen[str | None]):
     def filter_submitted(self, event: Input.Submitted) -> None:
         tree = self.query_one("#history-tree", Tree)
         identifier = tree.cursor_node.data if tree.cursor_node is not None else None
-        self.dismiss(
+        self._dismiss_selection(
             identifier if isinstance(identifier, str) else self._first_visible_data()
+        )
+
+    def _dismiss_selection(self, identifier: str | None, *, split: bool = False) -> None:
+        self.dismiss(HistorySelection(identifier, split) if identifier else None)
+
+    def action_open_in_split(self) -> None:
+        tree = self.query_one("#history-tree", HistoryTree)
+        identifier = tree.cursor_node.data if tree.cursor_node is not None else None
+        self._dismiss_selection(
+            identifier if isinstance(identifier, str) else self._first_visible_data(),
+            split=True,
+        )
+
+    def action_focus_filter(self) -> None:
+        self.query_one("#history-filter", Input).focus()
+
+    def action_toggle_focus(self) -> None:
+        tree = self.query_one("#history-tree", HistoryTree)
+        filter_input = self.query_one("#history-filter", Input)
+        (tree if filter_input.has_focus else filter_input).focus()
+
+    def _row_label(self, identifier: str, depth: int, width: int) -> Text:
+        return _history_label(
+            self.infos[identifier],
+            self.mounted,
+            self.running,
+            self.current_session_id,
+            depth,
+            width,
         )
 
     def _first_visible_data(self) -> str | None:
@@ -494,7 +876,10 @@ class HistoryPicker(ModalScreen[str | None]):
         return first(tree.root)
 
     def _refresh_tree(self) -> None:
-        tree = self.query_one("#history-tree", Tree)
+        tree = self.query_one("#history-tree", HistoryTree)
+        self._focus_tree_after_refresh = not self.query_one(
+            "#history-filter", Input
+        ).has_focus
         tree.clear()
         visible = self._filtered_infos()
         children: dict[str | None, list[str]] = {}
@@ -504,14 +889,9 @@ class HistoryPicker(ModalScreen[str | None]):
 
         def add_node(parent, info: SessionInfo, depth: int):
             node = parent.add(
-                _history_label(
-                    info,
-                    self.mounted,
-                    self.running,
-                    self.current_session_id,
-                    depth,
-                ),
+                self._row_label(info.id, depth, max(24, tree.size.width - 3)),
                 data=info.id,
+                allow_expand=bool(children.get(info.id)),
             )
             for identifier in children.get(info.id, []):
                 add_node(node, infos[identifier], depth + 1)
@@ -525,19 +905,22 @@ class HistoryPicker(ModalScreen[str | None]):
         if first_node is not None:
             self.call_after_refresh(self._apply_cursor)
         self.query_one("#history-help", Label).update(
-            f"共 {len(self.rows)} 个会话 · 显示 {len(visible)} 个 · Enter 选择 · Esc 取消"
+            f"共 {len(self.rows)} 个会话 · 显示 {len(visible)} · ←/→ 折叠/展开 · "
+            "Enter 打开 · Shift+Enter 分屏 · / 筛选"
         )
 
     def _apply_cursor(self) -> None:
         """把光标落到第一个节点；Tree 的行映射在访问时惰性构建。"""
 
-        tree = self.query_one("#history-tree", Tree)
+        tree = self.query_one("#history-tree", HistoryTree)
         if self._pending_cursor is None:
             return
         tree.cursor_line = self._pending_cursor._line
         tree.move_cursor(self._pending_cursor)
         if tree.cursor_line < 0:
             tree.cursor_line = 0
+        if self._focus_tree_after_refresh:
+            tree.focus()
 
     def _filtered_infos(self) -> list[tuple[int, SessionInfo]]:
         filter_text = self.filter_text.strip()
@@ -789,6 +1172,83 @@ class RewindMode(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+_WELCOME_LOGO = (
+    "█   █   ███  ███  ██   ███ ███",
+    "█   █    █  █    █  █ █  █ █",
+    "█   █    █  █    █  █ █  █ ███",
+    "█   █    █  █    █  █ █  █ █",
+    "███ █    █   ███  ██   ███ ███",
+)
+_WELCOME_GRADIENT = ("#06b6d4", "#38bdf8", "#6366f1", "#a855f7", "#d946ef")
+_WELCOME_SHINE = "#ffffff"
+_WELCOME_VALUE = "#94a3b8"
+_WELCOME_MUTED = "#64748b"
+
+
+class WelcomeBanner(Static):
+    """新会话入场横幅：渐变 logo + 会话信息 + 快捷键；只做渲染，不含决策逻辑。"""
+
+    def __init__(
+        self,
+        *,
+        workspace: str,
+        model_profile: str,
+        model_name: str,
+        configured: bool,
+    ) -> None:
+        super().__init__("")
+        self._workspace = workspace
+        self._model_profile = model_profile
+        self._model_name = model_name
+        self._configured = configured
+        self._shine = -1
+
+    def on_mount(self) -> None:
+        self.set_interval(1.4, self._pulse)
+
+    def _pulse(self) -> None:
+        self._shine += 1
+        border = _WELCOME_GRADIENT[self._shine % len(_WELCOME_GRADIENT)]
+        self.styles.border = ("round", border)
+        self.refresh()
+
+    def render(self) -> Text:
+        text = Text()
+        active = self._shine % len(_WELCOME_LOGO) if self._shine >= 0 else None
+        for index, line in enumerate(_WELCOME_LOGO):
+            if index == active:
+                text.append(line + "\n", style=f"bold {_WELCOME_SHINE}")
+            else:
+                text.append(line + "\n", style=f"bold {_WELCOME_GRADIENT[index]}")
+        text.append("\n")
+        text.append("─" * 33 + "\n", style=f"dim {_WELCOME_MUTED}")
+        for key, hint in (
+            ("/help", "显示命令"),
+            ("@ 文件", "引用文件"),
+            ("Ctrl+W 分屏", "切换 pane"),
+            ("F2", "切换模型"),
+            ("Ctrl+C", "停止/退出"),
+        ):
+            text.append(f"{key}   ", style=f"bold {_WELCOME_SHINE}")
+            text.append(f"{hint}  ", style=f"dim {_WELCOME_MUTED}")
+        text.append("\n")
+        text.append("─" * 33 + "\n", style=f"dim {_WELCOME_MUTED}")
+        meta = " · ".join(
+            (
+                self._model_name or "未配置",
+                self._model_profile,
+                self._workspace,
+            )
+        )
+        text.append(f"  {meta}\n", style=_WELCOME_VALUE)
+        text.append("  ")
+        if self._configured:
+            text.append("● 就绪 · 等待第一条消息", style="bold #4ade80")
+        else:
+            text.append("✕ 未连接 · 输入 /connect 连接供应商", style="bold #fbbf24")
+        return text
+
+
 class LitCodeTUI(App[None]):
     """LitCode Agent 的常驻全屏界面。"""
 
@@ -822,7 +1282,7 @@ class LitCodeTUI(App[None]):
     CSS = """
     Screen {
         layout: vertical;
-        background: $surface;
+        background: $background;
     }
     #pane-area, .split-horizontal, .split-vertical {
         height: 1fr;
@@ -831,10 +1291,7 @@ class LitCodeTUI(App[None]):
     .session-pane {
         height: 1fr;
         width: 1fr;
-        border: round $secondary;
-    }
-    .session-pane.pane-active {
-        border: round $primary;
+        background: $background;
     }
     .pane-divider {
         background: $secondary;
@@ -851,28 +1308,81 @@ class LitCodeTUI(App[None]):
     .pane-header {
         height: 1;
         padding: 0 1;
-        background: $panel;
+        background: $background;
         color: $text-muted;
     }
     .pane-active > .pane-header {
         color: $primary;
         text-style: bold;
+        background: $primary 8%;
     }
     .pane-timeline {
         height: 1fr;
-        padding: 1 2;
+        padding: 1 1;
         scrollbar-size: 1 1;
     }
-    .message-user, .message-assistant, .notice, Collapsible {
+    .message-user, .notice, Collapsible {
         margin: 0 0 1 0;
-        padding: 1 2;
     }
     .message-user {
-        background: $primary 10%;
+        padding: 1 2;
+        background: $panel;
+        border-left: thick $primary;
     }
     .message-assistant {
-        background: $success 10%;
-        border-left: thick $success;
+        margin: 0 0 1 0;
+        padding: 0 2;
+        background: transparent;
+        border: none;
+    }
+    .message-assistant MarkdownH1 {
+        content-align: left middle;
+        padding: 0 1;
+        color: $text;
+        background: $primary 15%;
+        border-bottom: solid $primary;
+        text-style: bold;
+    }
+    .message-assistant MarkdownH2 {
+        padding: 0 1;
+        color: $primary;
+        background: $primary 8%;
+        border-left: thick $primary;
+        text-style: bold;
+    }
+    .message-assistant MarkdownH3,
+    .message-assistant MarkdownH4,
+    .message-assistant MarkdownH5,
+    .message-assistant MarkdownH6 {
+        color: $primary;
+        text-style: bold;
+    }
+    .message-assistant MarkdownBlock > .strong {
+        color: $primary;
+        text-style: bold;
+    }
+    .message-assistant MarkdownBlock > .code_inline {
+        color: $warning;
+        background: $warning 20%;
+        text-style: bold;
+    }
+    .message-assistant MarkdownFence {
+        background: $panel;
+        border: round $secondary;
+    }
+    .message-assistant MarkdownBlockQuote {
+        padding: 0 1;
+        background: $secondary 10%;
+        border-left: thick $secondary;
+    }
+    .message-assistant MarkdownBullet {
+        color: $primary;
+        text-style: bold;
+    }
+    .message-assistant MarkdownTableContent > .header {
+        color: $text;
+        background: $primary 12%;
+        text-style: bold;
     }
     .notice {
         color: $text-muted;
@@ -881,21 +1391,39 @@ class LitCodeTUI(App[None]):
     .notice-error {
         color: $error;
     }
+    WelcomeBanner {
+        height: auto;
+        padding: 1 2;
+        margin: 0 0 1 0;
+        background: $panel 40%;
+        border: round #06b6d4;
+    }
     Collapsible {
+        margin: 0 0 1 0;
+        padding: 0 1;
+        padding-bottom: 0;
+        background: transparent;
+        border: none;
+        border-top: none;
+    }
+    Collapsible:focus-within {
         background: $boost;
-        border-left: thick $accent;
+    }
+    CollapsibleTitle {
+        padding: 0 1;
     }
     Collapsible.tool-succeeded {
-        border-left: thick $success;
+        border: none;
     }
     Collapsible.tool-failed {
-        border-left: thick $error;
+        border-left: solid $error;
+        background: $error 5%;
     }
     #composer {
-        height: 7;
-        padding: 0 1 1 1;
-        background: $panel;
-        border-top: solid $primary;
+        height: 6;
+        padding: 0 1;
+        background: $background;
+        border-top: none;
     }
     #composer.completing {
         height: 16;
@@ -910,19 +1438,60 @@ class LitCodeTUI(App[None]):
     #completion.visible {
         display: block;
     }
-    #prompt-label {
+    OptionList > .option-list--option-highlighted {
+        color: $text;
+        background: $primary 25%;
+        text-style: bold;
+    }
+    OptionList:focus > .option-list--option-highlighted {
+        color: $background;
+        background: $primary;
+        text-style: bold;
+    }
+    ListView > ListItem.-highlight {
+        color: $text;
+        background: $primary 25%;
+        text-style: bold;
+    }
+    ListView:focus > ListItem.-highlight {
+        color: $background;
+        background: $primary;
+        text-style: bold;
+    }
+    TextArea .text-area--selection {
+        background: $primary 45%;
+        text-style: bold;
+    }
+    #prompt-meta {
         height: 1;
+    }
+    #prompt-meta-left {
+        width: 1fr;
+        padding: 0 2;
+        color: $text-muted;
+    }
+    #prompt-meta-right {
+        padding: 0 2;
+        color: $text-muted;
+    }
+    #prompt-hint {
+        height: 1;
+        padding: 0 2;
         color: $text-muted;
     }
     #prompt {
-        height: 5;
-        border: tall $primary;
+        height: 4;
+        padding: 0 2;
+        border: none;
+        border-left: $primary;
+        background: $panel;
     }
     Footer {
-        height: 1;
+        display: none;
     }
     ModelPicker, ConfirmCommand, ChoicePicker, RewindMode, HistoryPicker,
-    QuestionPrompt {
+    QuestionPrompt, ProviderPicker, SecretPrompt, CustomEndpointPrompt,
+    ModelIDPrompt {
         align: center middle;
         background: $background 80%;
     }
@@ -935,12 +1504,36 @@ class LitCodeTUI(App[None]):
         background: $panel;
         border: round $primary;
     }
+    #model-dialog Input {
+        margin: 0 0 1 0;
+        border: none;
+        background: $boost;
+        width: 100%;
+    }
+    #model-dialog #custom-error {
+        height: auto;
+        margin-bottom: 1;
+        color: $error;
+    }
     #history-tree {
         height: auto;
         max-height: 24;
-        background: $boost;
+        background: $background;
         margin: 1 0 0 0;
-        border: round $accent;
+        border: none;
+    }
+    #history-tree > .tree--cursor {
+        color: $text;
+        background: $primary 25%;
+        text-style: bold;
+    }
+    #history-tree:focus > .tree--cursor {
+        color: $background;
+        background: $primary;
+        text-style: bold;
+    }
+    #history-tree > .tree--highlight-line {
+        background: $primary 12%;
     }
     #history-filter {
         margin-top: 1;
@@ -1023,6 +1616,7 @@ class LitCodeTUI(App[None]):
             system_prompt=self.system_prompt,
             event_sink=self._runtime_event,
         )
+        self.scheduler = Scheduler(self.store, self.runtime, settings.workspace)
         self.file_paths: tuple[str, ...] = ()
         self.directory_paths: tuple[str, ...] = ()
         self.completion_context: CompletionContext | None = None
@@ -1036,6 +1630,7 @@ class LitCodeTUI(App[None]):
             confirm_session_message=self.confirm_session_message,
             confirm_session_read=self.confirm_session_read,
             runtime=self.runtime,
+            scheduler=self.scheduler,
             confirm_session_control=self.confirm_session_control,
             ask_user=self.ask_user,
         )
@@ -1055,17 +1650,21 @@ class LitCodeTUI(App[None]):
         self._pane_layout_generation = 0
         self._pane_leader_until = 0.0
         self._exit_armed_until = 0.0
+        self._connect_state: dict[str, object] | None = None
         self.running_sessions: set[str] = set()
 
     def compose(self) -> ComposeResult:
         yield Vertical(self._pane_widget(self._active_runtime()), id="pane-area")
         with Vertical(id="composer"):
             yield OptionList(id="completion", compact=True, markup=False)
-            yield Label(
-                "Enter 发送（运行中自动排队） · Shift+Enter 换行 · ↑↓ 历史 · / @ # 补全",
-                id="prompt-label",
-            )
             yield PromptArea(id="prompt", language=None)
+            with Horizontal(id="prompt-meta"):
+                yield Label(id="prompt-meta-left")
+                yield Label(id="prompt-meta-right")
+            yield Label(
+                "Enter 发送 · Shift+Enter 换行 · ↑↓ 历史 · / @ # 补全命令/文件/会话 · Ctrl+W 分屏 · F2 切换模型",
+                id="prompt-hint",
+            )
         yield Footer()
 
     def _active_runtime(self) -> PaneRuntime:
@@ -1104,6 +1703,7 @@ class LitCodeTUI(App[None]):
             runtime.prompt_draft = ""
         self.agent = pane.agent
         self.model = pane.model
+        self._update_prompt_meta()
         return runtime
 
     @property
@@ -1253,10 +1853,13 @@ class LitCodeTUI(App[None]):
 
     def on_mount(self) -> None:
         self.ui_thread_id = threading.get_ident()
-        self._append_notice(
-            "会话已启动。输入 /help 查看命令，"
-            "工具调用会显示在时间线中。"
-        )
+        self._mount_welcome(self._active_runtime())
+        self._update_prompt_meta()
+        if not self.settings.configured:
+            self._append_notice(
+                "未配置 API Key：输入 /connect 连接供应商即可开始使用。",
+                error=True,
+            )
         self._append_notice(
             "分屏：Ctrl+W 后按方向键，或输入 /split right。"
             "多数 macOS 终端不会把 Cmd 组合键传给应用。"
@@ -1268,6 +1871,8 @@ class LitCodeTUI(App[None]):
         for issue in self.skills.issues:
             self._append_notice(f"Skill 加载失败：{issue}", error=True)
         self.query_one(PromptArea).focus()
+        self.scheduler.start()
+        self.set_interval(0.12, self._refresh_subagent_cards)
         self.run_worker(
             self._build_file_index,
             name="file-index",
@@ -1286,6 +1891,7 @@ class LitCodeTUI(App[None]):
         for pending in self.pending_questions.values():
             pending.answers = None
             pending.finished.set()
+        self.scheduler.close()
         self.runtime.close()
         self.sessions.close_all()
         self.store.close()
@@ -1295,6 +1901,15 @@ class LitCodeTUI(App[None]):
         value = event.value
         if value.startswith("/"):
             self._handle_command(value)
+            return
+        self._submit_text(value)
+
+    def _submit_text(self, value: str) -> None:
+        if not self.settings.configured:
+            self._append_notice(
+                "尚未配置 API Key：输入 /connect 连接供应商后开始使用。",
+                error=True,
+            )
             return
         if (
             self.settings.session_read_policy == "deny"
@@ -1387,6 +2002,7 @@ class LitCodeTUI(App[None]):
     def receive_agent_event(self, event: AgentEvent) -> None:
         if self.shutting_down:
             return
+        self._record_agent_activity(event)
         runtime = next(
             (
                 item
@@ -1402,6 +2018,25 @@ class LitCodeTUI(App[None]):
             self._render_agent_event(event, runtime)
         else:
             self.call_from_thread(self._render_agent_event, event, runtime)
+
+    def _record_agent_activity(self, event: AgentEvent) -> None:
+        """Persist coarse activity so unmounted child Sessions remain observable."""
+
+        if event.session_id is None:
+            return
+        activity = None
+        if event.kind == "model_start":
+            activity = f"第 {event.iteration} 轮 · 请求模型"
+        elif event.kind == "tool_start" and event.tool_call is not None:
+            activity = f"正在调用工具 · {event.tool_call.name}"
+        elif event.kind == "tool_result" and event.tool_call is not None:
+            activity = f"已完成工具 · {event.tool_call.name}"
+        if activity is None:
+            return
+        try:
+            self.store.set_session_state(event.session_id, activity=activity)
+        except KeyError:
+            return
 
     def _runtime_event(
         self, kind: str, session_id: str, turn: SessionTurn | None
@@ -1516,6 +2151,7 @@ class LitCodeTUI(App[None]):
             "exit": self.action_exit,
             "help": self._show_help,
             "model": self.action_choose_model,
+            "connect": self.action_connect,
             "new": self.action_new_session,
             "clear": self.action_clear_session,
             "history": lambda: self.action_history(arguments),
@@ -1530,6 +2166,7 @@ class LitCodeTUI(App[None]):
             "subagent": lambda: self.action_subagent(arguments),
             "inbox": self.action_inbox,
             "queue": lambda: self.action_queue(arguments),
+            "schedule": lambda: self.action_schedule(arguments),
         }
         handlers[spec.handler]()
 
@@ -1562,10 +2199,15 @@ class LitCodeTUI(App[None]):
         self.action_split(direction.lower(), session_id=session_id)
 
     def _show_help(self) -> None:
-        self._append_notice(
-            " · ".join(f"{item.name} {item.description}" for item in COMMANDS)
-            + " · Enter 发送 · Shift+Enter 换行"
-        )
+        lines = []
+        for item in COMMANDS:
+            alias = (
+                f"（别名：{'、'.join(item.aliases)}）"
+                if item.aliases
+                else ""
+            )
+            lines.append(f"{item.name:<10} {item.description} {alias}")
+        self._append_notice_card("命令列表（输入 / 搜索）", "\n".join(lines))
 
     def action_exit(self) -> None:
         """/exit 与 /quit：立即带上运行的 pane 状态退出（无需二次确认）。"""
@@ -1779,6 +2421,45 @@ class LitCodeTUI(App[None]):
             return
         self._append_notice("队列已更新。", runtime=runtime)
 
+    def action_schedule(self, arguments: str = "") -> None:
+        """Create through the Agent; keep listing and cancellation deterministic."""
+
+        text = arguments.strip()
+        tasks = self.store.scheduled_tasks(
+            self.settings.workspace, include_inactive=True
+        )
+        if not text or text == "list":
+            if not tasks:
+                self._append_notice("当前工作区没有定时任务。")
+                return
+            self._list_or_notice("定时 Agent 任务", "\n".join(map(describe_task, tasks)))
+            return
+        action, _, reference = text.partition(" ")
+        if action == "cancel":
+            reference = reference.strip()
+            matches = [task for task in tasks if task.id.startswith(reference)]
+            if not reference or len(matches) != 1:
+                self._append_notice("用法：/schedule cancel <唯一任务 ID 前缀>", error=True)
+                return
+            try:
+                self.store.cancel_scheduled_task(self.settings.workspace, matches[0].id)
+            except ValueError as error:
+                self._append_notice(str(error), error=True)
+                return
+            self.scheduler.notify()
+            self._append_notice(f"已取消定时任务 {matches[0].id[:8]}。")
+            return
+        zone = local_timezone_name()
+        local_now = datetime.now().astimezone().isoformat(timespec="seconds")
+        self._submit_text(
+            "用户明确要求创建定时 Agent 任务。"
+            "请解析下面的自然语言，然后调用 create_scheduled_task；"
+            "不要只返回文字计划。\n"
+            f"当前本地时间：{local_now}\n"
+            f"默认 IANA 时区：{zone}\n"
+            f"用户描述：{text}"
+        )
+
     def action_clear_session(self) -> None:
         if self.busy:
             self._append_notice(
@@ -1828,15 +2509,63 @@ class LitCodeTUI(App[None]):
     def action_subagent(self, prompt: str) -> None:
         prompt = prompt.strip()
         if not prompt:
-            self._append_notice("用法：/subagent <目标 prompt>", error=True)
+            self._append_notice(
+                "用法：/subagent [--pane left|right|up|down] <目标 prompt>",
+                error=True,
+            )
             return
+        direction: str | None = None
+        if prompt.startswith("--pane"):
+            _, separator, remainder = prompt.partition(" ")
+            if not separator:
+                self._append_notice("--pane 后需要方向和任务。", error=True)
+                return
+            direction, separator, prompt = remainder.strip().partition(" ")
+            if direction not in {"left", "right", "up", "down"} or not separator or not prompt.strip():
+                self._append_notice(
+                    "用法：/subagent --pane left|right|up|down <目标 prompt>",
+                    error=True,
+                )
+                return
+            prompt = prompt.strip()
+            if len(self.panes) >= 4:
+                self._append_notice("第一版最多同时打开 4 个 pane。", error=True)
+                return
+            if any(runtime.busy for runtime in self.panes.values()):
+                self._append_notice(
+                    "等待已挂载 pane 当前任务结束后再创建可见子会话。",
+                    error=True,
+                )
+                return
         self._ensure_active_session()
+        parent_id = self.session.session_id
         try:
             info = self.runtime.create_subagent_session(
-                self.session.session_id, prompt, start=True
+                parent_id, prompt, start=direction is None
             )
+            if direction is not None:
+                self.action_split(direction, session_id=info.id)
         except Exception as error:
             self._append_notice(str(error), error=True)
+            return
+        if direction is not None:
+            pane_slot = self._active_runtime().pane_slot
+
+            def start_visible_subagent() -> None:
+                try:
+                    self._append_notice(
+                        f"已创建子会话 {info.alias}，挂载到 {pane_slot} 号 pane 并开始运行。"
+                    )
+                    self.runtime.submit(
+                        info.id,
+                        prompt,
+                        source_session_id=parent_id,
+                        kind="user_subagent",
+                    )
+                except Exception as error:
+                    self._append_notice(str(error), error=True)
+
+            self.call_after_refresh(start_visible_subagent)
             return
         self._append_notice(
             f"已创建子会话 {info.alias}；它会在自己的队列中运行，可从 /sessions 挂载。"
@@ -1864,8 +2593,17 @@ class LitCodeTUI(App[None]):
                 query=arguments.strip(),
                 current_session_id=current_id,
             ),
-            self._session_selected,
+            self._history_selected,
         )
+
+    def _history_selected(self, selection: HistorySelection | None) -> None:
+        if selection is None:
+            self.query_one(PromptArea).focus()
+            return
+        if selection.split:
+            self.action_split("right", session_id=selection.session_id)
+            return
+        self._session_selected(selection.session_id)
 
     def _reset_pane_view(self) -> None:
         runtime = self._active_runtime()
@@ -1875,6 +2613,7 @@ class LitCodeTUI(App[None]):
         runtime.tool_cards.clear()
         runtime.streaming_markdown = None
         runtime.rendered_output = None
+        self._mount_welcome(runtime)
 
     def _session_selected(self, identifier: str | None) -> None:
         active = self._active_runtime()
@@ -2020,6 +2759,7 @@ class LitCodeTUI(App[None]):
         timeline.remove_children()
         runtime.tool_bodies.clear()
         runtime.tool_cards.clear()
+        runtime.subagent_cards.clear()
         runtime.streaming_markdown = None
         runtime.streaming_buffer = ""
         runtime.rendered_output = None
@@ -2075,7 +2815,174 @@ class LitCodeTUI(App[None]):
             self._append_notice(
                 f"已切换到模型 {selected}；对话上下文保持不变。"
             )
+        self._update_prompt_meta()
         self._update_status("就绪")
+        self.query_one(PromptArea).focus()
+
+    def action_connect(self) -> None:
+        """/connect：选择供应商、保存密钥、查询模型并切换端点。
+
+        借鉴 OpenCode 的三步流：供应商选择器 -> API Key 输入 -> 模型选择。
+        密钥只写入用户级 0600 凭据文件；端点选择记入同一文件，项目配置
+        仍只作为启动优先来源，本命令不改写项目配置。
+        """
+
+        if any(runtime.busy for runtime in self.panes.values()):
+            self._append_notice(
+                "等待当前任务结束后再切换供应商。", error=True
+            )
+            return
+        self.push_screen(
+            ProviderPicker(
+                current_provider=_current_provider(self.settings),
+                environ=os.environ,
+            ),
+            self._provider_selected,
+        )
+
+    def _provider_selected(self, choice: str | None) -> None:
+        if choice is None:
+            self.query_one(PromptArea).focus()
+            return
+        if choice == "custom":
+            self.push_screen(
+                CustomEndpointPrompt(), self._custom_endpoint_entered
+            )
+            return
+        if not choice.startswith("provider:"):
+            return
+        provider = provider_by_id(choice.removeprefix("provider:"))
+        if provider is None:
+            return
+        self.push_screen(
+            SecretPrompt(provider),
+            lambda key: self._provider_key_entered(provider, key),
+        )
+
+    def _provider_key_entered(
+        self, provider: Provider, key: str | None
+    ) -> None:
+        if key is None:
+            self.query_one(PromptArea).focus()
+            return
+        try:
+            save_api_key(provider.api_key_env, key)
+        except CredentialError as error:
+            self._append_notice(str(error), error=True)
+            return
+        self._begin_connect(
+            api_key=key,
+            base_url=provider.base_url,
+            api_key_env=provider.api_key_env,
+            provider_name=provider.name,
+            default_models=provider.default_models,
+        )
+
+    def _custom_endpoint_entered(self, endpoint: CustomEndpoint | None) -> None:
+        if endpoint is None:
+            self.query_one(PromptArea).focus()
+            return
+        try:
+            save_api_key(endpoint.api_key_env, endpoint.api_key)
+        except CredentialError as error:
+            self._append_notice(str(error), error=True)
+            return
+        self._begin_connect(
+            api_key=endpoint.api_key,
+            base_url=endpoint.base_url,
+            api_key_env=endpoint.api_key_env,
+            provider_name=endpoint.base_url,
+            default_models=(),
+        )
+
+    def _begin_connect(
+        self,
+        *,
+        api_key: str,
+        base_url: str | None,
+        api_key_env: str,
+        provider_name: str,
+        default_models: tuple[str, ...],
+    ) -> None:
+        self._connect_state = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "api_key_env": api_key_env,
+            "provider_name": provider_name,
+            "default_models": default_models,
+        }
+        self._set_busy(True, "正在连接并查询模型…")
+        self.run_worker(
+            lambda: self._connect_worker(api_key, base_url),
+            name="connect-query",
+            group="model-query",
+            thread=True,
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    def _connect_worker(self, api_key: str, base_url: str | None) -> None:
+        try:
+            models = fetch_model_list(api_key, base_url)
+        except ModelError as error:
+            self.call_from_thread(
+                self._connect_models_ready, None, str(error)
+            )
+            return
+        self.call_from_thread(self._connect_models_ready, models, None)
+
+    def _connect_models_ready(
+        self, models: tuple[str, ...] | None, error: str | None
+    ) -> None:
+        state = self._connect_state
+        self._set_busy(False, "就绪")
+        if error is not None:
+            self._append_notice(f"模型查询失败：{error}", error=True)
+        elif not models:
+            self._append_notice("端点没有返回模型列表。", error=True)
+        candidates = models or state["default_models"]
+        if not candidates:
+            self.push_screen(ModelIDPrompt(), self._connect_final_id)
+            return
+        self.push_screen(
+            ModelPicker(candidates, "", show_custom=True),
+            self._connect_model_selected,
+        )
+
+    def _connect_model_selected(self, selected: str | None) -> None:
+        if selected == MODEL_ID_CUSTOM:
+            self.push_screen(ModelIDPrompt(), self._connect_final_id)
+            return
+        self._connect_final_id(selected)
+
+    def _connect_final_id(self, model_id: str | None) -> None:
+        state = self._connect_state
+        if model_id is None or not state:
+            self.query_one(PromptArea).focus()
+            self._update_status("就绪")
+            return
+        new_model = OpenAIChatModel.for_endpoint(
+            state["api_key"], state["base_url"], model_id
+        )
+        self.sessions.switch_provider(new_model)
+        active = self.sessions.active
+        self.model = active.model
+        self.agent = active.agent
+        try:
+            save_last_client(
+                LastClient(
+                    api_key_env=state["api_key_env"],
+                    base_url=state["base_url"],
+                    model=model_id,
+                )
+            )
+        except CredentialError as error:
+            self._append_notice(str(error), error=True)
+        self._append_notice(
+            f"已连接 {state['provider_name']}；当前模型 {model_id}；"
+            "结束后在无项目 models 配置的工作区会自动继续使用本端点。"
+        )
+        self._update_pane_header(self._active_runtime(), "就绪")
         self.query_one(PromptArea).focus()
 
     def confirm_command(self, command: str) -> bool:
@@ -2148,6 +3055,7 @@ class LitCodeTUI(App[None]):
         self._mount_timeline(
             Static(Text(content), classes="message-user"), self._active_runtime()
         )
+        self._remove_welcome(self._active_runtime())
 
     def _append_assistant(
         self, content: str, runtime: PaneRuntime | None = None
@@ -2192,6 +3100,9 @@ class LitCodeTUI(App[None]):
         self._append_notice(f"{title}：\n{content}", runtime=runtime)
 
     def _append_tool(self, tool_call: ToolCall, runtime: PaneRuntime) -> None:
+        if tool_call.name == "spawn_subagent":
+            self._append_subagent_tool(tool_call, runtime)
+            return
         body = PagedOutput("运行中…")
         card = Collapsible(
             body,
@@ -2200,6 +3111,25 @@ class LitCodeTUI(App[None]):
         )
         runtime.tool_bodies[tool_call.id] = body
         runtime.tool_cards[tool_call.id] = card
+        self._mount_timeline(card, runtime)
+
+    def _append_subagent_tool(
+        self, tool_call: ToolCall, runtime: PaneRuntime
+    ) -> None:
+        model = runtime.agent.model_name
+        body = PagedOutput(subagent_running_summary(tool_call, "正在创建子会话…"))
+        card = Collapsible(
+            body,
+            title=subagent_title(tool_call, SUBAGENT_SPINNER_FRAMES[0], model, 0),
+            collapsed=False,
+        )
+        runtime.tool_bodies[tool_call.id] = body
+        runtime.tool_cards[tool_call.id] = card
+        runtime.subagent_cards[tool_call.id] = _SubagentCardState(
+            tool_call,
+            model,
+            time.monotonic(),
+        )
         self._mount_timeline(card, runtime)
 
     def _finish_tool(
@@ -2215,6 +3145,14 @@ class LitCodeTUI(App[None]):
         if body is None or card is None:
             self._append_notice(content, error=is_error, runtime=runtime)
             return
+        if tool_call.name == "spawn_subagent":
+            self._finish_subagent_tool(
+                tool_call,
+                content,
+                is_error,
+                runtime,
+            )
+            return
         card.title = tool_title(tool_call, "✗" if is_error else "✓")
         card.add_class("tool-failed" if is_error else "tool-succeeded")
         if is_error:
@@ -2226,6 +3164,183 @@ class LitCodeTUI(App[None]):
         body.set_content(summary)
         for item in self.panes.values():
             self._update_pane_header(item, "运行中" if item.busy else "就绪")
+
+    def _finish_subagent_tool(
+        self,
+        tool_call: ToolCall,
+        content: str,
+        is_error: bool,
+        runtime: PaneRuntime,
+    ) -> None:
+        state = runtime.subagent_cards.get(tool_call.id)
+        body = runtime.tool_bodies[tool_call.id]
+        if state is None:
+            body.set_content(tool_result_summary(content, is_error))
+            return
+        alias, invocation_id, background, summary = subagent_result_summary(
+            tool_call,
+            content,
+            is_error=is_error,
+        )
+        state.alias = alias or state.alias
+        state.invocation_id = invocation_id or state.invocation_id
+        state.tool_finished = True
+        if state.invocation_id is not None:
+            self._link_subagent_invocation(runtime, state)
+        if background and not is_error:
+            body.set_content(
+                subagent_running_summary(tool_call, self._subagent_activity(state))
+            )
+            self._refresh_subagent_card(runtime, tool_call.id, state)
+            return
+        self._finalize_subagent_card(
+            runtime,
+            tool_call.id,
+            state,
+            summary,
+            failed=is_error,
+        )
+
+    def _refresh_subagent_cards(self) -> None:
+        if self.shutting_down:
+            return
+        for runtime in tuple(self.panes.values()):
+            for tool_id, state in tuple(runtime.subagent_cards.items()):
+                self._refresh_subagent_card(runtime, tool_id, state)
+
+    def _refresh_subagent_card(
+        self,
+        runtime: PaneRuntime,
+        tool_id: str,
+        state: _SubagentCardState,
+    ) -> None:
+        card = runtime.tool_cards.get(tool_id)
+        body = runtime.tool_bodies.get(tool_id)
+        if card is None or body is None:
+            runtime.subagent_cards.pop(tool_id, None)
+            return
+        self._link_subagent_invocation(runtime, state)
+        elapsed = time.monotonic() - state.started_at
+        invocation = None
+        if state.invocation_id is not None:
+            try:
+                invocation = self.runtime.invocation(state.invocation_id)
+            except SessionRuntimeError:
+                invocation = None
+        if invocation is not None and invocation.status in {
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            failed = invocation.status != "completed"
+            output = invocation.output or (
+                "子会话已取消。"
+                if invocation.status == "cancelled"
+                else "（无输出）"
+            )
+            summary = subagent_completion_summary(
+                state.tool_call,
+                output,
+                failed=failed,
+            )
+            if state.tool_finished:
+                self._finalize_subagent_card(
+                    runtime,
+                    tool_id,
+                    state,
+                    summary,
+                    failed=failed,
+                )
+                return
+        frame_index = int(elapsed / 0.12) % len(SUBAGENT_SPINNER_FRAMES)
+        frame = SUBAGENT_SPINNER_FRAMES[frame_index]
+        card.title = subagent_title(
+            state.tool_call,
+            frame,
+            state.model,
+            elapsed,
+            alias=state.alias,
+        )
+        body.set_content(
+            subagent_running_summary(state.tool_call, self._subagent_activity(state))
+        )
+
+    def _link_subagent_invocation(
+        self, runtime: PaneRuntime, state: _SubagentCardState
+    ) -> None:
+        invocation = None
+        if state.invocation_id is not None:
+            try:
+                invocation = self.runtime.invocation(state.invocation_id)
+            except SessionRuntimeError:
+                return
+        elif runtime.session is not None:
+            used = {
+                item.invocation_id
+                for item in runtime.subagent_cards.values()
+                if item is not state and item.invocation_id is not None
+            }
+            matches = [
+                item
+                for item in self.runtime.invocations()
+                if item.parent_session_id == runtime.session.session_id
+                and item.prompt == self._subagent_prompt(state.tool_call)
+                and item.id not in used
+            ]
+            if matches:
+                invocation = max(matches, key=lambda item: item.created_at)
+                state.invocation_id = invocation.id
+        if invocation is None:
+            return
+        state.child_session_id = invocation.child_session_id
+        try:
+            info = self.store.session_info(invocation.child_session_id)
+            state.alias = info.alias
+            state.model = info.model
+        except KeyError:
+            pass
+
+    def _subagent_activity(self, state: _SubagentCardState) -> str:
+        if state.child_session_id is None:
+            return "正在创建子会话…"
+        try:
+            return self.store.session_info(state.child_session_id).activity
+        except KeyError:
+            return "正在运行"
+
+    @staticmethod
+    def _subagent_prompt(tool_call: ToolCall) -> str:
+        try:
+            arguments = json.loads(tool_call.arguments)
+        except (ValueError, TypeError):
+            return ""
+        prompt = arguments.get("prompt") if isinstance(arguments, dict) else None
+        return prompt.strip() if isinstance(prompt, str) else ""
+
+    def _finalize_subagent_card(
+        self,
+        runtime: PaneRuntime,
+        tool_id: str,
+        state: _SubagentCardState,
+        summary: str,
+        *,
+        failed: bool,
+    ) -> None:
+        card = runtime.tool_cards.get(tool_id)
+        body = runtime.tool_bodies.get(tool_id)
+        if card is None or body is None:
+            runtime.subagent_cards.pop(tool_id, None)
+            return
+        card.title = subagent_title(
+            state.tool_call,
+            "✗" if failed else "✓",
+            state.model,
+            time.monotonic() - state.started_at,
+            alias=state.alias,
+        )
+        card.add_class("tool-failed" if failed else "tool-succeeded")
+        body.set_content(summary)
+        runtime.subagent_cards.pop(tool_id, None)
 
     def _finish_with_error(self, message: str, session_id: str | None = None) -> None:
         if session_id is None:
@@ -2265,6 +3380,7 @@ class LitCodeTUI(App[None]):
         if runtime.pane_id != self.active_pane_id:
             return
         self._update_status(status)
+        self._update_prompt_meta()
         if not busy:
             self.query_one(PromptArea).focus()
             self.refresh_completions()
@@ -2294,6 +3410,46 @@ class LitCodeTUI(App[None]):
     def _update_status(self, activity: str) -> None:
         self._update_pane_header(self._active_runtime(), activity)
 
+    def _prompt_meta_text(self, runtime: PaneRuntime) -> Text:
+        """OpenCode prompt bar 的 meta 行：状态点 + 模型 + 配置档。"""
+
+        text = Text()
+        if not self.settings.configured:
+            text.append("✕ 未连接 · /connect 开始", style="bold #fbbf24")
+        elif runtime.busy:
+            text.append("● 运行中", style="bold #38bdf8")
+        else:
+            text.append("● 就绪", style="bold #4ade80")
+        text.append(f"  {self.model.model}", style="bold")
+        text.append(f" · {self.settings.model_profile}", style="dim #94a3b8")
+        return text
+
+    def _workspace_label(self) -> str:
+        """工作区路径的紧凑展示：home 下用 ~/，过长保留尾部。"""
+
+        workspace = self.settings.workspace
+        try:
+            label = "~/" + str(workspace.relative_to(Path.home()))
+        except ValueError:
+            label = str(workspace)
+        if len(label) > 40:
+            label = "…" + label[-(39):]
+        return label
+
+    def _update_prompt_meta(self) -> None:
+        try:
+            left = self.query_one("#prompt-meta-left", Label)
+            right = self.query_one("#prompt-meta-right", Label)
+        except Exception:
+            return
+        left.update(self._prompt_meta_text(self._active_runtime()))
+        right.update(Text(f"工作区 {self._workspace_label()}", style="dim #94a3b8"))
+
+    def _remove_welcome(self, runtime: PaneRuntime) -> None:
+        timeline = self._timeline(runtime)
+        for banner in list(timeline.query(WelcomeBanner)):
+            banner.remove()
+
     def _timeline(self, runtime: PaneRuntime) -> VerticalScroll:
         timeline_id = (
             "timeline"
@@ -2311,6 +3467,17 @@ class LitCodeTUI(App[None]):
         timeline = self._timeline(runtime)
         timeline.mount(widget)
         timeline.scroll_end(animate=False)
+
+    def _mount_welcome(self, runtime: PaneRuntime) -> None:
+        self._mount_timeline(
+            WelcomeBanner(
+                workspace=str(self.settings.workspace),
+                model_profile=self.settings.model_profile,
+                model_name=self.model.model if self.settings.configured else "",
+                configured=self.settings.configured,
+            ),
+            runtime,
+        )
 
     def _start_streaming_message(self, runtime: PaneRuntime) -> None:
         runtime.streaming_buffer = ""
@@ -2376,14 +3543,20 @@ class LitCodeTUI(App[None]):
             self.hide_completions()
             return
         if context.kind == "command":
-            descriptions = {
-                name: item.description
-                for item in COMMANDS
-                for name in (item.name, *item.aliases)
-            }
-            candidates = list(descriptions)
-            matches = _fuzzy_matches(context.query, candidates, 8)
-            labels = [f"{name:<10} {descriptions[name]}" for name in matches]
+            specs = _command_specs(context.query)
+            matches = [spec.name for spec in specs]
+            labels = [
+                Text.assemble(
+                    f"{spec.name:<10}",
+                    spec.description,
+                    *(
+                        (f"  别名：{'、'.join(spec.aliases)}", "dim")
+                        if spec.aliases
+                        else ("", "")
+                    ),
+                )
+                for spec in specs
+            ]
         elif context.kind == "session":
             sessions = _rank_session_matches(
                 self.sessions.catalog(), context.query, 12
@@ -2410,7 +3583,7 @@ class LitCodeTUI(App[None]):
         self.completion_context = context
         self.completion_values = matches
         options = [
-            Option(Text(label), id=str(index))
+            Option(label, id=str(index))
             for index, label in enumerate(labels)
         ]
         popup = self.query_one("#completion", OptionList)
@@ -2503,6 +3676,27 @@ def _completion_context(prompt: PromptArea) -> CompletionContext | None:
     return None
 
 
+def _command_specs(query: str) -> list[CommandSpec]:
+    """每条命令只有一行候选；模糊匹配命中主名或任意别名。
+
+    借鉴 OpenCode 的命令面板：别名不单独占行，列表保持全部可搜索。
+    """
+
+    if not query:
+        return list(COMMANDS)
+    matcher = Matcher(query)
+    scored: list[tuple[int, CommandSpec]] = []
+    for spec in COMMANDS:
+        score = max(
+            (matcher.match(name) for name in (spec.name, *spec.aliases)),
+            default=0,
+        )
+        if score > 0:
+            scored.append((score, spec))
+    scored.sort(key=lambda item: (-item[0], item[1].name))
+    return [spec for _, spec in scored]
+
+
 def _fuzzy_matches(
     query: str,
     candidates: tuple[str, ...] | list[str],
@@ -2531,6 +3725,35 @@ def run_tui(settings: Settings, model: OpenAIChatModel) -> int:
 
 def _model_label(model: str, current: str) -> str:
     return f"{model}  （当前）" if model == current else model
+
+
+def _current_provider(settings: Settings) -> Provider | None:
+    """当前 Settings 实际连的端点对应哪个内置供应商。"""
+
+    for provider in ordered_providers():
+        if (
+            provider.base_url == (settings.base_url or None)
+            and provider.api_key_env == settings.api_key_env
+        ):
+            return provider
+    return None
+
+
+def _provider_label(
+    provider: Provider,
+    current: Provider | None,
+    environ: Mapping[str, str],
+) -> str:
+    label = Text()
+    label.append(provider.name)
+    if current is not None and current.id == provider.id:
+        label.append("  （当前）", style="bold cyan")
+    if credential_available(provider.api_key_env, environ):
+        label.append("  ✓ 已存密钥", style="green")
+    hint = provider.key_url or "本地/代理 · 无需真实密钥"
+    truncated, _ = _truncate_cells(hint, PICKER_LABEL_CELLS - 24)
+    label.append("  " + truncated, style="dim")
+    return label.plain
 
 
 def _session_label(info: SessionInfo) -> str:
@@ -2591,31 +3814,37 @@ def _history_label(
     running: set[str],
     current_session_id: str | None = None,
     depth: int = 0,
+    width: int = PICKER_LABEL_CELLS,
 ) -> Text:
-    """一行有界标签：主文本截断、时间戳按节点深度贴齐同一右缘。"""
+    """Responsive history row with a flexible title and fixed right metadata."""
 
-    markers = []
+    statuses = []
+    active = info.id in running or info.active_turn_id is not None
     if info.id == current_session_id:
-        markers.append("当前")
-    if info.id in mounted:
-        markers.append(f"[{mounted[info.id]}]")
-    elif info.id in running or info.active_turn_id is not None:
-        markers.append("● 运行中")
+        statuses.append("当前")
+    elif info.id in mounted:
+        statuses.append(f"pane {mounted[info.id]}")
+    if active:
+        statuses.append(f"● {info.activity or '运行中'}")
     if info.paused:
-        markers.append("已暂停")
-    title = info.title if len(info.title) <= 24 else f"{info.title[:23]}…"
-    main = f"{' '.join(markers)} " if markers else ""
-    main += f"{info.alias} · {title}"
+        statuses.append("已暂停")
+    elif info.status not in {"idle", "running", "waiting"}:
+        statuses.append(info.status)
     if info.queue_size:
-        main += f" · 队列 {info.queue_size}"
+        statuses.append(f"队列 {info.queue_size}")
+    if info.parent_id is not None:
+        statuses.append(info.model)
+    title = info.title if len(info.title) <= 24 else f"{info.title[:23]}…"
+    main = f"{info.alias} · {title}"
     age = _relative_time(info.updated_at)
-    target = PICKER_LABEL_CELLS - depth * PICKER_GUIDE_DEPTH - _cell_width(age)
+    right = " · ".join((*statuses, age))
+    available = max(24, width - depth * PICKER_GUIDE_DEPTH)
+    target = max(8, available - _cell_width(right) - 1)
     main, _ = _truncate_cells(main, target)
     padding = target - _cell_width(main)
     label = Text(main)
-    if padding > 0:
-        label.append(" " * padding)
-    label.append(age, style="dim")
+    label.append(" " * (padding + 1))
+    label.append(right, style="dim")
     return label
 
 

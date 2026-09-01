@@ -12,3 +12,4 @@ build/
 .litcode/sessions.db
 .litcode/sessions.db-shm
 .litcode/sessions.db-wal
+.litcode/runtime.lock

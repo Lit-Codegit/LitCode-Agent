@@ -206,6 +206,13 @@ class SessionRuntime:
             kind=kind,
         )
 
+    def notify_session(self, session_id: str) -> None:
+        """Wake an actor after another durable module appended to its mailbox."""
+
+        if self._stopping:
+            raise SessionRuntimeError("runtime is stopping")
+        self._wake(session_id)
+
     def create_subagent_session(
         self,
         parent_session_id: str,

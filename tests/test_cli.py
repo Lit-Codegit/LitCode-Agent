@@ -6,6 +6,7 @@ import stat
 import litcode_agent.cli as cli
 from litcode_agent.cli import main
 from litcode_agent.model import AssistantTurn
+from litcode_agent.session_store import SessionStore
 from litcode_agent.ui import TerminalUI
 from rich.console import Console
 
@@ -208,3 +209,49 @@ def test_path_argument_opens_that_directory_tui(monkeypatch, tmp_path: Path) -> 
     assert main([str(tmp_path)]) == 0
 
     assert opened == [tmp_path.resolve()]
+
+
+def test_chat_opens_tui_without_credentials_for_new_users(
+    monkeypatch, tmp_path: Path
+) -> None:
+    opened = []
+    monkeypatch.setenv("HOME", str(tmp_path / "fresh-home"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        cli,
+        "run_tui",
+        lambda settings, model: opened.append(
+            (settings.configured, settings.api_key)
+        )
+        or 0,
+    )
+
+    assert main(["chat", "--workspace", str(tmp_path)]) == 0
+
+    assert opened == [(False, "")]
+
+
+def test_schedule_list_reads_durable_tasks_without_api_credentials(
+    monkeypatch, tmp_path: Path
+) -> None:
+    database = tmp_path / ".litcode" / "sessions.db"
+    store = SessionStore(database)
+    creator = store.create(tmp_path, "model-a", [])
+    target = store.create_child(creator, title="scheduled")
+    task = store.create_scheduled_task(
+        creator,
+        target,
+        "检查测试",
+        {"kind": "once", "run_at": "2099-01-01T00:00:00+00:00"},
+        "UTC",
+        4070908800.0,
+    )
+    store.close()
+    monkeypatch.setenv("HOME", str(tmp_path / "fresh-home"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    ui, output = make_ui()
+
+    assert main(["schedule", "list", "--workspace", str(tmp_path)], ui) == 0
+
+    assert task.id[:8] in output.getvalue()
+    assert "检查测试" in output.getvalue()

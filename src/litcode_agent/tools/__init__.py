@@ -22,6 +22,7 @@ from litcode_agent.tools.skills import LoadSkillTool
 from litcode_agent.mutation_locks import WorkspaceMutationLocks
 
 if TYPE_CHECKING:
+    from litcode_agent.scheduler import Scheduler
     from litcode_agent.session_store import SessionStore
     from litcode_agent.session_runtime import SessionRuntime
 
@@ -34,6 +35,7 @@ def build_default_registry(
     confirm_session_message: Callable[[str], bool] | None = None,
     confirm_session_read: Callable[[str], bool] | None = None,
     runtime: SessionRuntime | None = None,
+    scheduler: Scheduler | None = None,
     confirm_session_control: Callable[[str], bool] | None = None,
     ask_user: AskUserCallback | None = None,
 ) -> ToolRegistry:
@@ -131,6 +133,19 @@ def build_default_registry(
                         confirm_session_read,
                     ),
                     ControlSessionTool(runtime, confirm_session_control),
+                ]
+            )
+            from litcode_agent.tools.scheduling import (
+                CancelScheduledTaskTool,
+                CreateScheduledTaskTool,
+                ListScheduledTasksTool,
+            )
+
+            tools.extend(
+                [
+                    CreateScheduledTaskTool(store, scheduler),
+                    ListScheduledTasksTool(store),
+                    CancelScheduledTaskTool(store, scheduler),
                 ]
             )
     return ToolRegistry(tools)

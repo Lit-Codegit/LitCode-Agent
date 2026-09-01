@@ -2,6 +2,10 @@ from litcode_agent.model import ToolCall
 from litcode_agent.tool_display import (
     change_diff,
     change_result_summary,
+    subagent_completion_summary,
+    subagent_result_summary,
+    subagent_running_summary,
+    subagent_title,
     tool_result_summary,
     tool_title,
 )
@@ -107,3 +111,30 @@ def test_ask_user_title_counts_questions() -> None:
     )
 
     assert tool_title(call, "✓") == "✓ ask_user · 1 个问题"
+
+
+def test_subagent_display_keeps_model_task_and_bounded_completion() -> None:
+    call = ToolCall(
+        "call",
+        "spawn_subagent",
+        '{"prompt":"检查 测试\\n失败原因","agent":"explore","background":true}',
+    )
+
+    assert subagent_title(call, "⠋", "model-a", 8.9) == (
+        "⠋ 子代理 [explore] · model-a · 8s"
+    )
+    assert subagent_running_summary(call, "正在调用工具 · search_files") == (
+        "任务：检查 测试 失败原因\n\n当前：正在调用工具 · search_files"
+    )
+
+    alias, invocation_id, background, summary = subagent_result_summary(
+        call,
+        '{"alias":"260901-1432-ABC","invocation_id":"inv-1",'
+        '"background":true}',
+        is_error=False,
+    )
+    assert (alias, invocation_id, background) == ("260901-1432-ABC", "inv-1", True)
+    assert "子会话已在后台启动" in summary
+
+    completed = subagent_completion_summary(call, "定位到 fixture 没有初始化。")
+    assert completed.endswith("完成摘要：定位到 fixture 没有初始化。")

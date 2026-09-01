@@ -57,6 +57,8 @@ uv run litcode models
 uv run litcode
 ```
 
+新用户没有环境变量和项目配置也能打开 TUI：启动后输入 `/connect`，选择内置供应商（DeepSeek、OpenAI、Kimi、GLM、OpenRouter、Groq、硅基流动、本地 Ollama/LM Studio 或自定义 OpenAI 兼容端点），粘贴 API Key 并选择模型即可开始；密钥保存到用户级 0600 凭据文件，不会写入项目配置。见下文「连接与切换供应商」。
+
 打开另一个工作区：
 
 ```bash
@@ -65,7 +67,7 @@ uv run litcode ../small-project
 
 `uv run litcode chat [路径]` 作为兼容写法继续可用。
 
-TUI 中央是可滚动的对话和工具时间线，底部是固定的多行输入区，状态栏显示工作区、配置档、模型与当前阶段。模型文本会实时流式显示；工具卡片可以展开或折叠，危险命令会通过弹窗确认。当 Agent 在交互会话中需要真实决策时，会弹出提问面板（`ask_user` 工具）：数字键 1-9 或 j/k 选择选项、可输入自定义回答、`Esc` 拒绝后会作为可恢复错误反馈给 Agent，由它按默认方案继续。
+TUI 中央是可滚动的对话和工具时间线，底部是固定的多行输入区。用户消息使用弱背景和角色色边框标出一轮对话的起点；Assistant 正文直接显示为无边框 Markdown，普通工具调用保持一行摘要，错误和大段结果才形成块。模型文本会实时流式显示；工具卡片可以展开或折叠，危险命令会通过弹窗确认。当 Agent 在交互会话中需要真实决策时，会弹出提问面板（`ask_user` 工具）：数字键 1-9 或 j/k 选择选项、可输入自定义回答、`Esc` 拒绝后会作为可恢复错误反馈给 Agent，由它按默认方案继续。
 
 输入 `/` 会打开命令模糊补全；输入 `@` 会搜索当前工作区和显式配置的命名只读根；输入 `#` 会搜索当前工作区的会话 alias。目录候选以 `/` 结尾，选中后继续导航；文件和会话分别插入 `@{relative/path}`、`#{YYMMDD-HHMM-XXX}`。提交时 LitCode 只附加受大小限制的不可变快照。敏感文件、二进制文件、未授权路径和跨工作区会话都会被拒绝。
 
@@ -96,10 +98,11 @@ TUI 不启用鼠标报告，拖选文本、复制和右键粘贴交由终端原�
 斜杠命令：
 
 - `/help`：查看命令；
+- `/connect`（别名 `/auth`）：连接或切换供应商；三步流——选择供应商、粘贴 API Key（不回显）、查询端点模型并选择；密钥写入用户级凭据文件，端点与模型的选择记入同一文件，下次启动时在没有项目 `models` 配置的工作区自动兜底生效；
 - `/model`：重新查询 API，通过弹窗切换当前模型；
 - `/new`：新建会话并把当前 pane 切换到新会话；原会话不结束，仍在后台运行或用 `/history` 返回；
 - `/clear`：清空上下文，开始新会话；
-- `/history`（别名 `/sessions`、`/tree`、`/resume`）：树状浏览本工作区会话并挂载到当前 pane；原会话转入后台继续运行，输入框筛选、Enter 选择；
+- `/history`（别名 `/sessions`、`/tree`、`/resume`）：树状浏览本工作区会话并挂载到当前 pane；`←/→` 折叠、展开或移动父子层级，`Enter` 挂载到当前 pane，`Shift+Enter` 在右侧新 pane 打开，`/` 聚焦筛选；
 - `/compact [可选要求]`：手动压缩上下文，保留完整原始历史；
 - `/rewind`：选择检查点，再选择是否同时恢复 Agent 编辑的文件；
 - `/redo`：撤销最近一次 rewind；
@@ -107,10 +110,43 @@ TUI 不启用鼠标报告，拖选文本、复制和右键粘贴交由终端原�
 - `/split left|right|up|down`：创建 pane，第一版最多 4 个；
 - `/focus left|right|up|down`：移动 pane 焦点；
 - `/close-pane`：关闭视图但保留持久化会话；
+- `/subagent <任务>`：创建后台 child Session；`/subagent --pane left|right|up|down <任务>` 会先创建并挂载 pane，再启动 child，从第一条流式事件开始展示；
+- `/schedule <自然语言>`：创建一次性、每日、每周或每月的定时 Agent 任务，例如 `/schedule 每周一上午九点运行测试并修复失败`；`/schedule list` 查看，`/schedule cancel <ID>` 取消；
 - `/inbox`：显示并确认当前会话收到的跨会话指示；
 - `/exit`：退出。
 
 `/model` 只影响当前进程，不会改写配置文件；普通消息会保留在当前会话的线性历史中。停止采用协作式取消：如果模型请求或命令正在阻塞，会在该调用返回后的第一个安全控制边界停止。
+
+## 定时 Agent 任务
+
+定时任务保存在 `.litcode/sessions.db`。到期时 LitCode 会向独立子 Session 投递一条持久化消息，再由原有 `SessionRuntime` 启动完整 Agent turn；因此它可以读文件、修改代码、运行命令和调用其他工具，不是单纯的 shell cron。Agent 只应在用户明确提出定时要求时调用 `create_scheduled_task`。
+
+TUI 开启时内置调度线程会立即触发。TUI 关闭后，需要让操作系统保活下列进程：
+
+```bash
+uv run litcode schedule serve --workspace /absolute/path/to/project
+```
+
+macOS 可以把它配为 `launchd` LaunchAgent，Linux 可以配为 systemd user service。守护进程闲置时不占用工作区 runtime lock；TUI 存在时由 TUI 触发，TUI 不存在时由守护进程临时获取 lock 并运行 Agent。也可用下列单次入口交给现有 cron/CI：
+
+```bash
+uv run litcode schedule tick --workspace /absolute/path/to/project
+uv run litcode schedule list --workspace /absolute/path/to/project
+```
+
+SQLite 对 `(task_id, scheduled_for)` 建立唯一约束，并在同一事务中记录触发、投递 Session 消息和推进下次时间。进程崩溃、休眠或重启后会补跑一次，不会把所有错过周期瞬间补齐。设备关机时任何本地软件都无法在原时刻运行；LitCode 保证的是恢复后可发现、可补跑、不重复投递，不宣称物理上不可能的关机准时执行。
+
+## 连接与切换供应商
+
+TUI 内输入 `/connect` 即可完成一次配置（流程形状借鉴 OpenCode 的 connect 命令）：
+
+1. 供应商选择器：内置目录按 Popular 权重排序，已存密钥的供应商有 ✓ 标记，当前端点的供应商标有「（当前）」；末尾是「自定义 OpenAI 兼容端点」（base URL、凭据名、密钥一次填完）；
+2. 粘贴 API Key：密码框不回显；密钥保存到 `~/.local/share/litcode/auth.json`（0600），同名环境变量仍优先；
+3. 模型选择：查询该端点的 `/v1/models`，失败时退回到内置默认模型或手动输入模型 ID；选中后立刻切换端点，所有 pane 与已挂载会话统一改用新模型，历史消息保留。
+
+端点与模型的最近选择（不含密钥）记入同一个用户级凭据文件。下次启动时，若工作区没有 `models` 配置档且未设置 `LITCODE_DEFAULT_MODEL`，LitCode 会复用该选择；项目 `.litcode/settings.json` 的 `models` 配置档和 `defaultModel` 始终优先。想改密钥可直接重复 `/connect`（覆盖保存），不影响已用端点名。
+
+`litcode run`、`doctor` 等非交互入口仍要求完整配置；没有凭据时它们会报错。请先打开 TUI 用 `/connect` 配置一次，或设置环境变量、运行 `uv run litcode auth login`。
 
 在当前目录执行任务：
 

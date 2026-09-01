@@ -70,19 +70,39 @@ class Model(Protocol):
 class OpenAIChatModel:
     """Normalize SDK objects so the agent loop has no OpenAI dependency."""
 
+    UNCONFIGURED_ERROR = (
+        "尚未配置 API Key；请使用 /connect 连接供应商后再试。"
+    )
+
     def __init__(self, settings: Settings, client: Any | None = None) -> None:
         self.model = settings.model
-        self.client = client or OpenAI(
-            api_key=settings.api_key,
-            base_url=settings.base_url,
-            max_retries=0,
+        self.configured = bool(settings.api_key) and bool(settings.model)
+        self.client = client or _build_client(
+            settings.api_key, settings.base_url
         )
+
+    @classmethod
+    def for_endpoint(
+        cls, api_key: str, base_url: str | None, model: str
+    ) -> OpenAIChatModel:
+        """Construct a model bound to an arbitrary endpoint and key.
+
+        用于 /connect 切换供应商：不依赖 Settings，也不触碰项目配置。
+        """
+
+        instance = object.__new__(OpenAIChatModel)
+        instance.model = model.strip()
+        instance.configured = True
+        instance.client = _build_client(api_key, base_url)
+        return instance
 
     def complete(
         self,
         messages: Sequence[Message],
         tools: Sequence[ToolSchema],
     ) -> AssistantTurn:
+        if not self.configured:
+            raise ModelError(self.UNCONFIGURED_ERROR)
         try:
             completion = self.client.chat.completions.create(
                 model=self.model,
@@ -121,6 +141,8 @@ class OpenAIChatModel:
     ) -> Iterator[ModelDelta]:
         """把 OpenAI-compatible chunks 归一化为可累计的 delta。"""
 
+        if not self.configured:
+            raise ModelError(self.UNCONFIGURED_ERROR)
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -174,16 +196,13 @@ class OpenAIChatModel:
     def list_models(self) -> tuple[str, ...]:
         """查询当前 API 端点公开的模型 ID。"""
 
+        if not self.configured:
+            raise ModelError(self.UNCONFIGURED_ERROR)
         try:
             response = self.client.models.list()
         except OpenAIError as error:
             raise ModelError(f"model query failed: {error}") from error
-        model_ids = {
-            model.id
-            for model in response.data
-            if isinstance(getattr(model, "id", None), str) and model.id
-        }
-        return tuple(sorted(model_ids))
+        return _model_ids(response)
 
     def select_model(self, model: str) -> None:
         """切换当前会话后续请求使用的具体模型 ID。"""
@@ -198,6 +217,36 @@ class OpenAIChatModel:
         clone = object.__new__(OpenAIChatModel)
         clone.client = self.client
         clone.model = self.model
+        clone.configured = self.configured
         if model is not None:
             clone.select_model(model)
         return clone
+
+
+def fetch_model_list(
+    api_key: str, base_url: str | None
+) -> tuple[str, ...]:
+    """查询任意端点的模型 ID，不改变当前会话使用的客户端。"""
+
+    try:
+        response = _build_client(api_key, base_url).models.list()
+    except OpenAIError as error:
+        raise ModelError(f"model query failed: {error}") from error
+    return _model_ids(response)
+
+
+def _build_client(api_key: str, base_url: str | None) -> Any:
+    return OpenAI(
+        api_key=api_key or "litcode-connect",
+        base_url=base_url,
+        max_retries=0,
+    )
+
+
+def _model_ids(response: Any) -> tuple[str, ...]:
+    model_ids = {
+        model.id
+        for model in response.data
+        if isinstance(getattr(model, "id", None), str) and model.id
+    }
+    return tuple(sorted(model_ids))

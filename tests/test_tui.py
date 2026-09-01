@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from rich.style import Style
 from textual.widgets import Collapsible, Input, Label, Markdown, Static, Tree
 from textual.events import MouseScrollDown
 
@@ -20,6 +21,7 @@ from litcode_agent.tui import (
     ModelPicker,
     PaneDivider,
     PromptArea,
+    WelcomeBanner,
     run_tui,
 )
 
@@ -57,10 +59,31 @@ def test_tui_mounts_status_timeline_and_fixed_prompt(tmp_path: Path) -> None:
             assert app.store.list_sessions(tmp_path) == ()
             assert len(app.query("#status")) == 0
             assert app.query_one(PromptArea).has_focus
-            assert any(
-                "会话已启动" in str(widget.render())
-                for widget in app.query(".notice").results(Static)
-            )
+            banner = app.query_one(WelcomeBanner)
+            rendered = str(banner.render())
+            assert "● 就绪" in rendered
+            assert str(tmp_path) in rendered
+            meta = str(app.query_one("#prompt-meta-left", Label).render())
+            assert "● 就绪" in meta
+            assert "model-a" in meta
+            assert "environment" in meta
+            meta_right = str(app.query_one("#prompt-meta-right", Label).render())
+            assert "工作区" in meta_right
+            assert tmp_path.name in meta_right
+
+    asyncio.run(exercise())
+
+
+def test_welcome_banner_disappears_after_first_message(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert app.query_one(WelcomeBanner) is not None
+            prompt = app.query_one(PromptArea)
+            prompt.text = "你好"
+            prompt.action_submit()
+            await pilot.pause()
+            assert not list(app.query(WelcomeBanner))
 
     asyncio.run(exercise())
 
@@ -161,6 +184,35 @@ def test_model_request_receives_current_terminal_and_pane_location(
                 "litcode_runtime_location" not in str(message["content"])
                 for message in app.session.messages
             )
+
+    asyncio.run(exercise())
+
+
+def test_schedule_command_sends_natural_language_as_explicit_tool_request(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        model = FakeModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(140, 40)) as pilot:
+            tool_names = {
+                schema["function"]["name"] for schema in app.registry.schemas()
+            }
+            assert {
+                "create_scheduled_task",
+                "list_scheduled_tasks",
+                "cancel_scheduled_task",
+            } <= tool_names
+            app._handle_command("/schedule 每周一上午九点运行测试")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if model.requests and not app.busy:
+                    break
+
+            request = str(model.requests[0][-1]["content"])
+            assert "create_scheduled_task" in request
+            assert "每周一上午九点运行测试" in request
+            assert "IANA 时区" in request
 
     asyncio.run(exercise())
 
@@ -388,6 +440,46 @@ def test_tui_submits_prompt_in_background_and_renders_answer(
     asyncio.run(exercise())
 
 
+def test_assistant_markdown_has_clear_semantic_contrast(tmp_path: Path) -> None:
+    class MarkdownModel(FakeModel):
+        def complete(self, messages, tools):
+            self.requests.append(list(messages))
+            return AssistantTurn(
+                "# 结论\n\n正文里的 **重点** 和 `value`。\n\n"
+                "> 注意事项\n\n```python\nprint('ok')\n```"
+            )
+
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), MarkdownModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(100, 36)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = "展示 Markdown"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if not app.busy:
+                    break
+
+            heading = app.query_one("MarkdownH1")
+            fence = app.query_one("MarkdownFence")
+            quote = app.query_one("MarkdownBlockQuote")
+            paragraph = app.query_one("MarkdownParagraph")
+
+            assert heading.styles.text_style.bold
+            assert heading.styles.border_bottom[0] == "solid"
+            assert fence.styles.border_left[0] == "round"
+            assert quote.styles.border_left[0] == "thick"
+
+            strong = paragraph.get_component_rich_style("strong")
+            inline_code = paragraph.get_component_rich_style("code_inline")
+            assert strong.bold
+            assert strong.color != paragraph.rich_style.color
+            assert inline_code.bold
+            assert inline_code.bgcolor is not None
+
+    asyncio.run(exercise())
+
+
 def test_tui_queues_messages_and_accepts_commands_while_busy(
     tmp_path: Path,
 ) -> None:
@@ -508,12 +600,14 @@ def test_slash_command_uses_fuzzy_inline_completion(tmp_path: Path) -> None:
             prompt.text = "/se"
             prompt.move_cursor((0, 3))
             await pilot.pause()
-            assert "/sessions" in app.completion_values
+            assert "/history" in app.completion_values
+            assert "/sessions" not in app.completion_values
 
             prompt.text = "/t"
             prompt.move_cursor((0, 2))
             await pilot.pause()
-            assert "/tree" in app.completion_values
+            assert "/history" in app.completion_values
+            assert "/tree" not in app.completion_values
 
     asyncio.run(exercise())
 
@@ -647,6 +741,34 @@ def test_split_can_mount_an_existing_background_session_without_a_ghost(
                     if pane.session is not None and pane.session.session_id == target
                 ]
             ) == 1
+
+    asyncio.run(exercise())
+
+
+def test_subagent_command_can_create_mount_and_start_a_child_pane(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        model = FakeModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(140, 40)) as pilot:
+            parent_id = app.session.session_id
+
+            app._handle_command("/subagent --pane right 检查测试")
+            for _ in range(40):
+                await pilot.pause(0.02)
+                if model.requests and not app.busy:
+                    break
+
+            assert app.active_pane_id == "pane-2"
+            child = app.store.session_info(app.session.session_id)
+            assert child.parent_id == parent_id
+            assert model.requests[0][-1]["content"] == "检查测试"
+            assert app.session.messages[-1]["content"] == "TUI 回答"
+            assert any(
+                "挂载到 2 号 pane" in str(widget.render())
+                for widget in app.query(".notice").results(Static)
+            )
 
     asyncio.run(exercise())
 
@@ -1144,6 +1266,9 @@ def test_history_picker_filters_and_selected_session_switches_pane(
             assert tree.cursor_node is not None
             assert tree.cursor_node.data == other
             assert "当前" in tree.root.children[1].label.plain
+            cursor_style = tree.get_component_rich_style("tree--cursor")
+            assert cursor_style.bold
+            assert cursor_style.bgcolor is not None
 
             filter_input = picker.query_one("#history-filter", Input)
             filter_input.value = "其他"
@@ -1155,6 +1280,82 @@ def test_history_picker_filters_and_selected_session_switches_pane(
             await pilot.pause()
             assert app.session.session_id == other
             assert first in app.sessions.detached
+
+    asyncio.run(exercise())
+
+
+def test_history_tree_uses_left_right_for_hierarchy_navigation(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 36)) as pilot:
+            parent_id = app.session.session_id
+            child_id = app.store.create_child(parent_id, title="子调查")
+            app._handle_command("/history")
+            await pilot.pause()
+            await pilot.pause()
+
+            picker = app.screen
+            assert isinstance(picker, HistoryPicker)
+            tree = picker.query_one("#history-tree", Tree)
+            assert tree.has_focus
+            parent = tree.cursor_node
+            assert parent is not None and parent.data == parent_id
+            assert not parent.is_expanded
+
+            await pilot.press("right")
+            assert parent.is_expanded
+            await pilot.press("right")
+            assert tree.cursor_node is not None
+            assert tree.cursor_node.data == child_id
+            await pilot.press("left")
+            assert tree.cursor_node is parent
+            await pilot.press("left")
+            assert not parent.is_expanded
+
+    asyncio.run(exercise())
+
+
+def test_history_tree_keeps_right_timestamp_inside_narrow_viewport(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        app.store.create(tmp_path, "model-a", [], title="一个很长的历史会话标题" * 4)
+        async with app.run_test(size=(72, 24)) as pilot:
+            app._handle_command("/history")
+            await pilot.pause()
+            await pilot.pause()
+
+            picker = app.screen
+            assert isinstance(picker, HistoryPicker)
+            tree = picker.query_one("#history-tree", Tree)
+            node = tree.cursor_node
+            assert node is not None
+            rendered = tree.render_label(node, Style(), Style())
+
+            assert rendered.plain.rstrip().endswith("刚刚")
+            assert rendered.cell_len <= tree.scrollable_content_region.width
+
+    asyncio.run(exercise())
+
+
+def test_history_shift_enter_mounts_selection_in_a_new_pane(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        other = app.store.create(tmp_path, "model-a", [], title="右侧会话")
+        async with app.run_test(size=(140, 40)) as pilot:
+            app._handle_command("/history")
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, HistoryPicker)
+
+            await pilot.press("shift+enter")
+            await pilot.pause()
+
+            assert app.active_pane_id == "pane-2"
+            assert app.session.session_id == other
 
     asyncio.run(exercise())
 
@@ -1380,6 +1581,109 @@ def test_tui_ask_user_multi_question_confirm_tab(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_subagent_card_shows_spinner_model_and_completion_summary(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 36)) as pilot:
+            runtime = app._active_runtime()
+            call = ToolCall(
+                "sub-1",
+                "spawn_subagent",
+                '{"prompt":"检查测试失败原因","agent":"explore"}',
+            )
+            app._append_tool(call, runtime)
+            await pilot.pause(0.15)
+
+            card = runtime.tool_cards[call.id]
+            assert "子代理 [explore] · model-a" in str(card.title)
+            assert str(card.title)[0] in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            assert "任务：检查测试失败原因" in str(
+                runtime.tool_bodies[call.id].render()
+            )
+
+            app._finish_tool(
+                call,
+                '{"invocation_id":"inv-1","session_id":"child-1",'
+                '"alias":"260901-1432-ABC","background":false,'
+                '"output":"失败来自 fixture 没有初始化。"}',
+                False,
+                runtime,
+            )
+
+            assert str(card.title).startswith("✓ 子代理 260901-1432-ABC")
+            assert "model-a" in str(card.title)
+            assert "完成摘要：失败来自 fixture 没有初始化。" in str(
+                runtime.tool_bodies[call.id].render()
+            )
+            assert call.id not in runtime.subagent_cards
+
+    asyncio.run(exercise())
+
+
+def test_background_subagent_card_stays_live_until_child_finishes(
+    tmp_path: Path,
+) -> None:
+    child_started = threading.Event()
+    child_release = threading.Event()
+
+    class BackgroundSubagentModel(FakeModel):
+        def complete(self, messages, tools):
+            self.requests.append(list(messages))
+            last = messages[-1]
+            content = last.get("content", "")
+            if content == "启动后台":
+                return AssistantTurn(
+                    None,
+                    (
+                        ToolCall(
+                            "sub-background",
+                            "spawn_subagent",
+                            '{"prompt":"检查测试","agent":"explore",'
+                            '"background":true}',
+                        ),
+                    ),
+                )
+            if content == "检查测试":
+                child_started.set()
+                assert child_release.wait(5)
+                return AssistantTurn("child 找到了失败原因")
+            return AssistantTurn("父会话继续")
+
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), BackgroundSubagentModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 36)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = "启动后台"
+            await pilot.press("enter")
+            for _ in range(100):
+                await pilot.pause(0.02)
+                if child_started.is_set() and not app.busy:
+                    break
+
+            runtime = app._active_runtime()
+            card = runtime.tool_cards["sub-background"]
+            assert "子代理" in str(card.title)
+            assert str(card.title)[0] in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            assert "当前：" in str(
+                runtime.tool_bodies["sub-background"].render()
+            )
+
+            child_release.set()
+            for _ in range(100):
+                await pilot.pause(0.02)
+                if "sub-background" not in runtime.subagent_cards:
+                    break
+
+            assert str(card.title).startswith("✓ 子代理")
+            assert "child 找到了失败原因" in str(
+                runtime.tool_bodies["sub-background"].render()
+            )
+
+    asyncio.run(exercise())
+
+
 def test_history_label_places_relative_time_on_the_right() -> None:
     import time as time_module
 
@@ -1395,7 +1699,7 @@ def test_history_label_places_relative_time_on_the_right() -> None:
         updated_at=now - 3 * 3600,
     )
 
-    label = _history_label(info, {}, set())
+    label = _history_label(info, {}, set(), width=60)
     assert "3h" in label.plain
     assert label.plain.rstrip().endswith("3h")
     assert "model-a" not in label.plain
@@ -1407,13 +1711,37 @@ def test_history_label_places_relative_time_on_the_right() -> None:
         model="model-a",
         updated_at=now - 3 * 3600,
     )
-    long_label = _history_label(long_info, {}, set())
+    long_label = _history_label(long_info, {}, set(), width=40)
     assert "…" in long_label.plain
-    assert _cell_width(long_label.plain) <= 60
+    assert _cell_width(long_label.plain) <= 40
 
     assert _relative_time(now - 40) == "刚刚"
     assert _relative_time(now - 90) == "1m"
     assert _relative_time(now - 2 * 86400) == "2d"
+
+
+def test_history_label_shows_child_model_and_current_activity() -> None:
+    import time as time_module
+
+    from litcode_agent.session_store import SessionInfo
+    from litcode_agent.tui import _history_label
+
+    info = SessionInfo(
+        id="child",
+        alias="260901-1400-CHILD",
+        title="检查测试",
+        model="model-child",
+        updated_at=time_module.time(),
+        parent_id="parent",
+        status="running",
+        activity="正在调用工具 · search_files",
+        active_turn_id="turn-1",
+    )
+
+    label = _history_label(info, {}, {info.id}, width=100)
+
+    assert "● 正在调用工具 · search_files" in label.plain
+    assert "model-child" in label.plain
 
 
 def _tree_node_datas(picker) -> list[str | None]:
@@ -1429,3 +1757,147 @@ def _tree_node_datas(picker) -> list[str | None]:
 
     visit(tree.root)
     return result
+
+
+def test_connect_flow_saves_key_queries_models_and_switches_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import litcode_agent.tui as tui_module
+
+    monkeypatch.setenv("HOME", str(tmp_path / "user-home"))
+    monkeypatch.setattr(
+        tui_module,
+        "fetch_model_list",
+        lambda api_key, base_url: ("server-a", "server-b"),
+    )
+
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.action_connect()
+            await pilot.pause()
+            assert app.screen.__class__.__name__ == "ProviderPicker"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.screen.__class__.__name__ == "SecretPrompt"
+            await pilot.pause()
+            secret = app.screen.query_one("#secret-input", Input)
+            secret.value = "sk-connect-key"
+            await pilot.press("enter")
+            for _ in range(50):
+                await pilot.pause()
+                if app.screen.__class__.__name__ == "ModelPicker":
+                    break
+            assert app.screen.__class__.__name__ == "ModelPicker"
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.model.model == "server-a"
+            assert app.sessions.active.model.model == "server-a"
+            assert app.sessions.active.agent.model_name == "server-a"
+
+            auth = tmp_path / "user-home" / ".local" / "share" / "litcode" / "auth.json"
+            store = json.loads(auth.read_text(encoding="utf-8"))
+            assert store["credentials"]["DEEPSEEK_API_KEY"] == {
+                "type": "api",
+                "key": "sk-connect-key",
+            }
+            assert store["lastClient"]["model"] == "server-a"
+            assert store["lastClient"]["baseURL"] == "https://api.deepseek.com"
+
+            session_id = app.session.session_id
+            assert app.store.session_info(session_id).model == "server-a"
+
+    asyncio.run(exercise())
+
+
+def test_connect_custom_endpoint_flow(tmp_path: Path, monkeypatch) -> None:
+    import litcode_agent.tui as tui_module
+
+    monkeypatch.setenv("HOME", str(tmp_path / "user-home"))
+    monkeypatch.setattr(
+        tui_module,
+        "fetch_model_list",
+        lambda api_key, base_url: (),
+    )
+
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            app._provider_selected("custom")
+            await pilot.pause()
+            assert app.screen.__class__.__name__ == "CustomEndpointPrompt"
+            base = app.screen.query_one("#custom-base", Input)
+            base.value = "http://127.0.0.1:8000/v1"
+            env = app.screen.query_one("#custom-env", Input)
+            env.value = "LITCODE_CUSTOM_API_KEY"
+            key = app.screen.query_one("#custom-key", Input)
+            key.value = "placeholder"
+            app.screen.query_one("#custom-key", Input).focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            for _ in range(50):
+                await pilot.pause()
+                if app.screen.__class__.__name__ == "ModelIDPrompt":
+                    break
+            assert app.screen.__class__.__name__ == "ModelIDPrompt"
+            model_id = app.screen.query_one("#model-id-input", Input)
+            model_id.value = "custom-llm"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.model.model == "custom-llm"
+            assert str(app.model.client.base_url).rstrip("/") == "http://127.0.0.1:8000/v1"
+            auth = tmp_path / "user-home" / ".local" / "share" / "litcode" / "auth.json"
+            store = json.loads(auth.read_text(encoding="utf-8"))
+            assert store["credentials"]["LITCODE_CUSTOM_API_KEY"]["key"] == "placeholder"
+            assert store["lastClient"]["baseURL"] == "http://127.0.0.1:8000/v1"
+
+    asyncio.run(exercise())
+
+
+def test_connect_custom_endpoint_validates_bad_url(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            app._provider_selected("custom")
+            await pilot.pause()
+            base = app.screen.query_one("#custom-base", Input)
+            base.value = "not-a-url"
+            key = app.screen.query_one("#custom-key", Input)
+            key.value = "x"
+            app.screen.query_one("#custom-key", Input).focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.screen.__class__.__name__ == "CustomEndpointPrompt"
+            error = app.screen.query_one("#custom-error", Static)
+            assert "http" in str(error.render())
+
+    asyncio.run(exercise())
+
+
+def test_unconfigured_tui_guides_connect_and_blocks_messages(tmp_path: Path) -> None:
+    from litcode_agent.config import Settings as RealSettings
+
+    unconfigured = RealSettings.load_tui(
+        tmp_path, {"HOME": str(tmp_path / "fresh-home")}
+    )
+
+    async def exercise() -> None:
+        app = LitCodeTUI(unconfigured, FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert any(
+                "connect" in str(widget.render())
+                for widget in app.query(".notice").results(Static)
+            )
+            prompt = app.query_one(PromptArea)
+            prompt.text = "hello"
+            prompt.action_submit()
+            await pilot.pause()
+            assert app.store.list_sessions(tmp_path) == ()
+            assert any(
+                "connect" in str(widget.render())
+                for widget in app.query(".notice").results(Static)
+            )
+
+    asyncio.run(exercise())

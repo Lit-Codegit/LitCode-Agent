@@ -11,6 +11,7 @@ from litcode_agent.tools.base import FileChange
 
 TITLE_VALUE_LIMIT = 100
 RESULT_SUMMARY_LIMIT = 1_200
+SUBAGENT_PREVIEW_LIMIT = 240
 
 DIFF_CONTEXT_LINES = 3
 DIFF_LINE_LIMIT = 600
@@ -32,6 +33,82 @@ def tool_result_summary(content: str, is_error: bool) -> str:
     label = "失败" if is_error else "成功"
     normalized = content.strip() or "（无输出）"
     return f"状态：{label}\n\n{_truncate(normalized, RESULT_SUMMARY_LIMIT)}"
+
+
+def subagent_title(
+    tool_call: ToolCall,
+    status: str,
+    model: str,
+    elapsed_seconds: float,
+    *,
+    alias: str | None = None,
+) -> str:
+    """Render one stable subagent row without exposing invocation UUIDs."""
+
+    arguments = _arguments(tool_call.arguments)
+    profile = _value(arguments.get("agent")) or "general"
+    name = f"子代理 {_value(alias)}" if alias else "子代理"
+    model_label = _value(model) or "unknown"
+    elapsed = max(0, int(elapsed_seconds))
+    return f"{status} {name} [{profile}] · {model_label} · {elapsed}s"
+
+
+def subagent_running_summary(tool_call: ToolCall, activity: str) -> str:
+    """Show the bounded assignment plus the child's latest durable activity."""
+
+    arguments = _arguments(tool_call.arguments)
+    prompt = _preview(arguments.get("prompt"), SUBAGENT_PREVIEW_LIMIT) or "（未提供任务）"
+    current = " ".join(activity.split()) or "正在创建子会话…"
+    return f"任务：{prompt}\n\n当前：{current}"
+
+
+def subagent_result_summary(
+    tool_call: ToolCall,
+    content: str,
+    *,
+    is_error: bool,
+) -> tuple[str | None, str | None, bool, str]:
+    """Return alias, invocation id and a bounded human-facing result summary."""
+
+    arguments = _arguments(tool_call.arguments)
+    prompt = _preview(arguments.get("prompt"), SUBAGENT_PREVIEW_LIMIT) or "（未提供任务）"
+    payload = _json_object(content)
+    alias = _optional_text(payload.get("alias"))
+    invocation_id = _optional_text(payload.get("invocation_id"))
+    output = _optional_text(payload.get("output"))
+    if is_error:
+        result = _truncate(content.strip() or "（无错误信息）", RESULT_SUMMARY_LIMIT)
+        label = "失败"
+    elif output:
+        result = _truncate(" ".join(output.split()), RESULT_SUMMARY_LIMIT)
+        label = "完成摘要"
+    elif payload.get("background") is True:
+        result = "子会话已在后台启动。"
+        label = "当前"
+    else:
+        result = _truncate(content.strip() or "（无输出）", RESULT_SUMMARY_LIMIT)
+        label = "完成摘要"
+    return (
+        alias,
+        invocation_id,
+        payload.get("background") is True,
+        f"任务：{prompt}\n\n{label}：{result}",
+    )
+
+
+def subagent_completion_summary(
+    tool_call: ToolCall,
+    output: str,
+    *,
+    failed: bool = False,
+) -> str:
+    """Summarise a background invocation once the runtime reaches a terminal state."""
+
+    arguments = _arguments(tool_call.arguments)
+    prompt = _preview(arguments.get("prompt"), SUBAGENT_PREVIEW_LIMIT) or "（未提供任务）"
+    label = "失败" if failed else "完成摘要"
+    preview = _truncate(" ".join(output.split()) or "（无输出）", RESULT_SUMMARY_LIMIT)
+    return f"任务：{prompt}\n\n{label}：{preview}"
 
 
 def change_result_summary(change: FileChange) -> str:
@@ -123,6 +200,14 @@ def _arguments(raw: str) -> Mapping[str, object]:
     return value if isinstance(value, dict) else {}
 
 
+def _json_object(raw: str) -> Mapping[str, object]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def _key_arguments(name: str, arguments: Mapping[str, object]) -> str:
     if name == "read_file":
         path = _value(arguments.get("path"))
@@ -177,6 +262,16 @@ def _value(value: object) -> str:
     if len(text) <= TITLE_VALUE_LIMIT:
         return text
     return f"{text[: TITLE_VALUE_LIMIT - 1]}…"
+
+
+def _optional_text(value: object) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _preview(value: object, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return _truncate(" ".join(value.split()), limit)
 
 
 def _truncate(text: str, limit: int) -> str:

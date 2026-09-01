@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 import secrets
 
 from litcode_agent.agent import Agent, AgentEvent, AgentSession
@@ -15,6 +16,7 @@ from litcode_agent.config import Settings
 from litcode_agent.hooks import HookRunner
 from litcode_agent.model import OpenAIChatModel
 from litcode_agent.pane_layout import PaneLayout
+from litcode_agent.scheduler import local_timezone_name
 from litcode_agent.session_store import Checkpoint, InboxMessage, SessionStore
 from litcode_agent.session_runtime import SessionRuntime
 from litcode_agent.tools.registry import ToolRegistry
@@ -62,6 +64,20 @@ class SessionWorkspace:
         self.detached: dict[str, AgentSession] = {}
         self.layout = PaneLayout(first.pane_id)
         self.active_pane_id = first.pane_id
+
+    def switch_provider(self, model: OpenAIChatModel) -> None:
+        """Replace the endpoint for every mounted pane and recorded session.
+
+        /connect 在供货商之间切换；各 pane 统一改用新模型 ID，历史消息保留。
+        """
+
+        self.default_model = model
+        for pane in self.panes.values():
+            pane.model = _clone_model(model, model.model)
+            pane.agent.model = pane.model
+            pane.agent.model_name = model.model
+            if pane.session is not None:
+                self.store.update_model(pane.session.session_id, model.model)
 
     @property
     def active(self) -> PaneSession:
@@ -310,8 +326,13 @@ class SessionWorkspace:
 
     def _runtime_location(self, pane_id: str) -> str:
         pane = self.panes[pane_id]
+        time_context = (
+            f"当前本地时间：{datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+            f"默认 IANA 时区：{local_timezone_name()}"
+        )
         if pane.session is None:
             return (
+                f"{time_context}\n"
                 f"当前终端：{self.terminal_id}\n"
                 f"当前 pane：{pane.pane_slot}\n"
                 "当前 pane 为空；首次输入后创建会话。"
@@ -326,6 +347,7 @@ class SessionWorkspace:
             mounted.append(f"{candidate.pane_slot}={info.alias} · {info.title}")
         return "\n".join(
             (
+                time_context,
                 f"当前终端：{self.terminal_id}",
                 f"当前 pane：{pane.pane_slot}",
                 f"当前会话：{current.alias}",

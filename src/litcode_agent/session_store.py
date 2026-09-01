@@ -114,6 +114,22 @@ class SessionReferenceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ScheduledTask:
+    """A durable instruction that starts an Agent Session on a calendar."""
+
+    id: str
+    creator_session_id: str
+    target_session_id: str
+    prompt: str
+    schedule: Mapping[str, object]
+    timezone: str
+    next_run_at: float | None
+    status: str
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True, slots=True)
 class Checkpoint:
     id: str
     label: str
@@ -278,6 +294,28 @@ class SessionStore:
                 source_updated_at REAL NOT NULL,
                 capsule TEXT NOT NULL,
                 created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                id TEXT PRIMARY KEY,
+                creator_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                target_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                prompt TEXT NOT NULL,
+                schedule_json TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                next_run_at REAL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS scheduled_tasks_due_idx
+                ON scheduled_tasks(status, next_run_at);
+            CREATE TABLE IF NOT EXISTS scheduled_runs (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+                scheduled_for REAL NOT NULL,
+                message_id TEXT NOT NULL UNIQUE REFERENCES session_queue(id) ON DELETE CASCADE,
+                created_at REAL NOT NULL,
+                UNIQUE(task_id, scheduled_for)
             );
             """
         )
@@ -661,6 +699,155 @@ class SessionStore:
             for row in rows
         )
 
+    # ------------------------------------------------------------------
+    # Durable scheduled Agent tasks.  A firing and its mailbox message are
+    # committed together, so a crash cannot leave one without the other.
+
+    @_synchronized
+    def create_scheduled_task(
+        self,
+        creator_session_id: str,
+        target_session_id: str,
+        prompt: str,
+        schedule: Mapping[str, object],
+        timezone: str,
+        next_run_at: float,
+    ) -> ScheduledTask:
+        if not prompt.strip():
+            raise ValueError("scheduled task prompt must not be empty")
+        task_id = str(uuid.uuid4())
+        now = time.time()
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO scheduled_tasks "
+                "(id, creator_session_id, target_session_id, prompt, schedule_json, "
+                "timezone, next_run_at, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+                (
+                    task_id,
+                    creator_session_id,
+                    target_session_id,
+                    prompt.strip(),
+                    json.dumps(schedule, ensure_ascii=False, sort_keys=True),
+                    timezone,
+                    next_run_at,
+                    now,
+                    now,
+                ),
+            )
+        return self.scheduled_task(task_id)
+
+    @_synchronized
+    def scheduled_task(self, task_id: str) -> ScheduledTask:
+        row = self.connection.execute(
+            "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        return _scheduled_task(row)
+
+    @_synchronized
+    def scheduled_tasks(
+        self,
+        workspace: Path,
+        *,
+        include_inactive: bool = False,
+        limit: int = 100,
+    ) -> tuple[ScheduledTask, ...]:
+        status = "" if include_inactive else "AND task.status = 'active'"
+        rows = self.connection.execute(
+            "SELECT task.* FROM scheduled_tasks AS task "
+            "JOIN sessions AS session ON session.id = task.creator_session_id "
+            f"WHERE session.workspace = ? {status} "
+            "ORDER BY task.next_run_at IS NULL, task.next_run_at, task.created_at LIMIT ?",
+            (str(workspace.resolve()), limit),
+        ).fetchall()
+        return tuple(_scheduled_task(row) for row in rows)
+
+    @_synchronized
+    def due_scheduled_tasks(
+        self, workspace: Path, now: float, *, limit: int = 100
+    ) -> tuple[ScheduledTask, ...]:
+        rows = self.connection.execute(
+            "SELECT task.* FROM scheduled_tasks AS task "
+            "JOIN sessions AS session ON session.id = task.creator_session_id "
+            "WHERE session.workspace = ? AND task.status = 'active' "
+            "AND task.next_run_at IS NOT NULL AND task.next_run_at <= ? "
+            "ORDER BY task.next_run_at, task.created_at LIMIT ?",
+            (str(workspace.resolve()), now, limit),
+        ).fetchall()
+        return tuple(_scheduled_task(row) for row in rows)
+
+    @_synchronized
+    def dispatch_scheduled_task(
+        self,
+        task_id: str,
+        scheduled_for: float,
+        next_run_at: float | None,
+    ) -> QueuedMessage | None:
+        """Atomically claim one occurrence and append its Agent prompt."""
+
+        task = self.connection.execute(
+            "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            task is None
+            or task["status"] != "active"
+            or task["next_run_at"] is None
+            or float(task["next_run_at"]) != scheduled_for
+        ):
+            return None
+        now = time.time()
+        message_id = str(uuid.uuid4())
+        run_id = str(uuid.uuid4())
+        final_status = "completed" if next_run_at is None else "active"
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE scheduled_tasks SET next_run_at = ?, status = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'active' AND next_run_at = ?",
+                (next_run_at, final_status, now, task_id, scheduled_for),
+            )
+            if cursor.rowcount != 1:
+                return None
+            self.connection.execute(
+                "INSERT INTO session_queue "
+                "(id, target_session_id, source_session_id, content, kind, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'scheduled_task', 'queued', ?)",
+                (
+                    message_id,
+                    task["target_session_id"],
+                    task["creator_session_id"],
+                    task["prompt"],
+                    now,
+                ),
+            )
+            self.connection.execute(
+                "UPDATE session_queue SET queue_position = sequence WHERE id = ?",
+                (message_id,),
+            )
+            self.connection.execute(
+                "INSERT INTO scheduled_runs "
+                "(id, task_id, scheduled_for, message_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (run_id, task_id, scheduled_for, message_id, now),
+            )
+        return self.queue_message(message_id)
+
+    @_synchronized
+    def cancel_scheduled_task(
+        self, workspace: Path, task_id: str
+    ) -> ScheduledTask:
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE scheduled_tasks SET status = 'cancelled', next_run_at = NULL, "
+                "updated_at = ? WHERE id = ? AND status = 'active' "
+                "AND creator_session_id IN (SELECT id FROM sessions WHERE workspace = ?)",
+                (time.time(), task_id, str(workspace.resolve())),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError("only an active scheduled task can be cancelled")
+        return self.scheduled_task(task_id)
+
     @_synchronized
     def update_model(self, session_id: str, model: str) -> None:
         with self.connection:
@@ -713,6 +900,9 @@ class SessionStore:
         if version < 7:
             self._migrate_queue_positions()
             self._write_schema_version(7)
+        if version < 8:
+            self._migrate_scheduled_tasks()
+            self._write_schema_version(8)
 
     def _migrate_aliases(self) -> None:
         columns = {
@@ -832,6 +1022,35 @@ class SessionStore:
                 );
                 CREATE INDEX IF NOT EXISTS session_turns_session_idx
                     ON session_turns(session_id, created_at);
+                """
+            )
+
+    def _migrate_scheduled_tasks(self) -> None:
+        with self.connection:
+            self.connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                    id TEXT PRIMARY KEY,
+                    creator_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    target_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    prompt TEXT NOT NULL,
+                    schedule_json TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    next_run_at REAL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS scheduled_tasks_due_idx
+                    ON scheduled_tasks(status, next_run_at);
+                CREATE TABLE IF NOT EXISTS scheduled_runs (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+                    scheduled_for REAL NOT NULL,
+                    message_id TEXT NOT NULL UNIQUE REFERENCES session_queue(id) ON DELETE CASCADE,
+                    created_at REAL NOT NULL,
+                    UNIQUE(task_id, scheduled_for)
+                );
                 """
             )
 
@@ -1644,6 +1863,26 @@ def _queued_message(row: sqlite3.Row) -> QueuedMessage:
             float(row["finished_at"]) if row["finished_at"] is not None else None
         ),
         result=str(row["result"]) if row["result"] is not None else None,
+    )
+
+
+def _scheduled_task(row: sqlite3.Row) -> ScheduledTask:
+    schedule = json.loads(row["schedule_json"])
+    if not isinstance(schedule, dict):
+        raise ValueError("stored schedule must be an object")
+    return ScheduledTask(
+        id=str(row["id"]),
+        creator_session_id=str(row["creator_session_id"]),
+        target_session_id=str(row["target_session_id"]),
+        prompt=str(row["prompt"]),
+        schedule=schedule,
+        timezone=str(row["timezone"]),
+        next_run_at=(
+            float(row["next_run_at"]) if row["next_run_at"] is not None else None
+        ),
+        status=str(row["status"]),
+        created_at=float(row["created_at"]),
+        updated_at=float(row["updated_at"]),
     )
 
 

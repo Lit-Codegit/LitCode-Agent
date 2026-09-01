@@ -11,7 +11,9 @@ from typing import Literal, Mapping, cast
 
 from litcode_agent.credentials import (
     CredentialError,
+    LastClient,
     load_api_key,
+    load_last_client,
     validate_credential_name,
 )
 from litcode_agent.hooks import HookCommand, HookGroup, HookSettings
@@ -41,6 +43,7 @@ class Settings:
     base_url: str | None = None
     api_key_env: str = "OPENAI_API_KEY"
     api_key_source: str = "environment"
+    configured: bool = True
     max_iterations: int = 60
     command_timeout_seconds: float = 30.0
     max_output_chars: int = 20_000
@@ -74,6 +77,31 @@ class Settings:
             merged,
             loaded,
             use_credential_store=True,
+        )
+
+    @classmethod
+    def load_tui(
+        cls,
+        workspace: Path,
+        environ: Mapping[str, str] | None = None,
+    ) -> Settings:
+        """为 TUI 加载配置，允许还没有任何 API Key：新用户先连接再使用。
+
+        ``run``、``doctor`` 等非交互入口仍使用严格的 :meth:`load`。
+        项目 ``models`` 配置缺失时，会用用户级记忆的端点作为兜底。
+        """
+
+        root = workspace.expanduser().resolve()
+        if not root.is_dir():
+            raise ConfigurationError(f"workspace is not a directory: {root}")
+        merged, loaded = _load_project_config(root)
+        return cls._from_values(
+            root,
+            os.environ if environ is None else environ,
+            merged,
+            loaded,
+            use_credential_store=True,
+            allow_unconfigured=True,
         )
 
     @classmethod
@@ -120,6 +148,7 @@ class Settings:
         config_files: tuple[Path, ...],
         *,
         use_credential_store: bool,
+        allow_unconfigured: bool = False,
     ) -> Settings:
         _reject_unknown_keys(
             raw,
@@ -138,7 +167,20 @@ class Settings:
         permissions = _object(raw.get("permissions"), "permissions")
         tools = _object(raw.get("tools"), "tools")
         command_config = _object(tools.get("command"), "tools.command")
-        model_profile, model_config = _selected_model_config(raw, environ)
+        memory_client = (
+            _user_memory_client(raw, environ)
+            if use_credential_store
+            else None
+        )
+        if memory_client is not None:
+            model_profile = "user-memory"
+            model_config: dict[str, object] = {
+                "model": memory_client.model,
+                "baseURL": memory_client.base_url,
+                "apiKeyEnv": memory_client.api_key_env,
+            }
+        else:
+            model_profile, model_config = _selected_model_config(raw, environ)
         _reject_unknown_keys(
             model_config,
             {"model", "baseURL", "apiKeyEnv"},
@@ -189,12 +231,17 @@ class Settings:
             or ""
         )
         if not api_key:
-            raise ConfigurationError(f"{api_key_env} is required")
+            if allow_unconfigured:
+                api_key_source = "none"
+            else:
+                raise ConfigurationError(f"{api_key_env} is required")
         if not model:
-            raise ConfigurationError(
-                "selected model profile or environment variable LITCODE_MODEL "
-                "must provide a model ID"
-            )
+            if not allow_unconfigured:
+                raise ConfigurationError(
+                    "selected model profile or environment variable "
+                    "LITCODE_MODEL must provide a model ID"
+                )
+        configured = bool(api_key) and bool(model)
 
         base_url = (
             environ.get("OPENAI_BASE_URL")
@@ -309,6 +356,7 @@ class Settings:
             base_url=base_url or None,
             api_key_env=api_key_env,
             api_key_source=api_key_source,
+            configured=configured,
             max_iterations=max_iterations,
             command_timeout_seconds=command_timeout,
             max_output_chars=max_output_chars,
@@ -337,6 +385,7 @@ class Settings:
             "api_key_env": self.api_key_env,
             "api_key_configured": bool(self.api_key),
             "api_key_source": self.api_key_source,
+            "configured": self.configured,
             "max_iterations": self.max_iterations,
             "command_timeout_seconds": self.command_timeout_seconds,
             "max_output_chars": self.max_output_chars,
@@ -415,6 +464,27 @@ def _selected_model_config(
             "models must define the profile selected by defaultModel"
         )
     return profile, {}
+
+
+def _user_memory_client(
+    raw: Mapping[str, object], environ: Mapping[str, str]
+) -> LastClient | None:
+    """项目没有 models 配置且未显式选择时，用用户级记忆的端点兜底。
+
+    显式配置（LITCODE_DEFAULT_MODEL、defaultModel）优先于记忆；
+    记忆只保存到 0600 用户级文件，不会出现在项目配置中。
+    """
+
+    if "models" in raw:
+        return None
+    if raw.get("defaultModel") is not None:
+        return None
+    if environ.get("LITCODE_DEFAULT_MODEL", "").strip():
+        return None
+    last = load_last_client(environ)
+    if last is None or not last.model:
+        return None
+    return last
 
 
 def _api_key_name(model_config: Mapping[str, object], profile: str) -> str:

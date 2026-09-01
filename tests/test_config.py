@@ -480,3 +480,97 @@ def test_loads_named_read_only_roots(tmp_path: Path) -> None:
     assert settings.read_roots[0].alias == "local"
     assert settings.read_roots[0].path == (tmp_path / "local").resolve()
     assert settings.read_roots[0].send_to_model
+
+
+def test_load_tui_allows_missing_key_for_fresh_users(tmp_path: Path) -> None:
+    settings = Settings.load_tui(
+        tmp_path, {"HOME": str(tmp_path / "fresh-home")}
+    )
+
+    assert settings.api_key == ""
+    assert settings.model == ""
+    assert settings.configured is False
+    assert settings.api_key_source == "none"
+    summary = settings.safe_summary()
+    assert summary["configured"] is False
+    assert summary["api_key_configured"] is False
+
+
+def test_load_tui_still_strict_for_workspace_mistakes(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+    with pytest.raises(ConfigurationError, match="not a directory"):
+        Settings.load_tui(missing, {})
+
+
+def test_user_memory_client_resumes_endpoint_when_project_has_no_models(
+    tmp_path: Path, monkeypatch
+) -> None:
+    user_home = tmp_path / "user-home"
+    monkeypatch.setenv("HOME", str(user_home))
+    from litcode_agent.credentials import save_api_key, save_last_client
+    from litcode_agent.credentials import LastClient
+
+    save_api_key("DEEPSEEK_API_KEY", "sk-memory")
+    save_last_client(
+        LastClient("DEEPSEEK_API_KEY", "https://api.deepseek.com", "deepseek-chat"),
+    )
+
+    settings = Settings.load(tmp_path, {})
+
+    assert settings.configured is True
+    assert settings.model_profile == "user-memory"
+    assert settings.api_key_env == "DEEPSEEK_API_KEY"
+    assert settings.base_url == "https://api.deepseek.com"
+    assert settings.model == "deepseek-chat"
+    assert settings.api_key_source == "user credential store"
+    assert settings.api_key == "sk-memory"
+
+
+def test_project_models_config_wins_over_user_memory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    user_home = tmp_path / "user-home"
+    monkeypatch.setenv("HOME", str(user_home))
+    from litcode_agent.credentials import save_api_key, save_last_client
+    from litcode_agent.credentials import LastClient
+
+    save_api_key("DEEPSEEK_API_KEY", "sk-memory")
+    save_api_key("OPENAI_API_KEY", "sk-project")
+    save_last_client(
+        LastClient("DEEPSEEK_API_KEY", "https://api.deepseek.com", "deepseek-chat"),
+    )
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultModel": "primary",
+                "models": {"primary": {"model": "project-model"}},
+            }
+        )
+    )
+
+    settings = Settings.load(tmp_path, {})
+
+    assert settings.model_profile == "primary"
+    assert settings.model == "project-model"
+    assert settings.api_key_env == "OPENAI_API_KEY"
+    assert settings.api_key == "sk-project"
+
+
+def test_explicit_env_profile_disables_user_memory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    user_home = tmp_path / "user-home"
+    monkeypatch.setenv("HOME", str(user_home))
+    from litcode_agent.credentials import save_api_key, save_last_client
+    from litcode_agent.credentials import LastClient
+
+    save_api_key("DEEPSEEK_API_KEY", "sk-memory")
+    save_last_client(
+        LastClient("DEEPSEEK_API_KEY", "https://api.deepseek.com", "deepseek-chat"),
+    )
+
+    # LITCODE_DEFAULT_MODEL 显式选择时应完全忽略用户级记忆端点。
+    with pytest.raises(ConfigurationError, match="OPENAI_API_KEY is required"):
+        Settings.load(tmp_path, {"LITCODE_DEFAULT_MODEL": "fast"})
