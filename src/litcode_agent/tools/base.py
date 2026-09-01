@@ -53,6 +53,12 @@ class ToolExecutionContext:
 
     session_id: str
     workspace: Path
+    terminal_id: str | None = None
+    pane_slot: int | None = None
+    mounted_sessions: tuple[tuple[str, int], ...] = ()
+    orchestration_role: str | None = None
+    orchestration_write_policy: str | None = None
+    orchestration_allowed_paths: tuple[str, ...] = ()
 
 
 @runtime_checkable

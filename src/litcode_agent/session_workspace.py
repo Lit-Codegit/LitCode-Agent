@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import secrets
 
 from litcode_agent.agent import Agent, AgentEvent, AgentSession
 from litcode_agent.config import Settings
@@ -17,6 +18,7 @@ from litcode_agent.tools.registry import ToolRegistry
 @dataclass(slots=True)
 class PaneSession:
     pane_id: str
+    pane_slot: int
     agent: Agent
     model: OpenAIChatModel
     session: AgentSession
@@ -33,30 +35,37 @@ class SessionWorkspace:
         system_prompt: str,
         store: SessionStore,
         event_sink: Callable[[AgentEvent], None],
+        terminal_id: str | None = None,
+        before_model_request: Callable[[str], None] | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
         self.system_prompt = system_prompt
         self.store = store
         self.event_sink = event_sink
-        first = self._create("pane-1", model)
+        self.terminal_id = terminal_id or _terminal_id()
+        self.before_model_request = before_model_request
+        first = self._create(1, model)
         self.panes = {first.pane_id: first}
         self.detached: dict[str, AgentSession] = {}
         self.layout = PaneLayout(first.pane_id)
         self.active_pane_id = first.pane_id
-        self._next_pane_number = 2
 
     @property
     def active(self) -> PaneSession:
         return self.panes[self.active_pane_id]
 
     def split(self, direction: str) -> PaneSession:
-        pane_id = f"pane-{self._next_pane_number}"
-        self._next_pane_number += 1
+        pane_slot = next(
+            slot
+            for slot in range(1, 5)
+            if f"pane-{slot}" not in self.panes
+        )
+        pane_id = f"pane-{pane_slot}"
         current = self.active
         clone = getattr(current.model, "clone_for_model", None)
         model = clone(current.model.model) if callable(clone) else current.model
-        pane = self._create(pane_id, model)
+        pane = self._create(pane_slot, model)
         self.layout.split(self.active_pane_id, direction, pane_id)
         self.panes[pane_id] = pane
         self.active_pane_id = pane_id
@@ -104,6 +113,7 @@ class SessionWorkspace:
             pane.session = detached
             pane.agent = detached.agent
             pane.model = detached.agent.model  # type: ignore[assignment]
+            self._bind_runtime_location(pane)
             return pane
         info = self.store.session_info(session_id)
         pane.model.select_model(info.model)
@@ -138,16 +148,105 @@ class SessionWorkspace:
         for session in self.detached.values():
             session.close("user_exit", "")
 
-    def _create(self, pane_id: str, model: OpenAIChatModel) -> PaneSession:
+    def _create(self, pane_slot: int, model: OpenAIChatModel) -> PaneSession:
+        pane_id = f"pane-{pane_slot}"
         agent = Agent(
-            model,
-            self.registry,
-            self.settings.max_iterations,
-            self.event_sink,
-            HookRunner(self.settings.workspace, self.settings.hooks),
-            self.system_prompt,
-            self.store,
-            model.model,
-            self.settings.workspace,
+            model=model,
+            tools=self.registry,
+            max_iterations=self.settings.max_iterations,
+            event_sink=self.event_sink,
+            hooks=HookRunner(self.settings.workspace, self.settings.hooks),
+            system_prompt=self.system_prompt,
+            store=self.store,
+            model_name=model.model,
+            workspace=self.settings.workspace,
+            runtime_context=lambda: self._runtime_location(pane_id),
+            tool_context=lambda session_id: self._tool_context(pane_id, session_id),
+            origin_terminal_id=self.terminal_id,
+            origin_pane_slot=pane_slot,
+            before_model_request=self.before_model_request,
         )
-        return PaneSession(pane_id, agent, model, agent.start_session())
+        return PaneSession(pane_id, pane_slot, agent, model, agent.start_session())
+
+    def _bind_runtime_location(self, pane: PaneSession) -> None:
+        pane.agent.runtime_context = lambda: self._runtime_location(pane.pane_id)
+        pane.agent.tool_context = lambda session_id: self._tool_context(
+            pane.pane_id, session_id
+        )
+        pane.agent.origin_terminal_id = self.terminal_id
+        pane.agent.origin_pane_slot = pane.pane_slot
+
+    def mounted_sessions(self) -> dict[str, int]:
+        return {
+            pane.session.session_id: pane.pane_slot for pane in self.panes.values()
+        }
+
+    def pane_for_session(self, session_id: str) -> PaneSession | None:
+        return next(
+            (
+                pane
+                for pane in self.panes.values()
+                if pane.session.session_id == session_id
+            ),
+            None,
+        )
+
+    def catalog(self, query: str = "", limit: int = 50):
+        return self.store.session_catalog(
+            self.settings.workspace,
+            current_terminal_id=self.terminal_id,
+            mounted=self.mounted_sessions(),
+            query=query,
+            limit=limit,
+        )
+
+    def _tool_context(self, pane_id: str, session_id: str):
+        from litcode_agent.tools.base import ToolExecutionContext
+
+        running_task = self.store.running_task_for_session(session_id)
+        role = running_task.role if running_task is not None else None
+        write_policy = (
+            running_task.write_policy if running_task is not None else None
+        )
+        allowed_paths = (
+            running_task.allowed_paths if running_task is not None else ()
+        )
+        if running_task is None:
+            run = self.store.active_orchestration_run(
+                self.settings.workspace, session_id
+            )
+            if run is not None and run.status == "running":
+                role = "coordinator"
+                write_policy = "none"
+        return ToolExecutionContext(
+            session_id,
+            self.settings.workspace.resolve(),
+            terminal_id=self.terminal_id,
+            pane_slot=self.panes[pane_id].pane_slot,
+            mounted_sessions=tuple(sorted(self.mounted_sessions().items())),
+            orchestration_role=role,
+            orchestration_write_policy=write_policy,
+            orchestration_allowed_paths=allowed_paths,
+        )
+
+    def _runtime_location(self, pane_id: str) -> str:
+        pane = self.panes[pane_id]
+        current = self.store.session_info(pane.session.session_id)
+        mounted = []
+        for candidate in sorted(self.panes.values(), key=lambda item: item.pane_slot):
+            info = self.store.session_info(candidate.session.session_id)
+            mounted.append(f"{candidate.pane_slot}={info.alias} · {info.title}")
+        return "\n".join(
+            (
+                f"当前终端：{self.terminal_id}",
+                f"当前 pane：{pane.pane_slot}",
+                f"当前会话：{current.alias}",
+                "同终端 pane：" + "；".join(mounted),
+                "pane 编号只在本次 TUI 运行中有效。",
+            )
+        )
+
+
+def _terminal_id() -> str:
+    alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    return "T-" + "".join(secrets.choice(alphabet) for _ in range(3))

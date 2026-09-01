@@ -54,6 +54,8 @@ class ToolRegistry:
         if not isinstance(arguments, dict):
             return ToolResult.error("tool arguments must be a JSON object")
         try:
+            if context is not None:
+                _enforce_orchestration_policy(name, arguments, context)
             if isinstance(tool, ContextualTool):
                 if context is None:
                     raise ToolError("tool requires an active session context")
@@ -62,3 +64,24 @@ class ToolRegistry:
             return tool.execute(arguments)
         except (ToolError, OSError) as error:
             return ToolResult.error(str(error))
+
+
+def _enforce_orchestration_policy(
+    tool_name: str,
+    arguments: Mapping[str, object],
+    context: ToolExecutionContext,
+) -> None:
+    role = context.orchestration_role
+    if role in {"coordinator", "reviewer"} and tool_name in {
+        "apply_patch",
+        "run_command",
+    }:
+        raise ToolError(f"orchestration role {role} cannot use {tool_name}")
+    if role != "implementer" or tool_name != "apply_patch":
+        return
+    path = arguments.get("path")
+    if not isinstance(path, str):
+        return
+    allowed = context.orchestration_allowed_paths
+    if not any(path == root or path.startswith(root.rstrip("/") + "/") for root in allowed):
+        raise ToolError("apply_patch path is outside orchestration allowed_paths")

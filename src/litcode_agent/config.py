@@ -48,7 +48,9 @@ class Settings:
     max_reference_chars: int = 131_072
     max_session_reference_chars: int = 4_096
     command_policy: CommandPolicy = "confirm"
-    session_message_policy: CommandPolicy = "confirm"
+    session_read_policy: CommandPolicy = "allow"
+    session_send_policy: CommandPolicy = "confirm"
+    session_wake_policy: CommandPolicy = "confirm"
     read_roots: tuple[ReadRoot, ...] = ()
     session_database: Path | None = None
     hooks: HookSettings = HookSettings()
@@ -155,7 +157,14 @@ class Settings:
         )
         _reject_unknown_keys(
             permissions,
-            {"dangerousCommands", "sessionMessages", "readRoots"},
+            {
+                "dangerousCommands",
+                "sessionMessages",
+                "sessionRead",
+                "sessionSend",
+                "sessionWake",
+                "readRoots",
+            },
             "permissions",
         )
         _reject_unknown_keys(tools, {"command"}, "tools")
@@ -256,20 +265,35 @@ class Settings:
             raise ConfigurationError(
                 f"{policy_name} must be confirm, deny, or allow"
             )
-        session_policy_value = (
-            environ.get("LITCODE_SESSION_MESSAGE_POLICY")
-            if "LITCODE_SESSION_MESSAGE_POLICY" in environ
-            else permissions.get("sessionMessages", "confirm")
+        session_read_policy = _permission_policy(
+            environ,
+            "LITCODE_SESSION_READ_POLICY",
+            permissions,
+            "sessionRead",
+            "allow",
         )
-        if session_policy_value not in {"confirm", "deny", "allow"}:
-            session_policy_name = (
-                "LITCODE_SESSION_MESSAGE_POLICY"
-                if "LITCODE_SESSION_MESSAGE_POLICY" in environ
-                else "permissions.sessionMessages"
-            )
-            raise ConfigurationError(
-                f"{session_policy_name} must be confirm, deny, or allow"
-            )
+        send_environment_name = (
+            "LITCODE_SESSION_SEND_POLICY"
+            if "LITCODE_SESSION_SEND_POLICY" in environ
+            else "LITCODE_SESSION_MESSAGE_POLICY"
+        )
+        send_permission_name = (
+            "sessionSend" if "sessionSend" in permissions else "sessionMessages"
+        )
+        session_send_policy = _permission_policy(
+            environ,
+            send_environment_name,
+            permissions,
+            send_permission_name,
+            "confirm",
+        )
+        session_wake_policy = _permission_policy(
+            environ,
+            "LITCODE_SESSION_WAKE_POLICY",
+            permissions,
+            "sessionWake",
+            "confirm",
+        )
         disabled = raw.get("disableAllHooks", False)
         if not isinstance(disabled, bool):
             raise ConfigurationError("disableAllHooks must be a boolean")
@@ -292,7 +316,9 @@ class Settings:
             max_reference_chars=max_reference_chars,
             max_session_reference_chars=max_session_reference_chars,
             command_policy=cast(CommandPolicy, policy_value),
-            session_message_policy=cast(CommandPolicy, session_policy_value),
+            session_read_policy=session_read_policy,
+            session_send_policy=session_send_policy,
+            session_wake_policy=session_wake_policy,
             read_roots=read_roots,
             session_database=workspace / ".litcode" / "sessions.db",
             hooks=_parse_hooks(raw.get("hooks"), disabled),
@@ -318,7 +344,9 @@ class Settings:
             "max_reference_chars": self.max_reference_chars,
             "max_session_reference_chars": self.max_session_reference_chars,
             "command_policy": self.command_policy,
-            "session_message_policy": self.session_message_policy,
+            "session_read_policy": self.session_read_policy,
+            "session_send_policy": self.session_send_policy,
+            "session_wake_policy": self.session_wake_policy,
             "read_roots": [
                 {
                     "alias": root.alias,
@@ -331,6 +359,12 @@ class Settings:
             "hooks_enabled": not self.hooks.disabled,
             "hook_commands": self.hooks.count,
         }
+
+    @property
+    def session_message_policy(self) -> CommandPolicy:
+        """Backward-compatible name for the now-explicit send permission."""
+
+        return self.session_send_policy
 
 
 def _read_json_object(path: Path) -> dict[str, object]:
@@ -391,6 +425,28 @@ def _api_key_name(model_config: Mapping[str, object], profile: str) -> str:
         return validate_credential_name(configured or "OPENAI_API_KEY")
     except CredentialError as error:
         raise ConfigurationError(str(error)) from error
+
+
+def _permission_policy(
+    environ: Mapping[str, str],
+    environment_name: str,
+    permissions: Mapping[str, object],
+    permission_name: str,
+    default: CommandPolicy,
+) -> CommandPolicy:
+    value = (
+        environ.get(environment_name)
+        if environment_name in environ
+        else permissions.get(permission_name, default)
+    )
+    if value not in {"confirm", "deny", "allow"}:
+        source = (
+            environment_name
+            if environment_name in environ
+            else f"permissions.{permission_name}"
+        )
+        raise ConfigurationError(f"{source} must be confirm, deny, or allow")
+    return cast(CommandPolicy, value)
 
 
 def _parse_read_roots(workspace: Path, value: object) -> tuple[ReadRoot, ...]:

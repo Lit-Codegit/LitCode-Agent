@@ -21,6 +21,7 @@ from litcode_agent.skills import SkillCatalog
 from litcode_agent.tools.skills import LoadSkillTool
 
 if TYPE_CHECKING:
+    from litcode_agent.orchestration import OrchestrationService, OrchestrationTask
     from litcode_agent.session_store import SessionStore
 
 
@@ -30,6 +31,10 @@ def build_default_registry(
     skills: SkillCatalog | None = None,
     store: SessionStore | None = None,
     confirm_session_message: Callable[[str], bool] | None = None,
+    orchestrator: OrchestrationService | None = None,
+    on_orchestration_change: Callable[[OrchestrationTask], None] | None = None,
+    confirm_session_wake: Callable[[str], bool] | None = None,
+    confirm_session_read: Callable[[str], bool] | None = None,
 ) -> ToolRegistry:
     """Construct the complete MVP tool set from validated settings."""
 
@@ -66,15 +71,51 @@ def build_default_registry(
 
         tools.extend(
             [
-                ListSessionsTool(store, settings.workspace),
-                ReadSessionContextTool(store, settings.workspace),
+                ListSessionsTool(
+                    store,
+                    settings.workspace,
+                    settings.session_read_policy,
+                    confirm_session_read,
+                ),
+                ReadSessionContextTool(
+                    store,
+                    settings.workspace,
+                    settings.session_read_policy,
+                    confirm_session_read,
+                ),
                 SendSessionMessageTool(
                     store,
                     settings.workspace,
                     settings.session_message_policy,
                     confirm_session_message,
                 ),
-                ReadSessionInboxTool(store, settings.workspace),
+                ReadSessionInboxTool(
+                    store,
+                    settings.workspace,
+                    settings.session_read_policy,
+                    confirm_session_read,
+                ),
+            ]
+        )
+    if orchestrator is not None:
+        from litcode_agent.tools.orchestration import (
+            DelegateSessionTool,
+            FinishOrchestrationTool,
+            ListOrchestrationTool,
+            ReportTaskTool,
+        )
+
+        tools.extend(
+            [
+                DelegateSessionTool(
+                    orchestrator,
+                    on_orchestration_change,
+                    settings.session_wake_policy,
+                    confirm_session_wake,
+                ),
+                ReportTaskTool(orchestrator, on_orchestration_change),
+                ListOrchestrationTool(orchestrator),
+                FinishOrchestrationTool(orchestrator),
             ]
         )
     return ToolRegistry(tools)

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import threading
 from pathlib import Path
 
 from textual.widgets import Collapsible, Markdown, Static
+from textual.events import MouseScrollDown
 
 from litcode_agent.agent import AgentEvent
 from litcode_agent.config import Settings
@@ -42,11 +45,23 @@ def settings(tmp_path: Path) -> Settings:
     )
 
 
+def orchestration_settings(tmp_path: Path) -> Settings:
+    return Settings.from_env(
+        tmp_path,
+        {
+            "OPENAI_API_KEY": "secret",
+            "LITCODE_MODEL": "model-a",
+            "LITCODE_SESSION_WAKE_POLICY": "allow",
+        },
+    )
+
+
 def test_tui_mounts_status_timeline_and_fixed_prompt(tmp_path: Path) -> None:
     async def exercise() -> None:
         app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
         async with app.run_test(size=(120, 40)):
             header = str(app.query_one(".pane-header", Static).render())
+            assert header.startswith("1 ")
             assert "新会话" in header
             assert "model-a" in header
             assert app.store.session_info(app.session.session_id).alias not in header
@@ -55,6 +70,234 @@ def test_tui_mounts_status_timeline_and_fixed_prompt(tmp_path: Path) -> None:
             assert any(
                 "会话已启动" in str(widget.render())
                 for widget in app.query(".notice").results(Static)
+            )
+
+    asyncio.run(exercise())
+
+
+def test_closed_pane_releases_its_number_for_the_next_split(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(160, 44)) as pilot:
+            app.action_split("right")
+            app.action_split("down")
+            await pilot.pause()
+
+            assert app.active_pane_id == "pane-3"
+            app.action_close_pane()
+            await pilot.pause()
+            app.action_split("left")
+            await pilot.pause()
+
+            assert app.active_pane_id == "pane-3"
+            headers = [
+                str(widget.render())
+                for widget in app.query(".pane-header").results(Static)
+            ]
+            assert {header[0] for header in headers} == {"1", "2", "3"}
+
+    asyncio.run(exercise())
+
+
+def test_model_request_receives_current_terminal_and_pane_location(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        model = FakeModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(140, 40)) as pilot:
+            app.action_split("right")
+            await pilot.pause()
+            prompt = app.query_one(PromptArea)
+            prompt.text = "我在哪里"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if model.requests and not app.busy:
+                    break
+
+            runtime_messages = [
+                str(message["content"])
+                for message in model.requests[0]
+                if message["role"] == "system"
+            ]
+            assert any("当前 pane：2" in content for content in runtime_messages)
+            assert any(
+                app.sessions.terminal_id in content for content in runtime_messages
+            )
+            assert all(
+                "litcode_runtime_location" not in str(message["content"])
+                for message in app.session.messages
+            )
+
+    asyncio.run(exercise())
+
+
+def test_session_picker_focuses_an_already_mounted_pane(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(140, 40)) as pilot:
+            app.action_split("right")
+            await pilot.pause()
+            pane_two_session = app.session.session_id
+            app.action_focus_pane("left")
+
+            app._session_selected(pane_two_session)
+
+            assert app.active_pane_id == "pane-2"
+            assert app.session.session_id == pane_two_session
+            assert len(
+                [
+                    pane
+                    for pane in app.sessions.panes.values()
+                    if pane.session.session_id == pane_two_session
+                ]
+            ) == 1
+
+    asyncio.run(exercise())
+
+
+def test_hash_completion_lists_mounted_panes_in_numeric_order(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(140, 40)) as pilot:
+            first = app.session.session_id
+            app.action_split("right")
+            await pilot.pause()
+            second = app.session.session_id
+            prompt = app.query_one(PromptArea)
+            prompt.text = "#"
+            prompt.move_cursor(prompt.document.end)
+            app.refresh_completions()
+            await pilot.pause()
+
+            assert app.completion_values[:2] == [
+                app.store.session_info(first).alias,
+                app.store.session_info(second).alias,
+            ]
+
+    asyncio.run(exercise())
+
+
+def test_orchestration_command_drives_implementer_and_resumes_coordinator(
+    tmp_path: Path,
+) -> None:
+    class OrchestrationModel(FakeModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.target_alias = ""
+            self.run_id = ""
+
+        def complete(self, messages, tools):
+            self.requests.append(list(messages))
+            if messages[-1]["role"] == "tool":
+                return AssistantTurn("结构化步骤已提交。")
+            users = [
+                str(message["content"])
+                for message in messages
+                if message["role"] == "user"
+            ]
+            current = users[-1]
+            if "用户已批准 LitCode 受限编排" in current:
+                match = re.search(r"R-[0-9A-F]+", current)
+                assert match is not None
+                self.run_id = match.group(0)
+                return AssistantTurn(
+                    None,
+                    (
+                        ToolCall(
+                            "delegate",
+                            "delegate_session",
+                            json.dumps(
+                                {
+                                    "run_id": self.run_id,
+                                    "session": self.target_alias,
+                                    "role": "implementer",
+                                    "objective": "实现 parser",
+                                    "acceptance": ["测试通过"],
+                                    "allowed_paths": ["src/parser.py"],
+                                    "write_policy": "workspace-write",
+                                }
+                            ),
+                        ),
+                    ),
+                )
+            if "角色：implementer" in current:
+                task_match = re.search(r"T-[0-9A-F]+", current)
+                assert task_match is not None
+                return AssistantTurn(
+                    None,
+                    (
+                        ToolCall(
+                            "report",
+                            "report_task",
+                            json.dumps(
+                                {
+                                    "task_id": task_match.group(0),
+                                    "status": "completed",
+                                    "summary": "parser 已实现",
+                                    "evidence": ["pytest: 12 passed"],
+                                    "changed_files": ["src/parser.py"],
+                                }
+                            ),
+                        ),
+                    ),
+                )
+            if "已返回，状态：completed" in current:
+                return AssistantTurn(
+                    None,
+                    (
+                        ToolCall(
+                            "finish",
+                            "finish_orchestration",
+                            json.dumps(
+                                {
+                                    "run_id": self.run_id,
+                                    "status": "completed",
+                                    "summary": "实现证据充分",
+                                }
+                            ),
+                        ),
+                    ),
+                )
+            return AssistantTurn("无需操作。")
+
+    async def exercise() -> None:
+        model = OrchestrationModel()
+        app = LitCodeTUI(orchestration_settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(160, 44)) as pilot:
+            app.action_split("right")
+            await pilot.pause()
+            model.target_alias = app.store.session_info(app.session.session_id).alias
+            app.action_focus_pane("left")
+
+            app._handle_command("/orchestrate 实现并验证解析器")
+            for _ in range(300):
+                await pilot.pause(0.02)
+                if model.run_id and app.orchestrator.get_run(model.run_id).status == "completed":
+                    if not any(runtime.busy for runtime in app.panes.values()):
+                        break
+
+            assert app.orchestrator.get_run(model.run_id).status == "completed"
+            kinds = [
+                event.kind for event in app.orchestrator.ledger(model.run_id)
+            ]
+            assert kinds == [
+                "run_proposed",
+                "run_approved",
+                "task_queued",
+                "task_started",
+                "task_completed",
+                "coordinator_resumed",
+                "run_completed",
+            ]
+            assert any(
+                "当前 pane：2" in str(message["content"])
+                for request in model.requests
+                for message in request
+                if message["role"] == "system"
             )
 
     asyncio.run(exercise())
@@ -129,7 +372,7 @@ def test_ctrl_c_requires_second_press_to_exit(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
-def test_run_tui_leaves_mouse_to_terminal(
+def test_run_tui_enables_mouse_for_wheel_and_scrollbar(
     tmp_path: Path, monkeypatch
 ) -> None:
     options: dict[str, object] = {}
@@ -141,7 +384,37 @@ def test_run_tui_leaves_mouse_to_terminal(
     monkeypatch.setattr(LitCodeTUI, "run", fake_run)
 
     assert run_tui(settings(tmp_path), FakeModel()) == 0  # type: ignore[arg-type]
-    assert options == {"mouse": False}
+    assert options == {"mouse": True}
+
+
+def test_mouse_wheel_scrolls_each_split_timeline_independently(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 24)) as pilot:
+            app.action_split("right")
+            await pilot.pause()
+            for runtime in app.panes.values():
+                for number in range(40):
+                    app._append_notice(f"line {number}", runtime=runtime)
+            await pilot.pause()
+
+            for runtime in app.panes.values():
+                timeline = app._timeline(runtime)
+                assert timeline.max_scroll_y > 0
+                timeline.scroll_home(animate=False)
+                await pilot.pause()
+                before = timeline.scroll_y
+                timeline.post_message(
+                    MouseScrollDown(
+                        timeline, 1, 1, 0, 1, 0, False, False, False
+                    )
+                )
+                await pilot.pause()
+                assert timeline.scroll_y > before
+
+    asyncio.run(exercise())
 
 
 def test_tui_explains_portable_split_shortcut_on_start(tmp_path: Path) -> None:

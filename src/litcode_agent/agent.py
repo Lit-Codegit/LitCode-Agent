@@ -90,6 +90,11 @@ class Agent:
         store: SessionStore | None = None,
         model_name: str = "unknown",
         workspace: Path | None = None,
+        runtime_context: Callable[[], str] | None = None,
+        tool_context: Callable[[str], ToolExecutionContext] | None = None,
+        origin_terminal_id: str | None = None,
+        origin_pane_slot: int | None = None,
+        before_model_request: Callable[[str], None] | None = None,
     ) -> None:
         if max_iterations <= 0:
             raise ValueError("max_iterations must be positive")
@@ -102,6 +107,11 @@ class Agent:
         self.store = store
         self.model_name = model_name
         self.workspace = workspace.resolve() if workspace is not None else None
+        self.runtime_context = runtime_context
+        self.tool_context = tool_context
+        self.origin_terminal_id = origin_terminal_id
+        self.origin_pane_slot = origin_pane_slot
+        self.before_model_request = before_model_request
 
     def start_session(self, session_id: str | None = None) -> AgentSession:
         """创建一段保留消息历史的交互会话。"""
@@ -168,6 +178,8 @@ class AgentSession:
                 self.session_id = agent.store.create(
                     agent._workspace(), agent.model_name, self.messages,
                     session_id=self.session_id,
+                    origin_terminal_id=agent.origin_terminal_id,
+                    origin_pane_slot=agent.origin_pane_slot,
                 )
         saved_summary = agent.store.summary(self.session_id) if agent.store else None
         self.summary = saved_summary
@@ -268,6 +280,8 @@ class AgentSession:
         iteration: int,
         cancelled: Callable[[], bool],
     ) -> tuple[AssistantTurn, bool]:
+        if self.agent.before_model_request is not None:
+            self.agent.before_model_request(self.session_id)
         stream = getattr(self.agent.model, "stream", None)
         if not callable(stream):
             turn = self.agent.model.complete(
@@ -414,7 +428,13 @@ class AgentSession:
             else self.agent.tools.execute_json(
                 tool_call.name,
                 tool_call.arguments,
-                ToolExecutionContext(self.session_id, self.agent._workspace()),
+                (
+                    self.agent.tool_context(self.session_id)
+                    if self.agent.tool_context is not None
+                    else ToolExecutionContext(
+                        self.session_id, self.agent._workspace()
+                    )
+                ),
             )
         )
         self._append_message(
@@ -483,15 +503,31 @@ class AgentSession:
 
     def _model_messages(self) -> list[Message]:
         if self.summary is None:
-            return list(self.messages)
-        summary, boundary = self.summary
+            messages = list(self.messages)
+        else:
+            summary, boundary = self.summary
+            messages = [
+                self.messages[0],
+                {
+                    "role": "user",
+                    "content": "以下是此前会话的受信压缩摘要：\n\n" + summary,
+                },
+                *self.messages[boundary + 1 :],
+            ]
+        if self.agent.runtime_context is None:
+            return messages
+        runtime = self.agent.runtime_context()
         return [
-            self.messages[0],
+            messages[0],
             {
-                "role": "user",
-                "content": "以下是此前会话的受信压缩摘要：\n\n" + summary,
+                "role": "system",
+                "content": (
+                    "<litcode_runtime_location>\n"
+                    f"{runtime}\n"
+                    "</litcode_runtime_location>"
+                ),
             },
-            *self.messages[boundary + 1 :],
+            *messages[1:],
         ]
 
     def compact(self, instructions: str = "") -> str:

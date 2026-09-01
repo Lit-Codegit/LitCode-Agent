@@ -21,6 +21,8 @@ def test_loads_and_normalizes_settings(tmp_path: Path) -> None:
             "LITCODE_MAX_SESSION_REFERENCE_CHARS": "4096",
             "LITCODE_COMMAND_POLICY": "deny",
             "LITCODE_SESSION_MESSAGE_POLICY": "allow",
+            "LITCODE_SESSION_READ_POLICY": "deny",
+            "LITCODE_SESSION_WAKE_POLICY": "allow",
         },
     )
 
@@ -35,6 +37,9 @@ def test_loads_and_normalizes_settings(tmp_path: Path) -> None:
     assert settings.max_session_reference_chars == 4096
     assert settings.command_policy == "deny"
     assert settings.session_message_policy == "allow"
+    assert settings.session_read_policy == "deny"
+    assert settings.session_send_policy == "allow"
+    assert settings.session_wake_policy == "allow"
 
 
 def test_uses_safe_defaults(tmp_path: Path) -> None:
@@ -51,6 +56,9 @@ def test_uses_safe_defaults(tmp_path: Path) -> None:
     assert settings.max_session_reference_chars == 4096
     assert settings.command_policy == "confirm"
     assert settings.session_message_policy == "confirm"
+    assert settings.session_read_policy == "allow"
+    assert settings.session_send_policy == "confirm"
+    assert settings.session_wake_policy == "confirm"
 
 
 @pytest.mark.parametrize("missing", ["OPENAI_API_KEY", "LITCODE_MODEL"])
@@ -73,6 +81,8 @@ def test_requires_model_credentials(tmp_path: Path, missing: str) -> None:
         ("LITCODE_MAX_SESSION_REFERENCE_CHARS", "0"),
         ("LITCODE_COMMAND_POLICY", "sometimes"),
         ("LITCODE_SESSION_MESSAGE_POLICY", "sometimes"),
+        ("LITCODE_SESSION_READ_POLICY", "sometimes"),
+        ("LITCODE_SESSION_WAKE_POLICY", "sometimes"),
     ],
 )
 def test_rejects_invalid_limits(tmp_path: Path, name: str, value: str) -> None:
@@ -96,6 +106,31 @@ def test_safe_summary_never_contains_api_key(tmp_path: Path) -> None:
 
     assert "do-not-print" not in repr(summary)
     assert summary["api_key_configured"] is True
+
+
+def test_loads_separate_session_read_send_and_wake_policies(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".litcode"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "permissions": {
+                    "sessionRead": "deny",
+                    "sessionSend": "allow",
+                    "sessionWake": "deny",
+                }
+            }
+        )
+    )
+
+    settings = Settings.load(
+        tmp_path,
+        {"OPENAI_API_KEY": "secret", "LITCODE_MODEL": "model"},
+    )
+
+    assert settings.session_read_policy == "deny"
+    assert settings.session_send_policy == "allow"
+    assert settings.session_wake_policy == "deny"
 
 
 def test_rejects_per_file_reference_limit_above_total(tmp_path: Path) -> None:

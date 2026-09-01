@@ -26,36 +26,51 @@ class ListSessionsTool:
         "additionalProperties": False,
     }
 
-    def __init__(self, store: SessionStore, workspace: Path) -> None:
+    def __init__(
+        self,
+        store: SessionStore,
+        workspace: Path,
+        policy: CommandPolicy = "allow",
+        confirm: ConfirmSessionMessage | None = None,
+    ) -> None:
         self.store = store
         self.workspace = workspace.resolve()
+        self.policy = policy
+        self.confirm = confirm
 
     def execute_with_context(
         self, arguments: Mapping[str, object], context: ToolExecutionContext
     ) -> ToolResult:
         _check_workspace(self.workspace, context)
+        _authorize_read(self.policy, self.confirm, "列出当前工作区的会话元数据")
         query = arguments.get("query", "")
         limit = arguments.get("limit", 20)
         if not isinstance(query, str):
             raise ToolError("query must be a string")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
             raise ToolError("limit must be between 1 and 50")
-        needle = query.casefold()
-        rows = [
-            item
-            for item in self.store.list_sessions(self.workspace, limit=50)
-            if not needle
-            or needle in item.alias.casefold()
-            or needle in item.title.casefold()
-        ][:limit]
+        rows = self.store.session_catalog(
+            self.workspace,
+            current_terminal_id=context.terminal_id,
+            mounted=dict(context.mounted_sessions),
+            query=query,
+            limit=limit,
+        )
         return ToolResult(
             json.dumps(
                 [
                     {
-                        "alias": item.alias,
-                        "title": item.title,
-                        "model": item.model,
-                        "updated_at": item.updated_at,
+                        "alias": item.info.alias,
+                        "title": item.info.title,
+                        "model": item.info.model,
+                        "updated_at": item.info.updated_at,
+                        "scope": item.scope,
+                        "terminal": (
+                            context.terminal_id
+                            if item.scope in {"mounted", "current_terminal"}
+                            else None
+                        ),
+                        "pane": item.pane_slot,
                     }
                     for item in rows
                 ],
@@ -80,14 +95,23 @@ class ReadSessionContextTool:
         "additionalProperties": False,
     }
 
-    def __init__(self, store: SessionStore, workspace: Path) -> None:
+    def __init__(
+        self,
+        store: SessionStore,
+        workspace: Path,
+        policy: CommandPolicy = "allow",
+        confirm: ConfirmSessionMessage | None = None,
+    ) -> None:
         self.store = store
         self.workspace = workspace.resolve()
+        self.policy = policy
+        self.confirm = confirm
 
     def execute_with_context(
         self, arguments: Mapping[str, object], context: ToolExecutionContext
     ) -> ToolResult:
         _check_workspace(self.workspace, context)
+        _authorize_read(self.policy, self.confirm, "读取另一会话的局部上下文")
         alias = _string(arguments, "session")
         query = _string(arguments, "query")
         max_chars = arguments.get("max_chars", 2000)
@@ -167,14 +191,23 @@ class ReadSessionInboxTool:
         "additionalProperties": False,
     }
 
-    def __init__(self, store: SessionStore, workspace: Path) -> None:
+    def __init__(
+        self,
+        store: SessionStore,
+        workspace: Path,
+        policy: CommandPolicy = "allow",
+        confirm: ConfirmSessionMessage | None = None,
+    ) -> None:
         self.store = store
         self.workspace = workspace.resolve()
+        self.policy = policy
+        self.confirm = confirm
 
     def execute_with_context(
         self, arguments: Mapping[str, object], context: ToolExecutionContext
     ) -> ToolResult:
         _check_workspace(self.workspace, context)
+        _authorize_read(self.policy, self.confirm, "读取当前会话的跨会话 inbox")
         mark_read = arguments.get("mark_read", True)
         if not isinstance(mark_read, bool):
             raise ToolError("mark_read must be a boolean")
@@ -205,3 +238,14 @@ def _string(arguments: Mapping[str, object], name: str) -> str:
 def _check_workspace(workspace: Path, context: ToolExecutionContext) -> None:
     if context.workspace.resolve() != workspace:
         raise ToolError("tool context does not match the configured workspace")
+
+
+def _authorize_read(
+    policy: CommandPolicy,
+    confirm: ConfirmSessionMessage | None,
+    description: str,
+) -> None:
+    if policy == "deny":
+        raise ToolError("session reading is denied by policy")
+    if policy == "confirm" and (confirm is None or not confirm(description)):
+        raise ToolError("session reading was not approved")

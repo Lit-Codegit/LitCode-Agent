@@ -66,6 +66,45 @@ def test_existing_database_is_backfilled_with_aliases(tmp_path: Path) -> None:
     info = store.session_info("legacy-id")
     assert info.alias == "700101-0800-" + info.alias[-3:]
     assert len(info.alias) == 15
+    assert info.origin_terminal_id is None
+    assert info.origin_pane_slot is None
+
+
+def test_session_catalog_prioritizes_mounted_then_current_terminal(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    historical = store.create(
+        tmp_path, "model", [], origin_terminal_id="T-OLD", origin_pane_slot=1
+    )
+    local = store.create(
+        tmp_path, "model", [], origin_terminal_id="T-NOW", origin_pane_slot=3
+    )
+    pane_two = store.create(
+        tmp_path, "model", [], origin_terminal_id="T-OLD", origin_pane_slot=4
+    )
+    pane_one = store.create(
+        tmp_path, "model", [], origin_terminal_id="T-NOW", origin_pane_slot=2
+    )
+
+    catalog = store.session_catalog(
+        tmp_path,
+        current_terminal_id="T-NOW",
+        mounted={pane_two: 2, pane_one: 1},
+    )
+
+    assert [entry.info.id for entry in catalog] == [
+        pane_one,
+        pane_two,
+        local,
+        historical,
+    ]
+    assert [(entry.scope, entry.pane_slot) for entry in catalog] == [
+        ("mounted", 1),
+        ("mounted", 2),
+        ("current_terminal", None),
+        ("history", None),
+    ]
 
 
 def test_builds_bounded_session_capsule_in_same_workspace(tmp_path: Path) -> None:
