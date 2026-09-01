@@ -41,7 +41,7 @@ class Settings:
     base_url: str | None = None
     api_key_env: str = "OPENAI_API_KEY"
     api_key_source: str = "environment"
-    max_iterations: int = 20
+    max_iterations: int = 60
     command_timeout_seconds: float = 30.0
     max_output_chars: int = 20_000
     max_reference_file_chars: int = 32_768
@@ -209,7 +209,7 @@ class Settings:
             "LITCODE_MAX_ITERATIONS",
             agent_config.get("maxIterations"),
             "agent.maxIterations",
-            20,
+            60,
         )
         max_output_chars = _environment_or_positive_int(
             environ,

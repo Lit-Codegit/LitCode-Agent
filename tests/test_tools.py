@@ -23,7 +23,6 @@ from litcode_agent.tools.base import ToolError, ToolExecutionContext
 from litcode_agent.tools.command import is_dangerous_command
 from litcode_agent.tools.files import truncate_output
 from litcode_agent.session_store import SessionStore
-from litcode_agent.orchestration import OrchestrationService
 
 
 def test_workspace_rejects_parent_traversal(tmp_path: Path) -> None:
@@ -204,6 +203,7 @@ def test_default_registry_contains_core_and_progressive_context_tools(tmp_path: 
         "apply_patch",
         "run_command",
         "load_skill",
+        "ask_user",
     }
 
 
@@ -337,99 +337,6 @@ def test_list_sessions_exposes_same_terminal_pane_locations(tmp_path: Path) -> N
         ("mounted", 1),
         ("mounted", 2),
     ]
-
-
-def test_orchestration_tools_bind_source_and_reporter_to_runtime_identity(
-    tmp_path: Path,
-) -> None:
-    store = SessionStore(tmp_path / "sessions.db")
-    coordinator = store.create(tmp_path, "model", [])
-    implementer = store.create(tmp_path, "model", [])
-    service = OrchestrationService(store, tmp_path)
-    run = service.start_run(coordinator, "实现功能")
-    service.approve_run(run.id, coordinator)
-    settings = Settings.from_env(
-        tmp_path,
-        {
-            "OPENAI_API_KEY": "secret",
-            "LITCODE_MODEL": "model",
-            "LITCODE_SESSION_WAKE_POLICY": "allow",
-        },
-    )
-    registry = build_default_registry(
-        settings, store=store, orchestrator=service
-    )
-
-    delegated = registry.execute_json(
-        "delegate_session",
-        json.dumps(
-            {
-                "run_id": run.id,
-                "session": store.session_info(implementer).alias,
-                "role": "implementer",
-                "objective": "修改 parser",
-                "acceptance": ["测试通过"],
-                "allowed_paths": ["src/parser.py"],
-                "write_policy": "workspace-write",
-            }
-        ),
-        ToolExecutionContext(coordinator, tmp_path.resolve()),
-    )
-    task_id = json.loads(delegated.content)["task_id"]
-    service.start_task(task_id, implementer)
-    reported = registry.execute_json(
-        "report_task",
-        json.dumps(
-            {
-                "task_id": task_id,
-                "status": "completed",
-                "summary": "完成",
-                "evidence": ["pytest passed"],
-                "changed_files": ["src/parser.py"],
-            }
-        ),
-        ToolExecutionContext(implementer, tmp_path.resolve()),
-    )
-
-    assert not delegated.is_error
-    assert not reported.is_error
-    assert service.get_task(task_id).source_session_id == coordinator
-    assert service.get_task(task_id).target_session_id == implementer
-
-
-def test_orchestration_role_policy_blocks_reviewer_writes_and_path_escape(
-    tmp_path: Path,
-) -> None:
-    settings = Settings.from_env(
-        tmp_path,
-        {"OPENAI_API_KEY": "secret", "LITCODE_MODEL": "model"},
-    )
-    registry = build_default_registry(settings)
-
-    reviewer = registry.execute_json(
-        "apply_patch",
-        json.dumps({"path": "review.txt", "old_text": "", "new_text": "x"}),
-        ToolExecutionContext(
-            "reviewer",
-            tmp_path.resolve(),
-            orchestration_role="reviewer",
-            orchestration_write_policy="none",
-        ),
-    )
-    outside_scope = registry.execute_json(
-        "apply_patch",
-        json.dumps({"path": "other.py", "old_text": "", "new_text": "x"}),
-        ToolExecutionContext(
-            "implementer",
-            tmp_path.resolve(),
-            orchestration_role="implementer",
-            orchestration_write_policy="workspace-write",
-            orchestration_allowed_paths=("src/parser.py",),
-        ),
-    )
-
-    assert reviewer.is_error and "reviewer" in reviewer.content
-    assert outside_scope.is_error and "allowed_paths" in outside_scope.content
 
 
 def test_session_context_tool_returns_query_bounded_excerpt(tmp_path: Path) -> None:

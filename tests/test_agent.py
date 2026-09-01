@@ -55,7 +55,7 @@ def test_agent_returns_direct_model_answer() -> None:
     assert result.succeeded
     assert result.output == "Done"
     assert result.iterations == 1
-    assert model.requests[0][1] == {"role": "user", "content": "Fix it"}
+    assert model.requests[0][-1] == {"role": "user", "content": "Fix it"}
 
 
 def test_session_keeps_context_across_user_turns() -> None:
@@ -68,12 +68,16 @@ def test_session_keeps_context_across_user_turns() -> None:
 
     assert first.output == "第一次回答"
     assert second.output == "第二次回答"
-    assert model.requests[1] == [
-        {"role": "system", "content": model.requests[0][0]["content"]},
-        {"role": "user", "content": "第一个问题"},
-        {"role": "assistant", "content": "第一次回答"},
-        {"role": "user", "content": "继续说明"},
-    ]
+    assert model.requests[1][0]["role"] == "system"
+    budget = model.requests[1][1]
+    assert budget["role"] == "system"
+    assert "litcode_iteration_budget" in budget["content"]
+    assert "已用 0 / 上限 3，剩余 3" in budget["content"]
+    assert model.requests[1][-2] == {
+        "role": "assistant",
+        "content": "第一次回答",
+    }
+    assert model.requests[1][-1] == {"role": "user", "content": "继续说明"}
 
 
 def test_closed_session_rejects_new_turn() -> None:
@@ -162,13 +166,72 @@ def test_agent_stops_at_iteration_limit() -> None:
             AssistantTurn(None, (ToolCall(str(index), "echo", '{"text":"x"}'),))
             for index in range(2)
         ]
+        + [AssistantTurn("收尾结论")]
     )
 
     result = Agent(model, ToolRegistry([EchoTool()]), 2).run("Keep going")
 
     assert result.reason == "max_iterations"
+    assert result.output == "收尾结论"
     assert result.iterations == 2
-    assert len(model.requests) == 2
+    assert len(model.requests) == 3
+    sealed = model.requests[-1][1]["content"]
+    assert "收尾轮" in sealed
+    assert "不要调用工具" in sealed
+
+
+def test_agent_wrap_up_ignores_tool_calls_and_keeps_history_consistent() -> None:
+    model = FakeModel(
+        [
+            AssistantTurn(None, (ToolCall("a", "echo", '{"text":"x"}'),)),
+            AssistantTurn(None, (ToolCall("b", "echo", '{"text":"y"}'),)),
+            AssistantTurn(None, (ToolCall("late", "echo", '{"text":"z"}'),)),
+        ]
+    )
+
+    result = Agent(model, ToolRegistry([EchoTool()]), 2).run("Keep going")
+
+    assert result.reason == "max_iterations"
+    assert "没有返回收尾内容" in result.output
+    assert model.requests[-1][1]["content"].startswith("<litcode_iteration_budget>")
+    assert result.messages[-1] == {
+        "role": "assistant",
+        "content": result.output,
+    }
+
+
+def test_agent_warns_when_budget_is_nearly_exhausted() -> None:
+    model = FakeModel(
+        [
+            AssistantTurn(None, (ToolCall(str(index), "echo", '{"text":"x"}'),))
+            for index in range(4)
+        ]
+        + [AssistantTurn("收尾")]
+    )
+
+    result = Agent(model, ToolRegistry([EchoTool()]), 4).run("Keep going")
+
+    assert result.reason == "max_iterations"
+    assert result.output == "收尾"
+    first_round = next(
+        message["content"]
+        for message in model.requests[0]
+        if message.get("role") == "system"
+        and "litcode_iteration_budget" in message["content"]
+    )
+    assert "已用 0 / 上限 4，剩余 4" in first_round
+    third_round = next(
+        message["content"]
+        for message in model.requests[2]
+        if message.get("role") == "system"
+        and "litcode_iteration_budget" in message["content"]
+    )
+    assert "已用 2 / 上限 4，剩余 2" in third_round
+    assert any(
+        "预算接近耗尽" in message["content"]
+        for message in model.requests[3]
+        if message.get("role") == "system"
+    )
 
 
 def test_agent_reports_empty_model_response() -> None:
@@ -260,7 +323,11 @@ def test_session_compaction_keeps_raw_history_and_changes_model_view(
 
     assert summary == "压缩摘要"
     assert store.load(session.session_id)[1]["content"] == "第一个问题"
-    assert "受信压缩摘要" in model.requests[-1][1]["content"]
+    assert any(
+        "受信压缩摘要" in message["content"]
+        for message in model.requests[-1]
+        if message.get("role") == "user"
+    )
     assert model.requests[-1][-1]["content"] == "继续"
 
 

@@ -48,7 +48,7 @@ def test_uses_safe_defaults(tmp_path: Path) -> None:
         {"OPENAI_API_KEY": "secret", "LITCODE_MODEL": "example-model"},
     )
 
-    assert settings.max_iterations == 20
+    assert settings.max_iterations == 60
     assert settings.command_timeout_seconds == 30.0
     assert settings.max_output_chars == 20_000
     assert settings.max_reference_file_chars == 32_768

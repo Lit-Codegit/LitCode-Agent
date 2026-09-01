@@ -27,6 +27,7 @@ class ScriptedCodingModel:
             "apply_patch",
             "run_command",
             "load_skill",
+            "ask_user",
         }
         assert {
             schema["function"]["name"]  # type: ignore[index]

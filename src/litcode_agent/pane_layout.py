@@ -19,6 +19,7 @@ class PaneBranch:
     axis: Axis
     first: PaneNode
     second: PaneNode
+    ratio: float = 0.5
 
 
 PaneNode = PaneLeaf | PaneBranch
@@ -61,7 +62,7 @@ class PaneLayout:
                     else PaneBranch(axis, node, new)
                 )
                 return replacement
-            return PaneBranch(node.axis, replace(node.first), replace(node.second))
+            return PaneBranch(node.axis, replace(node.first), replace(node.second), node.ratio)
 
         self.root = replace(self.root)
         if replacement is None:
@@ -80,13 +81,85 @@ class PaneLayout:
                 return second
             if second is None:
                 return first
-            return PaneBranch(node.axis, first, second)
+            return PaneBranch(node.axis, first, second, node.ratio)
 
         updated = remove(self.root)
         if updated == self.root:
             raise KeyError(pane_id)
         assert updated is not None
         self.root = updated
+
+    def set_ratio(self, pane_id: str, ratio: float) -> None:
+        """Resize the nearest divider containing ``pane_id``."""
+
+        if not 0.1 <= ratio <= 0.9:
+            raise ValueError("pane ratio must be between 0.1 and 0.9")
+        changed = False
+
+        def contains(node: PaneNode, target: str) -> bool:
+            if isinstance(node, PaneLeaf):
+                return node.pane_id == target
+            return contains(node.first, target) or contains(node.second, target)
+
+        def update(node: PaneNode) -> PaneNode:
+            nonlocal changed
+            if isinstance(node, PaneLeaf):
+                return node
+            if contains(node.first, pane_id):
+                child = update(node.first)
+                if changed:
+                    return PaneBranch(node.axis, child, node.second, node.ratio)
+                changed = True
+                return PaneBranch(node.axis, node.first, node.second, ratio)
+            if contains(node.second, pane_id):
+                child = update(node.second)
+                if changed:
+                    return PaneBranch(node.axis, node.first, child, node.ratio)
+                changed = True
+                return PaneBranch(node.axis, node.first, node.second, ratio)
+            return node
+
+        self.root = update(self.root)
+        if not changed:
+            raise KeyError(pane_id)
+
+    def resize(self, pane_id: str, delta: float) -> None:
+        """Move the nearest divider by a fractional delta."""
+
+        if not -0.8 <= delta <= 0.8:
+            raise ValueError("pane resize delta is out of range")
+
+        def contains(node: PaneNode, target: str) -> bool:
+            if isinstance(node, PaneLeaf):
+                return node.pane_id == target
+            return contains(node.first, target) or contains(node.second, target)
+
+        if pane_id not in self.pane_ids():
+            raise KeyError(pane_id)
+
+        changed = False
+
+        def update(node: PaneNode) -> PaneNode:
+            nonlocal changed
+            if isinstance(node, PaneLeaf):
+                return node
+            if contains(node.first, pane_id):
+                child = update(node.first)
+                if changed:
+                    return PaneBranch(node.axis, child, node.second, node.ratio)
+                changed = True
+                ratio = max(0.1, min(0.9, node.ratio + delta))
+                return PaneBranch(node.axis, node.first, node.second, ratio)
+            if contains(node.second, pane_id):
+                child = update(node.second)
+                if changed:
+                    return PaneBranch(node.axis, node.first, child, node.ratio)
+                changed = True
+                ratio = max(0.1, min(0.9, node.ratio - delta))
+                return PaneBranch(node.axis, node.first, node.second, ratio)
+            return node
+
+        self.root = update(self.root)
 
     def focus_from(self, pane_id: str, direction: Direction) -> str | None:
         rectangles = _rectangles(self.root)
@@ -119,11 +192,11 @@ def _rectangles(root: PaneNode) -> dict[str, Rect]:
             return
         left, top, right, bottom = rect
         if node.axis == "horizontal":
-            middle = (left + right) / 2
+            middle = left + (right - left) * node.ratio
             visit(node.first, (left, top, middle, bottom))
             visit(node.second, (middle, top, right, bottom))
         else:
-            middle = (top + bottom) / 2
+            middle = top + (bottom - top) * node.ratio
             visit(node.first, (left, top, right, middle))
             visit(node.second, (left, middle, right, bottom))
 

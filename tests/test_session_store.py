@@ -1,5 +1,6 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import time
 
 import pytest
 
@@ -219,6 +220,47 @@ def test_session_store_serializes_concurrent_inbox_writes(tmp_path: Path) -> Non
 
     assert len({message.id for message in delivered}) == 40
     assert len(store.inbox(target)) == 40
+    queued = store.queue(target, include_finished=True)
+    assert {item.content for item in queued} == {
+        f"message-{number}" for number in range(40)
+    }
+    assert [item.sequence for item in queued] == sorted(
+        item.sequence for item in queued
+    )
+
+
+def test_session_actor_fields_and_reference_resolution_are_persistent(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "sessions.db"
+    store = SessionStore(database)
+    parent = store.create(tmp_path, "model", [], profile="explore", paused=True)
+    child = store.create_child(parent, "model", [], profile="explore")
+    child_info = store.session_info(child)
+
+    assert child_info.parent_id == parent
+    assert child_info.profile == "explore"
+    assert store.session_id_for_reference(tmp_path, child) == child
+    assert store.session_id_for_reference(tmp_path, child_info.alias) == child
+    assert store.session_tree(tmp_path)[-1][1].id == child
+
+    store.close()
+    reopened = SessionStore(database)
+    assert reopened.session_info(parent).paused
+    assert reopened.session_info(parent).status == "paused"
+
+
+def test_session_tree_orders_by_most_recent_use(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    first = store.create(tmp_path, "model-a", [], title="较早")
+    second = store.create(tmp_path, "model-a", [], title="较晚")
+    time.sleep(0.01)
+    store.set_session_state(first, status="idle", activity="再次使用")
+
+    roots = [info for _, info in store.session_tree(tmp_path)]
+    assert roots[0].id == first
+    assert roots[1].id == second
+    store.close()
 
 
 def test_inbox_is_visible_across_independent_store_connections(
@@ -290,3 +332,28 @@ def test_file_rewind_refuses_to_overwrite_a_later_user_edit(tmp_path: Path) -> N
         store.restore_files(session_id, 0, Workspace(tmp_path))
 
     assert target.read_text(encoding="utf-8") == "user edit"
+
+
+def test_user_can_reorder_and_cancel_only_queued_messages(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session_id = store.create(tmp_path, "model", [])
+    first = store.enqueue_message(session_id, "first")
+    second = store.enqueue_message(session_id, "second")
+    third = store.enqueue_message(session_id, "third")
+
+    store.reorder_queued_message(session_id, third.id, first.id)
+    assert [item.content for item in store.queue(session_id)] == [
+        "third",
+        "first",
+        "second",
+    ]
+    store.move_queued_message(session_id, third.id, 1)
+    assert [item.content for item in store.queue(session_id)] == [
+        "first",
+        "third",
+        "second",
+    ]
+    store.cancel_queued_message(second.id)
+    assert [item.content for item in store.queue(session_id)] == ["first", "third"]
+    with pytest.raises(ValueError, match="only a queued"):
+        store.cancel_queued_message(second.id)

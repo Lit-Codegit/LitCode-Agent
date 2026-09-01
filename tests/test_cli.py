@@ -110,7 +110,7 @@ def test_run_wires_configuration_model_tools_and_agent(
 ) -> None:
     class FakeModel:
         def complete(self, messages, tools):
-            assert len(tools) == 6
+            assert len(tools) == 7
             return AssistantTurn("Task complete")
 
     monkeypatch.setenv("OPENAI_API_KEY", "secret")

@@ -19,7 +19,7 @@ from litcode_agent.model import (
     ModelError,
     ToolCall,
 )
-from litcode_agent.tools.base import ToolResult
+from litcode_agent.tools.base import FileChange, ToolResult
 from litcode_agent.tools.base import ToolExecutionContext
 from litcode_agent.tools.registry import ToolRegistry
 from litcode_agent.session_store import Checkpoint, SessionStore
@@ -33,6 +33,14 @@ precise edits, and run appropriate verification. Treat tool errors as feedback:
 correct the request and try again. Never claim that a command or test succeeded
 unless its tool result says so. When the task is complete, respond with a concise
 summary of changes, tests run, and any remaining limitations.
+
+When a genuine user decision shapes the direction of your work, ask the user
+with the ask_user tool instead of guessing: clarify ambiguous instructions,
+gather preferences, or get an explicit choice between approaches. Wait for the
+answer before acting on it. Ask the minimum number of questions and prefer
+providing a recommended option first with "(Recommended)" appended to its label.
+Do not use the tool for trivia you can resolve yourself; if the user rejects a
+question, adapt by choosing the best default and continue.
 """
 
 TerminationReason = Literal[
@@ -59,6 +67,7 @@ class AgentEvent:
     hook_execution: HookExecution | None = None
     content: str | None = None
     is_error: bool = False
+    file_change: FileChange | None = None
     has_tool_calls: bool = False
     session_id: str | None = None
 
@@ -94,7 +103,6 @@ class Agent:
         tool_context: Callable[[str], ToolExecutionContext] | None = None,
         origin_terminal_id: str | None = None,
         origin_pane_slot: int | None = None,
-        before_model_request: Callable[[str], None] | None = None,
     ) -> None:
         if max_iterations <= 0:
             raise ValueError("max_iterations must be positive")
@@ -111,7 +119,6 @@ class Agent:
         self.tool_context = tool_context
         self.origin_terminal_id = origin_terminal_id
         self.origin_pane_slot = origin_pane_slot
-        self.before_model_request = before_model_request
 
     def start_session(self, session_id: str | None = None) -> AgentSession:
         """创建一段保留消息历史的交互会话。"""
@@ -269,23 +276,42 @@ class AgentSession:
                     return self._cancelled(iteration)
                 self._execute_tool(tool_call, iteration)
 
-        return self._finish_turn(task, self._result(
-            f"Stopped after reaching the {self.agent.max_iterations}-iteration limit.",
-            "max_iterations",
-            self.agent.max_iterations,
-        ))
+        # Budget exhausted while the model was still working: one sealed
+        # final round lets it deliver a wrap-up instead of stopping silent.
+        return self._finish_turn(task, self._wrap_up(cancelled))
+
+    def _wrap_up(self, cancelled: Callable[[], bool]) -> AgentResult:
+        if cancelled():
+            return self._cancelled(self.agent.max_iterations)
+        iteration = self.agent.max_iterations + 1
+        self.agent.event_sink(
+            AgentEvent(
+                kind="model_start",
+                iteration=iteration,
+                session_id=self.session_id,
+            )
+        )
+        turn, stream_cancelled = self._request_model(iteration, cancelled, sealed=True)
+        if stream_cancelled or cancelled():
+            return self._cancelled(iteration)
+        content = (turn.content or "").strip() or (
+            "迭代预算已耗尽，但模型没有返回收尾内容；"
+            "可继续追问或使用 /compact 压缩上下文。"
+        )
+        self._append_message({"role": "assistant", "content": content})
+        return self._result(content, "max_iterations", self.agent.max_iterations)
 
     def _request_model(
         self,
         iteration: int,
         cancelled: Callable[[], bool],
+        *,
+        sealed: bool = False,
     ) -> tuple[AssistantTurn, bool]:
-        if self.agent.before_model_request is not None:
-            self.agent.before_model_request(self.session_id)
         stream = getattr(self.agent.model, "stream", None)
         if not callable(stream):
             turn = self.agent.model.complete(
-                self._model_messages(), self.agent.tools.schemas()
+                self._model_messages(iteration, sealed=sealed), self.agent.tools.schemas()
             )
             self.agent.event_sink(
                 AgentEvent(
@@ -304,7 +330,7 @@ class AgentSession:
         pending_text: list[str] = []
         last_flush = 0.0
         stream_cancelled = False
-        deltas = stream(self._model_messages(), self.agent.tools.schemas())
+        deltas = stream(self._model_messages(iteration, sealed=sealed), self.agent.tools.schemas())
         try:
             for delta in deltas:
                 if cancelled():
@@ -472,6 +498,7 @@ class AgentSession:
                 tool_call=tool_call,
                 content=result.content,
                 is_error=result.is_error,
+                file_change=result.file_change,
                 session_id=self.session_id,
             )
         )
@@ -501,7 +528,9 @@ class AgentSession:
             self.agent.store.add_checkpoint(self.session_id, title, self.messages)
         return result
 
-    def _model_messages(self) -> list[Message]:
+    def _model_messages(
+        self, iteration: int | None = None, *, sealed: bool = False
+    ) -> list[Message]:
         if self.summary is None:
             messages = list(self.messages)
         else:
@@ -514,21 +543,51 @@ class AgentSession:
                 },
                 *self.messages[boundary + 1 :],
             ]
+        budget = self._budget_note(iteration, sealed=sealed) if iteration else None
         if self.agent.runtime_context is None:
-            return messages
+            if budget is None:
+                return messages
+            return [
+                messages[0],
+                {"role": "system", "content": budget},
+                *messages[1:],
+            ]
         runtime = self.agent.runtime_context()
+        blocks = [
+            (
+                "<litcode_runtime_location>\n"
+                f"{runtime}\n"
+                "</litcode_runtime_location>"
+            )
+        ]
+        if budget is not None:
+            blocks.append(budget)
         return [
             messages[0],
-            {
-                "role": "system",
-                "content": (
-                    "<litcode_runtime_location>\n"
-                    f"{runtime}\n"
-                    "</litcode_runtime_location>"
-                ),
-            },
+            {"role": "system", "content": "\n".join(blocks)},
             *messages[1:],
         ]
+
+    def _budget_note(self, iteration: int, *, sealed: bool) -> str:
+        used = max(0, iteration - 1)
+        remaining = max(0, self.agent.max_iterations - used)
+        if sealed:
+            return (
+                "<litcode_iteration_budget>\n"
+                f"预算已耗尽（已用 {used} 轮）。这是收尾轮：不要调用工具，"
+                "直接用已有信息写出最终交付或摘要，然后结束。\n"
+                "</litcode_iteration_budget>"
+            )
+        note = (
+            f"<litcode_iteration_budget>已用 {used} / 上限 {remaining + used}，"
+            f"剩余 {remaining}</litcode_iteration_budget>"
+        )
+        if remaining <= max(6, self.agent.max_iterations // 4):
+            note += (
+                "\n预算接近耗尽：立即停止探索与无关读取，优先产出最终结果；"
+                "需要更多工时请委派子会话或明示预算不足。"
+            )
+        return note
 
     def compact(self, instructions: str = "") -> str:
         """Create a manual summary checkpoint without deleting raw history."""

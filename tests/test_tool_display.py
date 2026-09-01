@@ -1,5 +1,11 @@
 from litcode_agent.model import ToolCall
-from litcode_agent.tool_display import tool_result_summary, tool_title
+from litcode_agent.tool_display import (
+    change_diff,
+    change_result_summary,
+    tool_result_summary,
+    tool_title,
+)
+from litcode_agent.tools.base import FileChange
 
 
 def test_tool_title_selects_key_arguments_without_large_patch_text() -> None:
@@ -52,3 +58,52 @@ def test_tool_result_summary_keeps_head_and_tail_with_omission_count() -> None:
     assert "已省略" in summary
     assert summary.endswith("BBBB")
     assert len(summary) <= 1_210
+
+
+def test_change_diff_renders_creation_as_all_added_lines() -> None:
+    change = FileChange("README.md", None, "line1\nline2\n", False)
+    diff = change_diff(change)
+
+    assert diff.startswith("--- README.md\n+++ README.md")
+    assert "@@ -0,0 +1,2 @@" in diff
+    assert "+line1" in diff
+    assert "+line2" in diff
+
+
+def test_change_diff_renders_edit_hunks_and_bounded_lines() -> None:
+    change = FileChange("a.py", "old line\n", "old line\n" + "n" * 400 + "\n", True)
+    diff = change_diff(change)
+
+    assert "@@ -1 +1,2 @@" in diff
+    assert " old line" in diff
+    assert "+n n" not in diff
+    assert all(len(line) <= 200 for line in diff.splitlines())
+    assert "…" in diff
+
+
+def test_change_diff_overview_replaces_large_changes() -> None:
+    before = [f"before {index}" for index in range(700)]
+    after = [f"after {index}" for index in range(700)]
+    change = FileChange("big.py", "\n".join(before), "\n".join(after), True)
+    diff = change_diff(change)
+
+    assert "修改前 700 行 → 修改后 700 行" in diff
+    assert diff.splitlines()[-1].startswith("修改前")
+
+
+def test_change_result_summary_precedes_diff_for_cards() -> None:
+    change = FileChange("b.py", "x", "y", True)
+    summary = change_result_summary(change)
+
+    assert summary.startswith("已修改 b.py")
+    assert "--- b.py" in summary
+
+
+def test_ask_user_title_counts_questions() -> None:
+    call = ToolCall(
+        "call",
+        "ask_user",
+        '{"questions":[{"question":"q","header":"h","options":[{"label":"a","description":"b"}]}]}',
+    )
+
+    assert tool_title(call, "✓") == "✓ ask_user · 1 个问题"

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Mapping, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from litcode_agent.session_runtime import SessionRuntime
 
 
 class ToolError(ValueError):
@@ -56,9 +59,9 @@ class ToolExecutionContext:
     terminal_id: str | None = None
     pane_slot: int | None = None
     mounted_sessions: tuple[tuple[str, int], ...] = ()
-    orchestration_role: str | None = None
-    orchestration_write_policy: str | None = None
-    orchestration_allowed_paths: tuple[str, ...] = ()
+    profile: str = "general"
+    turn_id: str | None = None
+    runtime: SessionRuntime | None = None
 
 
 @runtime_checkable

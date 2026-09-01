@@ -20,6 +20,7 @@ from textual.widgets import (
     Button,
     Collapsible,
     Footer,
+    Input,
     Label,
     ListItem,
     ListView,
@@ -27,6 +28,7 @@ from textual.widgets import (
     OptionList,
     Static,
     TextArea,
+    Tree,
 )
 from textual.widgets.option_list import Option
 
@@ -38,11 +40,6 @@ from litcode_agent.model import (
     OpenAIChatModel,
     ToolCall,
 )
-from litcode_agent.orchestration import (
-    OrchestrationError,
-    OrchestrationRun,
-    OrchestrationTask,
-)
 from litcode_agent.pane_layout import PaneBranch, PaneLayout, PaneLeaf, PaneNode
 from litcode_agent.references import (
     ReferenceBundle,
@@ -52,12 +49,18 @@ from litcode_agent.references import (
     SESSION_REFERENCE_PATTERN,
 )
 from litcode_agent.prompt import PromptBuilder
-from litcode_agent.session_store import Checkpoint, SessionInfo, SessionStore
+from litcode_agent.session_store import Checkpoint, SessionInfo, SessionStore, SessionTurn
+from litcode_agent.session_runtime import SessionRuntime
 from litcode_agent.session_workspace import PaneSession, SessionWorkspace
-from litcode_agent.scheduler import LocalScheduler, SchedulerAction
 from litcode_agent.skills import SkillCatalog
-from litcode_agent.tool_display import tool_result_summary, tool_title
+from litcode_agent.tool_display import (
+    change_result_summary,
+    tool_result_summary,
+    tool_title,
+)
 from litcode_agent.tools import build_default_registry
+from litcode_agent.tools.base import FileChange, ToolError
+from litcode_agent.tools.question import MAX_OPTIONS, QuestionSpec
 from litcode_agent.tools.workspace import Workspace
 
 @dataclass(frozen=True, slots=True)
@@ -73,22 +76,30 @@ COMMANDS = (
     CommandSpec("/model", "查询并选择模型", "model", ("/models",)),
     CommandSpec("/new", "新建会话并切换当前 pane", "new"),
     CommandSpec("/clear", "新建空白会话", "clear"),
-    CommandSpec("/sessions", "选择并恢复会话", "sessions", ("/resume",)),
+    CommandSpec(
+        "/history",
+        "浏览会话树并挂载到当前 pane（原会话转入后台）",
+        "history",
+        ("/sessions", "/tree", "/resume"),
+    ),
     CommandSpec("/compact", "压缩当前上下文", "compact"),
     CommandSpec("/rewind", "回到历史检查点", "rewind"),
     CommandSpec("/redo", "撤销最近一次 rewind", "redo"),
     CommandSpec("/fork", "从检查点创建分支", "fork"),
-    CommandSpec("/split", "按方向创建会话 pane", "split"),
+    CommandSpec("/split", "按方向创建 pane，可选挂载会话", "split"),
     CommandSpec("/focus", "按方向切换 pane", "focus"),
     CommandSpec("/close-pane", "关闭当前 pane", "close_pane"),
+    CommandSpec("/nohup", "卸载当前会话并让它在后台继续", "nohup"),
+    CommandSpec("/subagent", "创建一个子会话并按需后台运行", "subagent"),
     CommandSpec("/inbox", "查看当前会话收件箱", "inbox"),
-    CommandSpec("/orchestrate", "启动受限多会话编排", "orchestrate"),
-    CommandSpec("/orchestration", "查看当前协作日志", "orchestration"),
-    CommandSpec("/pause-orchestration", "暂停当前编排", "pause_orchestration"),
-    CommandSpec("/resume-orchestration", "恢复当前编排", "resume_orchestration"),
-    CommandSpec("/cancel-orchestration", "取消当前编排", "cancel_orchestration"),
+    CommandSpec("/queue", "查看或管理当前会话队列", "queue"),
     CommandSpec("/exit", "退出 LitCode", "exit", ("/quit",)),
 )
+
+
+LIST_CARD_LINE_THRESHOLD = 12
+PICKER_LABEL_CELLS = 60
+PICKER_GUIDE_DEPTH = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,15 +112,25 @@ class CompletionContext:
 
 
 @dataclass(slots=True)
+class _PendingQuestion:
+    """One ask_user request waiting on user input from a worker thread."""
+
+    session_id: str
+    questions: list[QuestionSpec]
+    answers: list[list[str]] | None = None
+    finished: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass(slots=True)
 class PaneRuntime:
     pane_id: str
     pane_slot: int
     agent: Agent
     model: OpenAIChatModel
-    session: AgentSession
+    session: AgentSession | None
     busy: bool = False
     cancel_requested: threading.Event = field(default_factory=threading.Event)
-    tool_bodies: dict[str, Static] = field(default_factory=dict)
+    tool_bodies: dict[str, PagedOutput] = field(default_factory=dict)
     tool_cards: dict[str, Collapsible] = field(default_factory=dict)
     streaming_markdown: Markdown | None = None
     streaming_buffer: str = ""
@@ -117,7 +138,10 @@ class PaneRuntime:
     prompt_history: list[str] = field(default_factory=list)
     prompt_history_index: int | None = None
     prompt_draft: str = ""
-    orchestration_task_id: str | None = None
+
+    @property
+    def empty(self) -> bool:
+        return self.session is None
 
 
 class PromptArea(TextArea):
@@ -153,6 +177,7 @@ class PromptArea(TextArea):
             "\n", start, end, maintain_selection_offset=False
         )
         self.move_cursor(result.end_location)
+
 
     def on_key(self, event: events.Key) -> None:
         app = self.app
@@ -191,6 +216,115 @@ class PromptArea(TextArea):
             return
         if event.key not in {"up", "down"}:
             app.reset_prompt_history_navigation()
+
+
+class PagedOutput(Static):
+    """有界内翻页正文：只显示一页，用 j/k 或上下键翻页。"""
+
+    PAGE_LINE_LIMIT = 18
+    BINDINGS = [
+        Binding("j,down,page_down", "next_page", "下一页", show=False),
+        Binding("k,up,page_up", "prev_page", "上一页", show=False),
+    ]
+
+    can_focus = True
+
+    def __init__(self, content: str = "") -> None:
+        super().__init__(classes="paged-output")
+        self._source_lines: list[str] = []
+        self._page_index = 0
+        self.set_content(content)
+
+    def set_content(self, content: str) -> None:
+        self._source_lines = content.splitlines() or ["（无输出）"]
+        self._page_index = 0
+        self.update(self._page_text())
+
+    @property
+    def page_count(self) -> int:
+        return max(1, -(-len(self._source_lines) // self.PAGE_LINE_LIMIT))
+
+    def _page_text(self) -> Text:
+        start = self._page_index * self.PAGE_LINE_LIMIT
+        lines = self._source_lines[start : start + self.PAGE_LINE_LIMIT]
+        content = Text()
+        for index, line in enumerate(lines):
+            if index:
+                content.append("\n")
+            content.append(line, style=_diff_style(line))
+        if self.page_count > 1:
+            content.append(
+                f"\n第 {self._page_index + 1}/{self.page_count} 页 · "
+                "j/k 翻页",
+                style="dim",
+            )
+        return content
+
+    def action_next_page(self) -> None:
+        if self.page_count > 1 and self._page_index < self.page_count - 1:
+            self._page_index += 1
+            self.update(self._page_text())
+
+    def action_prev_page(self) -> None:
+        if self._page_index > 0:
+            self._page_index -= 1
+            self.update(self._page_text())
+
+    def on_click(self, event: events.Click) -> None:
+        self.focus()
+        event.stop()
+
+    def on_focus(self) -> None:
+        self.add_class("paged-focused")
+
+    def on_blur(self) -> None:
+        self.remove_class("paged-focused")
+
+
+class PaneDivider(Static):
+    """A one-cell divider whose drag is translated into a layout ratio delta."""
+
+    def __init__(self, target_pane_id: str, axis: str) -> None:
+        super().__init__(classes="pane-divider")
+        self.target_pane_id = target_pane_id
+        self.axis = axis
+        self._dragging = False
+        self._last_coordinate = 0
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        self._dragging = True
+        self._last_coordinate = (
+            event.screen_x if self.axis == "horizontal" else event.screen_y
+        )
+        self.capture_mouse()
+        event.stop()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if not self._dragging or not isinstance(self.app, LitCodeTUI):
+            return
+        coordinate = (
+            event.screen_x if self.axis == "horizontal" else event.screen_y
+        )
+        delta_pixels = coordinate - self._last_coordinate
+        if delta_pixels:
+            parent_size = self.parent.size
+            denominator = (
+                parent_size.width if self.axis == "horizontal" else parent_size.height
+            )
+            if denominator > 0:
+                self.app.resize_pane(
+                    self.target_pane_id,
+                    self.axis,
+                    delta_pixels / denominator,
+                )
+            self._last_coordinate = coordinate
+        event.stop()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self._dragging:
+            self._dragging = False
+            self.release_mouse()
+        event.stop()
 
 
 class ModelPicker(ModalScreen[str | None]):
@@ -282,6 +416,357 @@ class ChoicePicker(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class HistoryPicker(ModalScreen[str | None]):
+    """树状历史会话选择器：筛选 + Enter 挂载，原会话转为后台运行。
+
+    接口形状借鉴 OpenCode 的会话选择弹窗（搜索框 + 有界列表 + Enter 提交），
+    但保留 LitCode 的会话树层级：子会话缩进展示，候选数有界并提示总数。
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "取消")]
+
+    def __init__(
+        self,
+        rows: tuple[tuple[int, SessionInfo], ...],
+        *,
+        mounted: dict[str, int],
+        running: set[str],
+        terminal_id: str,
+        query: str = "",
+        current_session_id: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.rows = rows
+        self.mounted = mounted
+        self.running = running
+        self.terminal_id = terminal_id
+        self.filter_text = query
+        self.current_session_id = current_session_id
+        self._pending_cursor = None
+
+    def compose(self) -> ComposeResult:
+        session_tree = Tree("会话", id="history-tree")
+        session_tree.show_root = False
+        session_tree.guide_depth = 3
+        with Vertical(id="history-dialog"):
+            yield Label("选择历史会话", classes="dialog-title")
+            yield session_tree
+            yield Input(
+                value=self.filter_text,
+                placeholder="筛选：编号 / 标题 / 模型",
+                id="history-filter",
+            )
+            yield Label("", classes="dialog-help", id="history-help")
+
+    def on_mount(self) -> None:
+        self._refresh_tree()
+
+    @on(Tree.NodeSelected, "#history-tree")
+    def tree_selected(self, event: Tree.NodeSelected) -> None:
+        identifier = event.node.data if isinstance(event.node.data, str) else None
+        self.dismiss(identifier or self._first_visible_data())
+
+    @on(Input.Changed, "#history-filter")
+    def filter_changed(self, event: Input.Changed) -> None:
+        self.filter_text = event.value
+        self._refresh_tree()
+
+    @on(Input.Submitted, "#history-filter")
+    def filter_submitted(self, event: Input.Submitted) -> None:
+        tree = self.query_one("#history-tree", Tree)
+        identifier = tree.cursor_node.data if tree.cursor_node is not None else None
+        self.dismiss(
+            identifier if isinstance(identifier, str) else self._first_visible_data()
+        )
+
+    def _first_visible_data(self) -> str | None:
+        tree = self.query_one("#history-tree", Tree)
+
+        def first(node) -> str | None:
+            if isinstance(node.data, str):
+                return node.data
+            for child in node.children:
+                found = first(child)
+                if found is not None:
+                    return found
+            return None
+
+        return first(tree.root)
+
+    def _refresh_tree(self) -> None:
+        tree = self.query_one("#history-tree", Tree)
+        tree.clear()
+        visible = self._filtered_infos()
+        children: dict[str | None, list[str]] = {}
+        for depth, info in visible:
+            children.setdefault(info.parent_id, []).append(info.id)
+        infos = {info.id: info for _, info in visible}
+
+        def add_node(parent, info: SessionInfo, depth: int):
+            node = parent.add(
+                _history_label(
+                    info,
+                    self.mounted,
+                    self.running,
+                    self.current_session_id,
+                    depth,
+                ),
+                data=info.id,
+            )
+            for identifier in children.get(info.id, []):
+                add_node(node, infos[identifier], depth + 1)
+            return node
+
+        first_node = None
+        for identifier in children.get(None, []):
+            node = add_node(tree.root, infos[identifier], 0)
+            first_node = first_node or node
+        self._pending_cursor = first_node
+        if first_node is not None:
+            self.call_after_refresh(self._apply_cursor)
+        self.query_one("#history-help", Label).update(
+            f"共 {len(self.rows)} 个会话 · 显示 {len(visible)} 个 · Enter 选择 · Esc 取消"
+        )
+
+    def _apply_cursor(self) -> None:
+        """把光标落到第一个节点；Tree 的行映射在访问时惰性构建。"""
+
+        tree = self.query_one("#history-tree", Tree)
+        if self._pending_cursor is None:
+            return
+        tree.cursor_line = self._pending_cursor._line
+        tree.move_cursor(self._pending_cursor)
+        if tree.cursor_line < 0:
+            tree.cursor_line = 0
+
+    def _filtered_infos(self) -> list[tuple[int, SessionInfo]]:
+        filter_text = self.filter_text.strip()
+        if not filter_text:
+            return list(self.rows)
+        matcher = Matcher(filter_text)
+        matched = {
+            info.id
+            for _, info in self.rows
+            if matcher.match(info.alias) > 0
+            or matcher.match(info.title) > 0
+            or matcher.match(info.model) > 0
+        }
+        parents = {info.id: info.parent_id for _, info in self.rows}
+        keep: set[str] = set()
+        for identifier in matched:
+            current: str | None = identifier
+            while current is not None and current not in keep:
+                keep.add(current)
+                current = parents.get(current)
+        return [
+            (depth, info)
+            for depth, info in self.rows
+            if info.id in keep
+        ]
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class QuestionPrompt(ModalScreen[list[list[str]] | None]):
+    """收集 ask_user 工具的问题答案。
+
+    交互形态借鉴 OpenCode 的 question 视图：顶部问题标签页、数字键直选、
+    j/k 移动、Enter 确认、自定义回答输入、Esc 拒绝。单个单选题选中即提交；
+    多个问题时用 Tab 或 h/l 切换问题（最后一页是确认页）。
+    """
+
+    BINDINGS = (
+        [Binding("escape", "cancel", "取消"), Binding("enter", "confirm", "确认")]
+        + [
+            Binding("left,h", "prev_tab", "上一题", show=False),
+            Binding("right,l", "next_tab", "下一题", show=False),
+            Binding("tab", "next_tab", "下一题", show=False),
+            Binding("j,down", "option_down", "下一项", show=False),
+            Binding("k,up", "option_up", "上一项", show=False),
+        ]
+        + [
+            Binding(str(number), f"pick_option({number - 1})", "选项", show=False)
+            for number in range(1, MAX_OPTIONS + 2)
+        ]
+    )
+
+    def __init__(self, questions: list[QuestionSpec], title: str) -> None:
+        super().__init__()
+        self.questions = questions
+        self.title = title
+        self.answers: list[list[str]] = [[] for _ in questions]
+        self.tab: int = 0
+        self.custom_active = False
+
+    @property
+    def confirm_tab(self) -> int:
+        return len(self.questions)
+
+    @property
+    def submitting_on_pick(self) -> bool:
+        return len(self.questions) == 1 and not self.questions[0].multiple
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="question-dialog"):
+            yield Label(self.title, classes="dialog-title")
+            yield Static("", id="question-tabs")
+            yield Static("", id="question-text")
+            yield OptionList(id="question-options", markup=False)
+            yield Input(
+                placeholder="自定义回答，Enter 提交",
+                id="question-custom",
+            )
+            yield Label(
+                "数字选择 · j/k 移动 · Enter 确认 · h/l 或 Tab 切换问题 · Esc 拒绝",
+                classes="dialog-help",
+            )
+
+    def on_mount(self) -> None:
+        self._refresh_tab()
+
+    @on(OptionList.OptionSelected, "#question-options")
+    def option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option.id is not None:
+            self._pick(int(event.option.id))
+
+    @on(Input.Changed, "#question-custom")
+    def custom_changed(self, event: Input.Changed) -> None:
+        if event.value:
+            self.custom_active = True
+
+    @on(Input.Submitted, "#question-custom")
+    def custom_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        if not text:
+            return
+        self.answers[self.tab] = [text]
+        self.custom_active = False
+        if self.submitting_on_pick:
+            self.dismiss(list(self.answers))
+            return
+        self._advance_tab()
+
+    def _refresh_tab(self) -> None:
+        self.query_one("#question-tabs", Static).update(
+            Text(self._tab_labels(), style="dim")
+        )
+        options_list = self.query_one("#question-options", OptionList)
+        text_widget = self.query_one("#question-text", Static)
+        custom_input = self.query_one("#question-custom", Input)
+        if self.tab == self.confirm_tab:
+            text_widget.update(Text(self._summary_text(), style="bold"))
+            options_list.clear_options()
+            options_list.display = False
+            custom_input.display = False
+            return
+        question = self.questions[self.tab]
+        text_widget.update(Text(f"{question.header}\n{question.question}"))
+        options = list(question.options)
+        if question.custom:
+            options.append(("✎ 自定义回答", "输入你自己的答案"))
+        options_list.display = True
+        options_list.clear_options()
+        options_list.add_options(
+            Option(
+                Text(("✓ " if label in self.tab_answers else "") + label),
+                id=str(index),
+            )
+            for index, (label, description) in enumerate(options)
+        )
+        options_list.highlighted = 0
+        if self.custom_active:
+            custom_input.display = True
+            custom_input.focus()
+        else:
+            custom_input.display = False
+            options_list.focus()
+
+    @property
+    def tab_answers(self) -> list[str]:
+        return self.answers[self.tab] if self.tab < len(self.answers) else []
+
+    def _tab_labels(self) -> str:
+        labels = [
+            f"[{index + 1}] {question.header}"
+            for index, question in enumerate(self.questions)
+        ]
+        labels.append("[确认]")
+        return "  ".join(
+            label
+            if index != self.tab
+            else f"<{label}>"
+            for index, label in enumerate(labels)
+        )
+
+    def _summary_text(self) -> str:
+        lines = []
+        for index, question in enumerate(self.questions):
+            selected = self.answers[index]
+            answer = ", ".join(selected) if selected else "未回答"
+            lines.append(f"{index + 1}. {question.header}：{question.question}\n   → {answer}")
+        return "\n".join(lines)
+
+    def _pick(self, index: int) -> None:
+        if self.tab == self.confirm_tab:
+            return
+        question = self.questions[self.tab]
+        if index < len(question.options):
+            label = question.options[index][0]
+            if question.multiple:
+                current = list(self.answers[self.tab])
+                self.answers[self.tab] = (
+                    [item for item in current if item != label]
+                    if label in current
+                    else current + [label]
+                )
+                self._refresh_tab()
+                return
+            self.answers[self.tab] = [label]
+            if self.submitting_on_pick:
+                self.dismiss(list(self.answers))
+                return
+            self._advance_tab()
+            return
+        if question.custom and index == len(question.options):
+            self.custom_active = True
+            self._refresh_tab()
+
+    def _advance_tab(self) -> None:
+        self.tab = min(self.tab + 1, self.confirm_tab)
+        self._refresh_tab()
+
+    def action_prev_tab(self) -> None:
+        if self.tab > 0:
+            self.tab -= 1
+            self._refresh_tab()
+
+    def action_next_tab(self) -> None:
+        if self.tab < self.confirm_tab:
+            self.tab += 1
+            self._refresh_tab()
+
+    def action_pick_option(self, number: int) -> None:
+        self._pick(number)
+
+    def action_option_down(self) -> None:
+        options = self.query_one("#question-options", OptionList)
+        if options.option_count:
+            options.highlighted = ((options.highlighted or 0) + 1) % options.option_count
+
+    def action_option_up(self) -> None:
+        options = self.query_one("#question-options", OptionList)
+        if options.option_count:
+            options.highlighted = (options.highlighted or 1) - 1
+
+    def action_confirm(self) -> None:
+        if self.tab == self.confirm_tab:
+            self.dismiss(list(self.answers))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class RewindMode(ModalScreen[str | None]):
     """Choose whether a rewind also restores agent-edited files."""
 
@@ -351,6 +836,18 @@ class LitCodeTUI(App[None]):
     .session-pane.pane-active {
         border: round $primary;
     }
+    .pane-divider {
+        background: $secondary;
+        width: 1;
+        height: 1fr;
+    }
+    .pane-divider:hover {
+        background: $accent;
+    }
+    .split-vertical > .pane-divider {
+        width: 1fr;
+        height: 1;
+    }
     .pane-header {
         height: 1;
         padding: 0 1;
@@ -371,8 +868,7 @@ class LitCodeTUI(App[None]):
         padding: 1 2;
     }
     .message-user {
-        background: $primary 18%;
-        border-left: thick $primary;
+        background: $primary 10%;
     }
     .message-assistant {
         background: $success 10%;
@@ -425,11 +921,12 @@ class LitCodeTUI(App[None]):
     Footer {
         height: 1;
     }
-    ModelPicker, ConfirmCommand, ChoicePicker, RewindMode {
+    ModelPicker, ConfirmCommand, ChoicePicker, RewindMode, HistoryPicker,
+    QuestionPrompt {
         align: center middle;
-        background: $background 70%;
+        background: $background 80%;
     }
-    #model-dialog, #confirm-dialog {
+    #model-dialog, #confirm-dialog, #history-dialog, #question-dialog {
         width: 72;
         max-width: 90%;
         height: auto;
@@ -437,6 +934,43 @@ class LitCodeTUI(App[None]):
         padding: 1 2;
         background: $panel;
         border: round $primary;
+    }
+    #history-tree {
+        height: auto;
+        max-height: 24;
+        background: $boost;
+        margin: 1 0 0 0;
+        border: round $accent;
+    }
+    #history-filter {
+        margin-top: 1;
+    }
+    #question-tabs {
+        height: 1;
+        color: $text-muted;
+    }
+    #question-text {
+        margin: 1 0;
+        text-style: bold;
+    }
+    #question-options {
+        height: auto;
+        max-height: 16;
+        margin: 1 0;
+    }
+    #question-custom {
+        height: 1;
+        margin: 0 0 1 0;
+        padding: 0 2;
+        border: none;
+        background: $boost;
+        width: 100%;
+    }
+    .paged-output {
+        background: $boost;
+    }
+    .paged-output.paged-focused {
+        background: $accent 20%;
     }
     #model-list {
         height: auto;
@@ -473,33 +1007,38 @@ class LitCodeTUI(App[None]):
         self.ui_thread_id: int | None = None
         self.shutting_down = False
         self.pending_confirmations: set[threading.Event] = set()
+        self.pending_questions: dict[str, _PendingQuestion] = {}
         self.workspace = Workspace(settings.workspace)
         self.skills = SkillCatalog.discover(settings.workspace)
         assert settings.session_database is not None
         self.store = SessionStore(settings.session_database)
-        from litcode_agent.orchestration import OrchestrationService
-
-        self.orchestrator = OrchestrationService(self.store, settings.workspace)
+        self.system_prompt = PromptBuilder(
+            settings.workspace,
+            settings.max_iterations,
+            self.skills.metadata(),
+        ).build()
+        self.runtime = SessionRuntime(
+            self.store,
+            settings.workspace,
+            system_prompt=self.system_prompt,
+            event_sink=self._runtime_event,
+        )
         self.file_paths: tuple[str, ...] = ()
         self.directory_paths: tuple[str, ...] = ()
         self.completion_context: CompletionContext | None = None
         self.completion_values: list[str] = []
+        self._pending_checkpoint: Checkpoint | None = None
         self.registry = build_default_registry(
             settings,
             confirm=self.confirm_command,
             skills=self.skills,
             store=self.store,
             confirm_session_message=self.confirm_session_message,
-            orchestrator=self.orchestrator,
-            on_orchestration_change=self.orchestration_changed,
-            confirm_session_wake=self.confirm_session_wake,
             confirm_session_read=self.confirm_session_read,
+            runtime=self.runtime,
+            confirm_session_control=self.confirm_session_control,
+            ask_user=self.ask_user,
         )
-        self.system_prompt = PromptBuilder(
-            settings.workspace,
-            settings.max_iterations,
-            self.skills.metadata(),
-        ).build()
         self.sessions = SessionWorkspace(
             settings,
             model,
@@ -507,9 +1046,9 @@ class LitCodeTUI(App[None]):
             self.system_prompt,
             self.store,
             self.receive_agent_event,
-            before_model_request=self.orchestrator.before_model_request,
+            runtime=self.runtime,
         )
-        self.scheduler = LocalScheduler(self.orchestrator)
+        self.runtime.session_factory = self.sessions.session_factory
         first = self.sessions.active
         self.agent = first.agent
         self.panes = {first.pane_id: self._pane_runtime(first)}
@@ -523,7 +1062,7 @@ class LitCodeTUI(App[None]):
         with Vertical(id="composer"):
             yield OptionList(id="completion", compact=True, markup=False)
             yield Label(
-                "Enter 发送 · Shift+Enter 换行 · ↑↓ 历史 · / @ # 补全",
+                "Enter 发送（运行中自动排队） · Shift+Enter 换行 · ↑↓ 历史 · / @ # 补全",
                 id="prompt-label",
             )
             yield PromptArea(id="prompt", language=None)
@@ -545,16 +1084,21 @@ class LitCodeTUI(App[None]):
         runtime = PaneRuntime(
             pane.pane_id, pane.pane_slot, pane.agent, pane.model, pane.session
         )
-        runtime.prompt_history = _message_prompt_history(pane.session.messages)
+        if pane.session is not None:
+            runtime.prompt_history = _message_prompt_history(pane.session.messages)
         return runtime
 
     def _sync_runtime(self, pane: PaneSession) -> PaneRuntime:
         runtime = self.panes[pane.pane_id]
-        session_changed = runtime.session.session_id != pane.session.session_id
+        session_changed = (
+            runtime.session is None
+            or pane.session is None
+            or runtime.session.session_id != pane.session.session_id
+        )
         runtime.agent = pane.agent
         runtime.model = pane.model
         runtime.session = pane.session
-        if session_changed:
+        if session_changed and pane.session is not None:
             runtime.prompt_history = _message_prompt_history(pane.session.messages)
             runtime.prompt_history_index = None
             runtime.prompt_draft = ""
@@ -564,16 +1108,29 @@ class LitCodeTUI(App[None]):
 
     @property
     def session(self) -> AgentSession:
-        return self._active_runtime().session
+        """Return the active session, materializing an empty pane on demand.
+
+        UI actions call ``_ensure_active_session`` explicitly.  This property
+        keeps the small public test/application surface convenient for callers
+        that intentionally ask for the active conversation.
+        """
+
+        runtime = self._ensure_active_session()
+        assert runtime.session is not None
+        return runtime.session
 
     @property
     def busy(self) -> bool:
         return self._active_runtime().busy
 
     def _pane_widget(self, runtime: PaneRuntime) -> Vertical:
-        info = self.store.session_info(runtime.session.session_id)
-        unread = len(self.store.inbox(runtime.session.session_id))
-        unread_label = f" · 未读 {unread}" if unread else ""
+        if runtime.session is None:
+            header_text = f"{runtime.pane_slot}  空窗格 · 输入消息开始"
+        else:
+            info = self.store.session_info(runtime.session.session_id)
+            unread = len(self.store.inbox(runtime.session.session_id))
+            unread_label = f" · 未读 {unread}" if unread else ""
+            header_text = f"{runtime.pane_slot}  {_session_label(info)}{unread_label}"
         timeline_id = (
             "timeline"
             if runtime.pane_id == "pane-1"
@@ -586,7 +1143,7 @@ class LitCodeTUI(App[None]):
         )
         return Vertical(
             Static(
-                Text(f"{runtime.pane_slot}  {_session_label(info)}{unread_label}"),
+                Text(header_text),
                 classes="pane-header",
             ),
             VerticalScroll(id=timeline_id, classes="pane-timeline"),
@@ -597,10 +1154,26 @@ class LitCodeTUI(App[None]):
     def _layout_widget(self, node: PaneNode):
         if isinstance(node, PaneLeaf):
             return self._pane_widget(self.panes[node.pane_id])
-        children = (self._layout_widget(node.first), self._layout_widget(node.second))
+        first = self._layout_widget(node.first)
+        second = self._layout_widget(node.second)
+        first.styles.width = f"{node.ratio}fr"
+        second.styles.width = f"{1.0 - node.ratio}fr"
+        divider = PaneDivider(_first_leaf(node.first), node.axis)
         if node.axis == "horizontal":
-            return Horizontal(*children, classes="split-horizontal")
-        return Vertical(*children, classes="split-vertical")
+            return Horizontal(first, divider, second, classes="split-horizontal")
+        first.styles.width = "1fr"
+        second.styles.width = "1fr"
+        first.styles.height = f"{node.ratio}fr"
+        second.styles.height = f"{1.0 - node.ratio}fr"
+        return Vertical(first, divider, second, classes="split-vertical")
+
+    def resize_pane(self, pane_id: str, axis: str, delta: float) -> None:
+        """Apply a bounded divider drag and rebuild only the pane view."""
+
+        if axis not in {"horizontal", "vertical"}:
+            raise ValueError(f"unknown pane axis: {axis}")
+        self.pane_layout.resize(pane_id, delta)
+        self._rebuild_panes()
 
     def _rebuild_panes(self) -> None:
         self._pane_layout_generation += 1
@@ -710,6 +1283,10 @@ class LitCodeTUI(App[None]):
             runtime.cancel_requested.set()
         for confirmation in self.pending_confirmations:
             confirmation.set()
+        for pending in self.pending_questions.values():
+            pending.answers = None
+            pending.finished.set()
+        self.runtime.close()
         self.sessions.close_all()
         self.store.close()
 
@@ -718,9 +1295,6 @@ class LitCodeTUI(App[None]):
         value = event.value
         if value.startswith("/"):
             self._handle_command(value)
-            return
-        if self.busy:
-            self._append_notice("当前任务仍在运行。", error=True)
             return
         if (
             self.settings.session_read_policy == "deny"
@@ -742,6 +1316,7 @@ class LitCodeTUI(App[None]):
         except ReferenceError as error:
             self._append_notice(str(error), error=True)
             return
+        self._ensure_active_session()
         for reference in bundle.session_references:
             self.store.record_session_reference(
                 self.session.session_id,
@@ -751,13 +1326,33 @@ class LitCodeTUI(App[None]):
             )
         self._append_user_bundle(bundle)
         runtime = self._active_runtime()
-        self._start_runtime_turn(runtime, bundle.model_text)
+        # User messages use the same durable mailbox as Agent messages.  The
+        # pane remains a view; a background/child Session can consume its own
+        # queue even when no pane is mounted.
+        assert runtime.session is not None
+        already_running = runtime.busy
+        self.runtime.register(runtime.session.session_id, runtime.session)
+        if not already_running:
+            self._set_pane_busy(runtime, True, "排队中…")
+            self.running_sessions.add(runtime.session.session_id)
+        try:
+            self.runtime.submit(runtime.session.session_id, bundle.model_text)
+        except Exception as error:
+            self.running_sessions.discard(runtime.session.session_id)
+            self._set_pane_busy(runtime, False, "错误")
+            self._append_notice(str(error), error=True, runtime=runtime)
+            return
+        if already_running:
+            queued = self.store.queue(runtime.session.session_id)
+            position = sum(1 for item in queued if item.status == "queued")
+            self._append_notice(
+                f"消息已加入队列（第 {position} 条待执行）。", runtime=runtime
+            )
 
     @on(TextArea.Changed, "#prompt")
     @on(TextArea.SelectionChanged, "#prompt")
     def prompt_updated(self) -> None:
-        if not self.busy:
-            self.refresh_completions()
+        self.refresh_completions()
 
     @on(OptionList.OptionSelected, "#completion")
     def completion_selected(self, event: OptionList.OptionSelected) -> None:
@@ -769,89 +1364,25 @@ class LitCodeTUI(App[None]):
             (
                 runtime
                 for runtime in self.panes.values()
-                if runtime.session.session_id == session_id
+                if runtime.session is not None
+                and runtime.session.session_id == session_id
             ),
             None,
         )
 
-    def _run_turn(
-        self,
-        value: str,
-        session: AgentSession,
-        cancel_event: threading.Event,
-        session_id: str,
-        task_id: str | None,
-    ) -> None:
-        try:
-            result = session.ask(value, cancel_event.is_set)
-        except ModelError as error:
-            self.call_from_thread(
-                self._finish_with_error, str(error), session_id, task_id
-            )
-            return
-        except Exception as error:  # keep an unexpected worker error visible
-            self.call_from_thread(
-                self._finish_with_error,
-                f"未预期错误：{type(error).__name__}: {error}",
-                session_id,
-                task_id,
-            )
-            return
-        self.call_from_thread(
-            self._finish_turn, result.output, result.succeeded, session_id, task_id
-        )
+    def _ensure_active_session(self) -> PaneRuntime:
+        """Materialize a root Session only when an Empty Pane receives input."""
 
-    def _start_runtime_turn(
-        self,
-        runtime: PaneRuntime,
-        value: str,
-        *,
-        task_id: str | None = None,
-    ) -> None:
-        if runtime.busy:
-            raise RuntimeError(f"pane {runtime.pane_slot} is already busy")
-        runtime.orchestration_task_id = task_id
-        self._set_pane_busy(runtime, True, "正在启动…")
-        runtime.cancel_requested.clear()
-        session_id = runtime.session.session_id
-        self.running_sessions.add(session_id)
-        self.run_worker(
-            lambda: self._run_turn(
-                value, runtime.session, runtime.cancel_requested, session_id, task_id
-            ),
-            name=f"agent-turn-{session_id}",
-            group=f"agent-{session_id}",
-            thread=True,
-            exclusive=True,
-            exit_on_error=False,
-        )
-
-    def orchestration_changed(self, task: OrchestrationTask) -> None:
-        del task
-        self.call_from_thread(self._drive_orchestration)
-
-    def _drive_orchestration(self) -> None:
-        while True:
-            mounted = self.sessions.mounted_sessions()
-            busy = {
-                runtime.session.session_id
-                for runtime in self.panes.values()
-                if runtime.busy
-            }
-            busy |= self.running_sessions
-            action = self.scheduler.next_action(mounted=mounted, busy=busy)
-            if action is None:
-                return
-            pane = self.sessions.pane_for_session(action.session_id)
-            if pane is None:
-                return
-            runtime = self.panes[pane.pane_id]
-            self._append_notice(_scheduler_notice(action), runtime=runtime)
-            self._start_runtime_turn(
-                runtime,
-                action.prompt,
-                task_id=(action.task_id if action.kind == "wake_task" else None),
-            )
+        runtime = self._active_runtime()
+        if runtime.session is not None:
+            return runtime
+        prompt_history = list(runtime.prompt_history)
+        self.sessions.materialize(runtime.pane_id)
+        self._sync_runtime(self.sessions.active)
+        runtime.prompt_history = prompt_history
+        self._reset_pane_view()
+        self._update_pane_header(runtime, "就绪")
+        return runtime
 
     def receive_agent_event(self, event: AgentEvent) -> None:
         if self.shutting_down:
@@ -860,7 +1391,8 @@ class LitCodeTUI(App[None]):
             (
                 item
                 for item in self.panes.values()
-                if item.session.session_id == event.session_id
+                if item.session is not None
+                and item.session.session_id == event.session_id
             ),
             None,
         )
@@ -870,6 +1402,74 @@ class LitCodeTUI(App[None]):
             self._render_agent_event(event, runtime)
         else:
             self.call_from_thread(self._render_agent_event, event, runtime)
+
+    def _runtime_event(
+        self, kind: str, session_id: str, turn: SessionTurn | None
+    ) -> None:
+        """Project background actor lifecycle into the mounted pane when present."""
+
+        if self.shutting_down:
+            return
+        if kind in {"turn_finished", "turn_failed"} and turn is not None:
+            if threading.get_ident() == self.ui_thread_id:
+                self._runtime_turn_finished(turn)
+            else:
+                self.call_from_thread(self._runtime_turn_finished, turn)
+            return
+        runtime = self._runtime_for_session(session_id)
+        if runtime is None:
+            return
+        text = {
+            "turn_started": "会话轮次已开始",
+            "turn_finished": "会话轮次已完成",
+            "turn_failed": "会话轮次失败",
+            "paused": "会话已暂停",
+            "resumed": "会话已恢复",
+        }.get(kind, kind)
+        if threading.get_ident() == self.ui_thread_id:
+            if kind == "turn_started":
+                self._runtime_turn_started(runtime)
+            else:
+                self._append_notice(text, runtime=runtime)
+                self._update_pane_header(runtime, "就绪")
+            return
+        if kind == "turn_started":
+            self.call_from_thread(self._runtime_turn_started, runtime)
+            return
+        self.call_from_thread(self._append_notice, text, runtime=runtime)
+        self.call_from_thread(
+            self._update_pane_header,
+            runtime,
+            "运行中" if kind == "turn_started" else "就绪",
+        )
+
+    def _runtime_turn_started(self, runtime: PaneRuntime) -> None:
+        assert runtime.session is not None
+        self.running_sessions.add(runtime.session.session_id)
+        self._set_pane_busy(runtime, True, "运行中")
+
+    def _runtime_turn_finished(self, turn: SessionTurn) -> None:
+        session_id = turn.session_id
+        self.running_sessions.discard(session_id)
+        runtime = self._runtime_for_session(session_id)
+        if runtime is None:
+            return
+        if turn.output and turn.output != runtime.rendered_output:
+            self._append_assistant(turn.output, runtime)
+        runtime.rendered_output = None
+        status = turn.status
+        if status != "completed":
+            if turn.reason == "max_iterations":
+                self._append_notice(
+                    "已达到迭代上限；以上是模型收尾输出，可继续追问或 /compact。"
+                    if turn.output
+                    else "已达到迭代上限，模型没有给出收尾输出。",
+                    error=True,
+                    runtime=runtime,
+                )
+            else:
+                self._append_notice("本轮未正常完成。", error=True, runtime=runtime)
+        self._set_pane_busy(runtime, False, "就绪" if status == "completed" else "错误")
 
     def _render_agent_event(self, event: AgentEvent, runtime: PaneRuntime) -> None:
         if event.kind == "model_start":
@@ -898,6 +1498,7 @@ class LitCodeTUI(App[None]):
             event.content or "（无输出）",
             event.is_error,
             runtime,
+            event.file_change,
         )
 
     def _handle_command(self, command: str) -> None:
@@ -912,25 +1513,23 @@ class LitCodeTUI(App[None]):
             )
             return
         handlers = {
-            "exit": lambda: self.action_cancel_or_quit(),
+            "exit": self.action_exit,
             "help": self._show_help,
             "model": self.action_choose_model,
             "new": self.action_new_session,
             "clear": self.action_clear_session,
-            "sessions": self.action_choose_session,
+            "history": lambda: self.action_history(arguments),
             "compact": lambda: self.action_compact(arguments),
             "rewind": self.action_rewind,
             "redo": self.action_redo,
             "fork": self.action_fork,
-            "split": lambda: self._command_direction(arguments, self.action_split),
+            "split": lambda: self._command_split(arguments),
             "focus": lambda: self._command_direction(arguments, self.action_focus_pane),
             "close_pane": self.action_close_pane,
+            "nohup": self.action_nohup,
+            "subagent": lambda: self.action_subagent(arguments),
             "inbox": self.action_inbox,
-            "orchestrate": lambda: self.action_orchestrate(arguments),
-            "orchestration": self.action_orchestration,
-            "pause_orchestration": self.action_pause_orchestration,
-            "resume_orchestration": self.action_resume_orchestration,
-            "cancel_orchestration": self.action_cancel_orchestration,
+            "queue": lambda: self.action_queue(arguments),
         }
         handlers[spec.handler]()
 
@@ -943,11 +1542,37 @@ class LitCodeTUI(App[None]):
             return
         action(direction)
 
+    def _command_split(self, arguments: str) -> None:
+        direction, _, reference = arguments.strip().partition(" ")
+        if direction.lower() not in {"left", "right", "up", "down"}:
+            self._append_notice(
+                "方向必须是 left、right、up 或 down。", error=True
+            )
+            return
+        reference = reference.strip()
+        session_id = None
+        if reference:
+            try:
+                session_id = self.store.session_id_for_reference(
+                    self.settings.workspace, reference.lstrip("#{").rstrip("}")
+                )
+            except KeyError:
+                self._append_notice(f"找不到会话：{reference}", error=True)
+                return
+        self.action_split(direction.lower(), session_id=session_id)
+
     def _show_help(self) -> None:
         self._append_notice(
             " · ".join(f"{item.name} {item.description}" for item in COMMANDS)
             + " · Enter 发送 · Shift+Enter 换行"
         )
+
+    def action_exit(self) -> None:
+        """/exit 与 /quit：立即带上运行的 pane 状态退出（无需二次确认）。"""
+
+        for runtime in self.panes.values():
+            runtime.cancel_requested.set()
+        self.exit()
 
     def action_cancel_or_quit(self) -> None:
         now = time.monotonic()
@@ -959,7 +1584,12 @@ class LitCodeTUI(App[None]):
         self._exit_armed_until = now + 1.5
         self.set_timer(1.5, self._reset_exit_arm)
         if self.busy:
-            self._active_runtime().cancel_requested.set()
+            active = self._active_runtime()
+            active.cancel_requested.set()
+            try:
+                self.runtime.cancel_turn(active.session.session_id)
+            except (KeyError, RuntimeError):
+                pass
             self._update_status("正在停止；再次 Ctrl+C 退出")
             return
         self._update_status("再次 Ctrl+C 退出")
@@ -970,19 +1600,27 @@ class LitCodeTUI(App[None]):
         self._exit_armed_until = 0.0
         self._update_status("运行中" if self.busy else "就绪")
 
-    def action_split(self, direction: str) -> None:
+    def action_split(self, direction: str, session_id: str | None = None) -> None:
         if direction not in {"left", "right", "up", "down"}:
             self._append_notice(f"未知分屏方向：{direction}", error=True)
             return
         if len(self.panes) >= 4:
             self._append_notice("第一版最多同时打开 4 个 pane。", error=True)
             return
+        if session_id is not None:
+            mounted = self.sessions.pane_for_session(session_id)
+            if mounted is not None:
+                self._append_notice(
+                    f"会话已挂载在 {mounted.pane_slot} 号 pane，已聚焦。"
+                )
+                self._session_selected(session_id)
+                return
         if any(runtime.busy for runtime in self.panes.values()):
             self._append_notice(
                 "等待所有 pane 当前任务结束后再改变布局。", error=True
             )
             return
-        pane = self.sessions.split(direction)
+        pane = self.sessions.split(direction, session_id=session_id)
         runtime = self._pane_runtime(pane)
         self.panes[pane.pane_id] = runtime
         self.agent = runtime.agent
@@ -1008,10 +1646,7 @@ class LitCodeTUI(App[None]):
         runtime = self._active_runtime()
         self.agent = runtime.agent
         self.model = runtime.model
-        prompt = self.query_one(PromptArea)
-        prompt.disabled = runtime.busy
-        if not runtime.busy:
-            prompt.focus()
+        self.query_one(PromptArea).focus()
         self._update_status("运行中" if runtime.busy else "就绪")
 
     def action_cycle_pane(self) -> None:
@@ -1026,10 +1661,7 @@ class LitCodeTUI(App[None]):
         except Exception:
             pass
         runtime = self._sync_runtime(pane)
-        prompt = self.query_one(PromptArea)
-        prompt.disabled = runtime.busy
-        if not runtime.busy:
-            prompt.focus()
+        self.query_one(PromptArea).focus()
         self._update_status("运行中" if runtime.busy else "就绪")
 
     def record_prompt(self, value: str) -> None:
@@ -1086,114 +1718,66 @@ class LitCodeTUI(App[None]):
         if not messages:
             self._append_notice("当前会话没有未读消息。")
             return
+        lines = []
         for message in messages:
             source = self.store.session_info(message.source_session_id)
-            self._append_notice(
-                f"来自 {source.alias} · {source.title}：\n{message.content}"
-            )
+            lines.append(f"来自 {source.alias} · {source.title}：\n{message.content}")
+        self._list_or_notice("收件箱", "\n\n".join(lines))
         self._update_pane_header(self._active_runtime(), "就绪")
 
-    def action_orchestrate(self, objective: str) -> None:
-        objective = objective.strip()
-        if not objective:
+    def action_queue(self, arguments: str = "") -> None:
+        """Let the user inspect and mutate queued-but-not-started messages."""
+
+        runtime = self._active_runtime()
+        if runtime.session is None:
+            self._append_notice("当前 pane 为空，没有消息队列。")
+            return
+        parts = arguments.split()
+        messages = self.store.queue(runtime.session.session_id, include_finished=True)
+        if not parts:
+            if not messages:
+                self._append_notice("当前会话队列为空。")
+                return
+            lines = [
+                f"{message.id[:8]} · {message.status} · {message.content[:120]}"
+                for message in messages
+            ]
+            self._list_or_notice("消息队列", "\n".join(lines), runtime=runtime)
+            return
+        action = parts[0].lower()
+        if action not in {"cancel", "up", "down", "move"}:
             self._append_notice(
-                "用法：/orchestrate <需要多会话协作的目标>", error=True
+                "用法：/queue [cancel|up|down|move] <消息 ID> [before ID]",
+                error=True,
             )
             return
-        if self.busy:
-            self._append_notice("当前任务结束后才能启动编排。", error=True)
+        if len(parts) < 2:
+            self._append_notice("缺少消息 ID。", error=True)
+            return
+        message_id = _find_queue_message(messages, parts[1])
+        if message_id is None:
+            self._append_notice(f"找不到队列消息：{parts[1]}", error=True)
             return
         try:
-            run = self.orchestrator.start_run(self.session.session_id, objective)
-            self.orchestrator.approve_run(run.id, self.session.session_id)
-        except OrchestrationError as error:
+            if action == "cancel":
+                self.store.cancel_queued_message(message_id)
+            elif action in {"up", "down"}:
+                self.store.move_queued_message(
+                    runtime.session.session_id, message_id, -1 if action == "up" else 1
+                )
+            else:
+                if len(parts) < 3:
+                    raise ValueError("move 需要 before 消息 ID")
+                before = _find_queue_message(messages, parts[2])
+                if before is None:
+                    raise ValueError(f"找不到 before 消息：{parts[2]}")
+                self.store.reorder_queued_message(
+                    runtime.session.session_id, message_id, before
+                )
+        except (KeyError, ValueError) as error:
             self._append_notice(str(error), error=True)
             return
-        self._append_notice(
-            f"编排 {run.id} 已启动；当前 {self._active_runtime().pane_slot} 号为协调者。"
-        )
-        prompt = (
-            f"用户已批准 LitCode 受限编排 {run.id}。\n目标：{objective}\n"
-            "你是协调者。先检查任务和当前 pane 目录，再使用 delegate_session "
-            "把实现或审查任务交给同终端已挂载会话。每次只传有界目标、验收条件和路径；"
-            "收到结构化结果后决定审查或结束。所有任务结束后调用 "
-            "finish_orchestration。"
-        )
-        self._start_runtime_turn(self._active_runtime(), prompt)
-
-    def action_orchestration(self) -> None:
-        runs = list(
-            self.orchestrator.runs_for_session(self.session.session_id)
-        )
-        if not runs:
-            self._append_notice("当前会话没有活动编排。")
-            return
-        run = runs[-1]
-        lines = [f"协作日志 {run.id} · {run.status} · {run.objective}"]
-        for event in self.orchestrator.ledger(run.id)[-50:]:
-            source = _session_alias(self.store, event.source_session_id)
-            target = _session_alias(self.store, event.target_session_id)
-            route = f"{source} → {target}" if source or target else "system"
-            lines.append(
-                f"{datetime.fromtimestamp(event.created_at).strftime('%H:%M:%S')} "
-                f"{route} · {event.kind} · {event.summary[:160]}"
-            )
-        self._append_notice("\n".join(lines))
-
-    def action_pause_orchestration(self) -> None:
-        run = self._coordinator_run()
-        if run is None:
-            self._append_notice("当前会话没有可暂停的编排。", error=True)
-            return
-        try:
-            self.orchestrator.pause_run(run.id, self.session.session_id)
-        except OrchestrationError as error:
-            self._append_notice(str(error), error=True)
-            return
-        for runtime in self.panes.values():
-            if runtime.orchestration_task_id is not None:
-                runtime.cancel_requested.set()
-        self._append_notice(f"编排 {run.id} 已暂停；运行中的 turn 正在安全边界停止。")
-
-    def action_resume_orchestration(self) -> None:
-        run = self._coordinator_run()
-        if run is None:
-            self._append_notice("当前会话没有可恢复的编排。", error=True)
-            return
-        try:
-            self.orchestrator.resume_run(run.id, self.session.session_id)
-        except OrchestrationError as error:
-            self._append_notice(str(error), error=True)
-            return
-        self._append_notice(f"编排 {run.id} 已恢复。")
-        self._drive_orchestration()
-
-    def action_cancel_orchestration(self) -> None:
-        run = self._coordinator_run()
-        if run is None:
-            self._append_notice("当前会话没有可取消的编排。", error=True)
-            return
-        try:
-            self.orchestrator.cancel_run(
-                run.id, self.session.session_id, "用户从 TUI 取消编排"
-            )
-        except OrchestrationError as error:
-            self._append_notice(str(error), error=True)
-            return
-        for runtime in self.panes.values():
-            if runtime.orchestration_task_id is not None:
-                runtime.cancel_requested.set()
-        self._append_notice(f"编排 {run.id} 已取消。")
-
-    def _coordinator_run(self) -> OrchestrationRun | None:
-        return next(
-            (
-                run
-                for run in reversed(self.orchestrator.active_runs())
-                if run.coordinator_session_id == self.session.session_id
-            ),
-            None,
-        )
+        self._append_notice("队列已更新。", runtime=runtime)
 
     def action_clear_session(self) -> None:
         if self.busy:
@@ -1215,6 +1799,74 @@ class LitCodeTUI(App[None]):
             "已创建新会话，当前 pane 已切换；原会话没有结束，仍在后台，可用 /sessions 返回。"
         )
 
+    def action_nohup(self) -> None:
+        """Detach the mounted Session while leaving its actor alive."""
+
+        runtime = self._active_runtime()
+        if runtime.session is None:
+            self._append_notice("当前 pane 已经是空窗格。")
+            return
+        current = runtime.session.session_id
+        if self.busy:
+            self._append_notice("当前会话已卸载；正在运行的 turn 会继续。")
+        if len(self.panes) > 1:
+            removed_id, pane = self.sessions.close_active_pane()
+            del self.panes[removed_id]
+            self._sync_runtime(pane)
+            self._rebuild_panes()
+        else:
+            self.sessions.detach_active()
+            runtime.session = None
+            runtime.busy = False
+            self._reset_pane_view()
+            self._update_pane_header(runtime, "空窗格")
+        info = self.store.session_info(current)
+        self._append_notice(
+            f"会话 {info.alias} 已转入后台；可用 /sessions 重新挂载。"
+        )
+
+    def action_subagent(self, prompt: str) -> None:
+        prompt = prompt.strip()
+        if not prompt:
+            self._append_notice("用法：/subagent <目标 prompt>", error=True)
+            return
+        self._ensure_active_session()
+        try:
+            info = self.runtime.create_subagent_session(
+                self.session.session_id, prompt, start=True
+            )
+        except Exception as error:
+            self._append_notice(str(error), error=True)
+            return
+        self._append_notice(
+            f"已创建子会话 {info.alias}；它会在自己的队列中运行，可从 /sessions 挂载。"
+        )
+
+    def action_history(self, arguments: str = "") -> None:
+        """Open the interactive session-tree picker.
+
+        允许在任意时刻打开：当前 pane 的任务不会被中断，切换后它转入后台
+        继续运行。``arguments`` 作为预填的筛选关键字。
+        """
+
+        rows = self.store.session_tree(self.settings.workspace)
+        if not rows:
+            self._append_notice("当前还没有会话。")
+            return
+        active = self.sessions.active
+        current_id = active.session.session_id if active.session is not None else None
+        self.push_screen(
+            HistoryPicker(
+                rows,
+                mounted=self.sessions.mounted_sessions(),
+                running=set(self.running_sessions),
+                terminal_id=self.sessions.terminal_id,
+                query=arguments.strip(),
+                current_session_id=current_id,
+            ),
+            self._session_selected,
+        )
+
     def _reset_pane_view(self) -> None:
         runtime = self._active_runtime()
         timeline = self._timeline(runtime)
@@ -1224,30 +1876,14 @@ class LitCodeTUI(App[None]):
         runtime.streaming_markdown = None
         runtime.rendered_output = None
 
-    def action_choose_session(self) -> None:
-        if self.busy:
-            self._append_notice("当前任务结束后才能切换会话。", error=True)
-            return
-        sessions = self.sessions.catalog()
-        choices = tuple(
-            (
-                item.info.id,
-                f"{_catalog_marker(item.scope, item.pane_slot)} "
-                f"{item.info.alias} · {item.info.title} · {item.info.model}",
-            )
-            for item in sessions
-        )
-        if not choices:
-            self._append_notice("没有可恢复的会话。")
-            return
-        self.push_screen(ChoicePicker("恢复会话", choices), self._session_selected)
-
     def _session_selected(self, identifier: str | None) -> None:
-        if identifier is None or identifier == self.session.session_id:
+        active = self._active_runtime()
+        if identifier is None:
             return
-        if self.busy:
-            self._append_notice("当前任务结束后才能切换会话。", error=True)
+        if active.session is not None and identifier == active.session.session_id:
+            self._append_notice("该会话已经挂载在当前 pane。")
             return
+        previous_id = active.session.session_id if active.session is not None else None
         mounted = self.sessions.pane_for_session(identifier)
         if mounted is not None:
             previous = self.active_pane_id
@@ -1258,22 +1894,26 @@ class LitCodeTUI(App[None]):
             except Exception:
                 pass
             runtime = self._sync_runtime(mounted)
-            prompt = self.query_one(PromptArea)
-            prompt.disabled = runtime.busy
-            if not runtime.busy:
-                prompt.focus()
+            self.query_one(PromptArea).focus()
             self._update_status("运行中" if runtime.busy else "就绪")
             return
         self._sync_runtime(self.sessions.switch_active(identifier))
         runtime = self._active_runtime()
-        if runtime.session.session_id in self.running_sessions:
-            runtime.busy = True
-            prompt = self.query_one(PromptArea)
-            prompt.disabled = True
+        assert runtime.session is not None
+        running = runtime.session.session_id in self.running_sessions
+        runtime.busy = running
+        if running:
             self._update_status("运行中")
-            self._append_notice("已恢复仍在运行中的会话；任务结束后恢复输入。")
+            self._render_session_history(
+                "已恢复仍在运行中的会话；可以继续输入消息，它们会进入队列。"
+            )
             return
+        self._set_pane_busy(runtime, False, "就绪")
         self._render_session_history("已恢复会话")
+        if previous_id is not None and previous_id in self.running_sessions:
+            self._append_notice(
+                "原会话已转入后台继续运行。", runtime=runtime
+            )
 
     def action_compact(self, instructions: str = "") -> None:
         if self.busy:
@@ -1320,7 +1960,8 @@ class LitCodeTUI(App[None]):
             self.push_screen(RewindMode(), self._rewind_mode_selected)
 
     def _rewind_mode_selected(self, mode: str | None) -> None:
-        checkpoint = getattr(self, "_pending_checkpoint", None)
+        checkpoint = self._pending_checkpoint
+        self._pending_checkpoint = None
         if checkpoint is None or mode is None:
             return
         try:
@@ -1382,7 +2023,10 @@ class LitCodeTUI(App[None]):
         runtime.streaming_markdown = None
         runtime.streaming_buffer = ""
         runtime.rendered_output = None
-        for message in runtime.session.messages[1:]:
+        if runtime.session is None:
+            return
+        session = runtime.session
+        for message in session.messages[1:]:
             content = message.get("content")
             if not isinstance(content, str) or not content:
                 continue
@@ -1440,11 +2084,11 @@ class LitCodeTUI(App[None]):
     def confirm_session_message(self, description: str) -> bool:
         return self._confirm_action(description, "跨会话消息确认")
 
-    def confirm_session_wake(self, description: str) -> bool:
-        return self._confirm_action(description, "自动唤醒会话确认")
-
     def confirm_session_read(self, description: str) -> bool:
         return self._confirm_action(description, "跨会话读取确认")
+
+    def confirm_session_control(self, description: str) -> bool:
+        return self._confirm_action(description, "会话控制确认")
 
     def _confirm_action(self, content: str, title: str) -> bool:
         finished = threading.Event()
@@ -1463,6 +2107,33 @@ class LitCodeTUI(App[None]):
         finished.wait()
         self.pending_confirmations.discard(finished)
         return decision["allowed"]
+
+    def ask_user(
+        self, session_id: str, questions: list[QuestionSpec]
+    ) -> list[list[str]]:
+        """Show a question dialog and wait (worker thread); reject yields None."""
+
+        pending = _PendingQuestion(session_id, questions)
+        request_id = f"q-{len(self.pending_questions) + 1}"
+        self.pending_questions[request_id] = pending
+        alias = self.store.session_info(session_id).alias
+
+        def resolved(answers: list[list[str]] | None) -> None:
+            pending.answers = answers
+            pending.finished.set()
+
+        self.call_from_thread(
+            self.push_screen,
+            QuestionPrompt(questions, f"Agent 提问 · {alias}"),
+            resolved,
+        )
+        pending.finished.wait()
+        self.pending_questions.pop(request_id, None)
+        if pending.answers is None:
+            raise ToolError(
+                "用户取消了提问。请按你自己的判断继续执行，或改用合理的默认值。"
+            )
+        return pending.answers
 
     def _append_user_bundle(self, bundle: ReferenceBundle) -> None:
         content = bundle.display_text
@@ -1495,8 +2166,33 @@ class LitCodeTUI(App[None]):
         classes = "notice notice-error" if error else "notice"
         self._mount_timeline(Static(Text(content), classes=classes), runtime)
 
+    def _append_notice_card(
+        self,
+        title: str,
+        content: str,
+        runtime: PaneRuntime | None = None,
+    ) -> None:
+        """Long list outputs are folded into a collapsible, paged card."""
+
+        body = PagedOutput(content)
+        card = Collapsible(body, title=title, collapsed=True)
+        self._mount_timeline(card, runtime)
+
+    def _list_or_notice(
+        self,
+        title: str,
+        content: str,
+        runtime: PaneRuntime | None = None,
+    ) -> None:
+        """Small lists stay as plain notices; long ones become folded cards."""
+
+        if len(content.splitlines()) > LIST_CARD_LINE_THRESHOLD:
+            self._append_notice_card(title, content, runtime=runtime)
+            return
+        self._append_notice(f"{title}：\n{content}", runtime=runtime)
+
     def _append_tool(self, tool_call: ToolCall, runtime: PaneRuntime) -> None:
-        body = Static(Text("运行中…"))
+        body = PagedOutput("运行中…")
         card = Collapsible(
             body,
             title=tool_title(tool_call, "●"),
@@ -1512,6 +2208,7 @@ class LitCodeTUI(App[None]):
         content: str,
         is_error: bool,
         runtime: PaneRuntime,
+        file_change: FileChange | None = None,
     ) -> None:
         body = runtime.tool_bodies.get(tool_call.id)
         card = runtime.tool_cards.get(tool_call.id)
@@ -1520,49 +2217,30 @@ class LitCodeTUI(App[None]):
             return
         card.title = tool_title(tool_call, "✗" if is_error else "✓")
         card.add_class("tool-failed" if is_error else "tool-succeeded")
-        body.update(Text(tool_result_summary(content, is_error)))
+        if is_error:
+            summary = tool_result_summary(content, is_error)
+        elif file_change is not None and tool_call.name == "apply_patch":
+            summary = change_result_summary(file_change)
+        else:
+            summary = tool_result_summary(content, is_error)
+        body.set_content(summary)
         for item in self.panes.values():
             self._update_pane_header(item, "运行中" if item.busy else "就绪")
 
-    def _finish_turn(
-        self, output: str, succeeded: bool, session_id: str, task_id: str | None
-    ) -> None:
+    def _finish_with_error(self, message: str, session_id: str | None = None) -> None:
+        if session_id is None:
+            session_id = (
+                self._active_runtime().session.session_id
+                if self._active_runtime().session is not None
+                else None
+            )
+        if session_id is None:
+            self._append_notice(message, error=True)
+            self._set_busy(False, "错误")
+            return
         self.running_sessions.discard(session_id)
         runtime = self._runtime_for_session(session_id)
         if runtime is None:
-            self._finish_detached_task(task_id)
-            return
-        if output and output != runtime.rendered_output:
-            self._append_assistant(output, runtime)
-        runtime.rendered_output = None
-        if not succeeded:
-            self._append_notice("本轮未正常完成。", error=True, runtime=runtime)
-        runtime.orchestration_task_id = None
-        if task_id is not None:
-            task = self.orchestrator.get_task(task_id)
-            if task.status == "running":
-                self.orchestrator.interrupt_task(
-                    task_id,
-                    "目标会话结束了模型 turn，但没有调用 report_task 提交结构化结果。",
-                )
-        self._set_pane_busy(runtime, False, "就绪")
-        self._drive_orchestration()
-
-    def _finish_detached_task(self, task_id: str | None) -> None:
-        if task_id is None:
-            return
-        task = self.orchestrator.get_task(task_id)
-        if task.status == "running":
-            self.orchestrator.interrupt_task(task_id, "目标会话已离开 pane，turn 结束。")
-        self._drive_orchestration()
-
-    def _finish_with_error(
-        self, message: str, session_id: str, task_id: str | None = None
-    ) -> None:
-        self.running_sessions.discard(session_id)
-        runtime = self._runtime_for_session(session_id)
-        if runtime is None:
-            self._finish_detached_task(task_id)
             return
         if runtime.streaming_markdown is not None:
             partial = runtime.streaming_buffer
@@ -1574,11 +2252,7 @@ class LitCodeTUI(App[None]):
             runtime.streaming_markdown = None
             runtime.streaming_buffer = ""
         self._append_notice(message, error=True, runtime=runtime)
-        runtime.orchestration_task_id = None
-        if task_id is not None:
-            self.orchestrator.interrupt_task(task_id, f"目标会话运行失败：{message}")
         self._set_pane_busy(runtime, False, "错误")
-        self._drive_orchestration()
 
     def _set_busy(self, busy: bool, status: str) -> None:
         self._set_pane_busy(self._active_runtime(), busy, status)
@@ -1590,11 +2264,9 @@ class LitCodeTUI(App[None]):
         self._update_pane_header(runtime, status)
         if runtime.pane_id != self.active_pane_id:
             return
-        prompt = self.query_one(PromptArea)
-        prompt.disabled = busy
         self._update_status(status)
         if not busy:
-            prompt.focus()
+            self.query_one(PromptArea).focus()
             self.refresh_completions()
 
     def _update_pane_status(self, runtime: PaneRuntime, status: str) -> None:
@@ -1606,6 +2278,9 @@ class LitCodeTUI(App[None]):
         try:
             header = self.query_one(f"#view-{runtime.pane_id} .pane-header", Static)
         except Exception:
+            return
+        if runtime.session is None:
+            header.update(Text(f"{runtime.pane_slot}  空窗格 · {status}"))
             return
         info = self.store.session_info(runtime.session.session_id)
         unread = len(self.store.inbox(runtime.session.session_id))
@@ -1701,8 +2376,12 @@ class LitCodeTUI(App[None]):
             self.hide_completions()
             return
         if context.kind == "command":
-            candidates = [item.name for item in COMMANDS]
-            descriptions = {item.name: item.description for item in COMMANDS}
+            descriptions = {
+                name: item.description
+                for item in COMMANDS
+                for name in (item.name, *item.aliases)
+            }
+            candidates = list(descriptions)
             matches = _fuzzy_matches(context.query, candidates, 8)
             labels = [f"{name:<10} {descriptions[name]}" for name in matches]
         elif context.kind == "session":
@@ -1873,21 +2552,6 @@ def _catalog_marker(scope: str, pane_slot: int | None) -> str:
     return "[历史]"
 
 
-def _session_alias(store: SessionStore, session_id: str | None) -> str:
-    if session_id is None:
-        return ""
-    try:
-        return store.session_info(session_id).alias
-    except KeyError:
-        return session_id[:8]
-
-
-def _scheduler_notice(action: SchedulerAction) -> str:
-    if action.kind == "wake_task":
-        return f"编排 {action.run_id} 自动唤醒 {action.pane_slot} 号 · {action.task_id}"
-    return f"编排 {action.run_id} 恢复协调者 · 收到 {action.task_id} 的结果"
-
-
 def _rank_session_matches(entries, query: str, limit: int):
     if not query:
         return list(entries[:limit])
@@ -1910,6 +2574,106 @@ def _rank_session_matches(entries, query: str, limit: int):
         for _, negative_score, _, entry in sorted(scored)
         if negative_score < 0
     ][:limit]
+
+
+def _find_queue_message(messages, reference: str) -> str | None:
+    """Accept a full queue id or its unambiguous short display prefix."""
+
+    matches = [message.id for message in messages if message.id == reference]
+    if not matches:
+        matches = [message.id for message in messages if message.id.startswith(reference)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _history_label(
+    info: SessionInfo,
+    mounted: dict[str, int],
+    running: set[str],
+    current_session_id: str | None = None,
+    depth: int = 0,
+) -> Text:
+    """一行有界标签：主文本截断、时间戳按节点深度贴齐同一右缘。"""
+
+    markers = []
+    if info.id == current_session_id:
+        markers.append("当前")
+    if info.id in mounted:
+        markers.append(f"[{mounted[info.id]}]")
+    elif info.id in running or info.active_turn_id is not None:
+        markers.append("● 运行中")
+    if info.paused:
+        markers.append("已暂停")
+    title = info.title if len(info.title) <= 24 else f"{info.title[:23]}…"
+    main = f"{' '.join(markers)} " if markers else ""
+    main += f"{info.alias} · {title}"
+    if info.queue_size:
+        main += f" · 队列 {info.queue_size}"
+    age = _relative_time(info.updated_at)
+    target = PICKER_LABEL_CELLS - depth * PICKER_GUIDE_DEPTH - _cell_width(age)
+    main, _ = _truncate_cells(main, target)
+    padding = target - _cell_width(main)
+    label = Text(main)
+    if padding > 0:
+        label.append(" " * padding)
+    label.append(age, style="dim")
+    return label
+
+
+def _truncate_cells(text: str, limit: int) -> tuple[str, bool]:
+    """按显示宽度（中文占 2 列）截断文本并追加省略号。"""
+
+    if _cell_width(text) <= limit:
+        return text, False
+    out: list[str] = []
+    width = 0
+    for character in text:
+        cell = 2 if ord(character) > 0x2E80 else 1
+        if width + cell > limit - 1:
+            break
+        out.append(character)
+        width += cell
+    return "".join(out) + "…", True
+
+
+def _relative_time(timestamp: float) -> str:
+    """Compact age for the right edge of a picker row."""
+
+    seconds = max(0, time.time() - timestamp)
+    if seconds < 90:
+        return "刚刚"
+    minutes = seconds / 60
+    if minutes < 90:
+        return f"{int(minutes)}m"
+    hours = seconds / 3600
+    if hours < 24:
+        return f"{int(hours)}h"
+    days = hours / 24
+    if days < 31:
+        return f"{int(days)}d"
+    created = datetime.fromtimestamp(timestamp)
+    return created.strftime("%m-%d")
+
+
+def _cell_width(text: str) -> int:
+    return sum(2 if ord(character) > 0x2E80 else 1 for character in text)
+
+
+def _diff_style(line: str) -> str:
+    if line.startswith("+"):
+        return "bold green"
+    if line.startswith("-") and not line.startswith("---"):
+        return "bold red"
+    if line.startswith("@"):
+        return "cyan"
+    if line.startswith("…"):
+        return "dim"
+    return ""
+
+
+def _first_leaf(node: PaneNode) -> str:
+    while isinstance(node, PaneBranch):
+        node = node.first
+    return node.pane_id
 
 
 def _display_user_content(content: str) -> str:

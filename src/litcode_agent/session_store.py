@@ -14,16 +14,9 @@ from functools import wraps
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence
+from typing import Callable, Concatenate, Literal, Mapping, ParamSpec, Sequence, TypeVar
 
 from litcode_agent.model import Message
-from litcode_agent.orchestration import (
-    OrchestrationEvent,
-    OrchestrationRun,
-    OrchestrationTask,
-    RunStatus,
-    TaskStatus,
-)
 from litcode_agent.tools.base import FileChange
 from litcode_agent.tools.workspace import Workspace
 
@@ -38,6 +31,46 @@ class SessionInfo:
     parent_id: str | None = None
     origin_terminal_id: str | None = None
     origin_pane_slot: int | None = None
+    profile: str = "general"
+    paused: bool = False
+    status: str = "idle"
+    activity: str = ""
+    queue_size: int = 0
+    active_turn_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedMessage:
+    """A durable item in one Session's shared FIFO mailbox."""
+
+    id: str
+    sequence: int
+    target_session_id: str
+    source_session_id: str | None
+    content: str
+    kind: str
+    status: str
+    created_at: float
+    started_at: float | None = None
+    finished_at: float | None = None
+    result: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTurn:
+    """Durable execution state; invocation identity lives in this table."""
+
+    id: str
+    session_id: str
+    input: str
+    status: str
+    root_turn_id: str
+    parent_turn_id: str | None
+    output: str | None
+    reason: str | None
+    created_at: float
+    started_at: float | None = None
+    finished_at: float | None = None
 
 
 SessionScope = Literal["mounted", "current_terminal", "history"]
@@ -124,11 +157,21 @@ class _LockedConnection:
             self._lock.release()
 
 
-def _synchronized(method: Any) -> Any:
+StoreParameters = ParamSpec("StoreParameters")
+StoreResult = TypeVar("StoreResult")
+
+
+def _synchronized(
+    method: Callable[Concatenate[SessionStore, StoreParameters], StoreResult]
+) -> Callable[Concatenate[SessionStore, StoreParameters], StoreResult]:
     """Hold the store lock for complete execute/fetch/transaction sequences."""
 
     @wraps(method)
-    def wrapped(self: SessionStore, *args: Any, **kwargs: Any) -> Any:
+    def wrapped(
+        self: SessionStore,
+        *args: StoreParameters.args,
+        **kwargs: StoreParameters.kwargs,
+    ) -> StoreResult:
         with self._lock:
             return method(self, *args, **kwargs)
 
@@ -159,6 +202,11 @@ class SessionStore:
                 title TEXT NOT NULL,
                 model TEXT NOT NULL,
                 parent_id TEXT,
+                profile TEXT NOT NULL DEFAULT 'general',
+                paused INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'idle',
+                activity TEXT NOT NULL DEFAULT '',
+                active_turn_id TEXT,
                 messages_json TEXT NOT NULL,
                 summary TEXT,
                 summary_boundary INTEGER,
@@ -167,6 +215,37 @@ class SessionStore:
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS session_queue (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                target_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                source_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                content TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'message',
+                status TEXT NOT NULL DEFAULT 'queued',
+                queue_position REAL NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL,
+                result TEXT
+            );
+            CREATE INDEX IF NOT EXISTS session_queue_target_idx
+                ON session_queue(target_session_id, status, sequence);
+            CREATE TABLE IF NOT EXISTS session_turns (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                input TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                root_turn_id TEXT NOT NULL,
+                parent_turn_id TEXT REFERENCES session_turns(id) ON DELETE SET NULL,
+                output TEXT,
+                reason TEXT,
+                created_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS session_turns_session_idx
+                ON session_turns(session_id, created_at);
             CREATE TABLE IF NOT EXISTS checkpoints (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -200,50 +279,6 @@ class SessionStore:
                 capsule TEXT NOT NULL,
                 created_at REAL NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS orchestration_runs (
-                id TEXT PRIMARY KEY,
-                workspace TEXT NOT NULL,
-                coordinator_session_id TEXT NOT NULL REFERENCES sessions(id),
-                objective TEXT NOT NULL,
-                status TEXT NOT NULL,
-                max_tasks INTEGER NOT NULL,
-                model_requests INTEGER NOT NULL,
-                max_model_requests INTEGER NOT NULL,
-                deadline REAL NOT NULL,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS orchestration_tasks (
-                id TEXT PRIMARY KEY,
-                run_id TEXT NOT NULL REFERENCES orchestration_runs(id) ON DELETE CASCADE,
-                parent_task_id TEXT,
-                source_session_id TEXT NOT NULL REFERENCES sessions(id),
-                target_session_id TEXT NOT NULL REFERENCES sessions(id),
-                role TEXT NOT NULL,
-                objective TEXT NOT NULL,
-                acceptance_json TEXT NOT NULL,
-                allowed_paths_json TEXT NOT NULL,
-                write_policy TEXT NOT NULL,
-                status TEXT NOT NULL,
-                attempt INTEGER NOT NULL,
-                hop INTEGER NOT NULL,
-                summary TEXT NOT NULL,
-                evidence_json TEXT NOT NULL,
-                changed_files_json TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS orchestration_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL REFERENCES orchestration_runs(id) ON DELETE CASCADE,
-                task_id TEXT,
-                kind TEXT NOT NULL,
-                actor_session_id TEXT,
-                source_session_id TEXT,
-                target_session_id TEXT,
-                summary TEXT NOT NULL,
-                created_at REAL NOT NULL
-            );
             """
         )
         self._migrate_schema()
@@ -262,19 +297,24 @@ class SessionStore:
         session_id: str | None = None,
         title: str = "新会话",
         parent_id: str | None = None,
+        profile: str = "general",
+        paused: bool = False,
         origin_terminal_id: str | None = None,
         origin_pane_slot: int | None = None,
     ) -> str:
+        if not profile.strip():
+            raise ValueError("profile must not be empty")
         identifier = session_id or str(uuid.uuid4())
         now = time.time()
         alias = self._new_alias(identifier, now)
         with self.connection:
             self.connection.execute(
                 "INSERT INTO sessions "
-                "(id, alias, workspace, title, model, parent_id, messages_json, "
+                "(id, alias, workspace, title, model, parent_id, profile, paused, "
+                "status, activity, active_turn_id, messages_json, "
                 "summary, summary_boundary, origin_terminal_id, origin_pane_slot, "
                 "created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', NULL, ?, NULL, NULL, ?, ?, ?, ?)",
                 (
                     identifier,
                     alias,
@@ -282,6 +322,9 @@ class SessionStore:
                     title,
                     model,
                     parent_id,
+                    profile,
+                    int(paused),
+                    "paused" if paused else "idle",
                     _messages_json(messages),
                     origin_terminal_id,
                     origin_pane_slot,
@@ -295,7 +338,7 @@ class SessionStore:
     def save_messages(
         self, session_id: str, messages: Sequence[Message], *, title: str | None = None
     ) -> None:
-        values: list[Any] = [_messages_json(messages), time.time()]
+        values: list[object] = [_messages_json(messages), time.time()]
         sql = "UPDATE sessions SET messages_json = ?, updated_at = ?"
         if title is not None:
             sql += ", title = ?"
@@ -318,11 +361,13 @@ class SessionStore:
     def list_sessions(self, workspace: Path, limit: int = 50) -> tuple[SessionInfo, ...]:
         rows = self.connection.execute(
             "SELECT id, alias, title, model, updated_at, parent_id, "
-            "origin_terminal_id, origin_pane_slot FROM sessions "
+            "origin_terminal_id, origin_pane_slot, profile, paused, status, activity, active_turn_id, "
+            "(SELECT COUNT(*) FROM session_queue AS q WHERE q.target_session_id = sessions.id "
+            "AND q.status = 'queued') AS queue_size FROM sessions "
             "WHERE workspace = ? ORDER BY updated_at DESC LIMIT ?",
             (str(workspace.resolve()), limit),
         ).fetchall()
-        return tuple(SessionInfo(**dict(row)) for row in rows)
+        return tuple(_session_info(row) for row in rows)
 
     @_synchronized
     def session_catalog(
@@ -341,12 +386,14 @@ class SessionStore:
         needle = query.casefold().strip()
         rows = self.connection.execute(
             "SELECT id, alias, title, model, updated_at, parent_id, "
-            "origin_terminal_id, origin_pane_slot FROM sessions WHERE workspace = ?",
+            "origin_terminal_id, origin_pane_slot, profile, paused, status, activity, active_turn_id, "
+            "(SELECT COUNT(*) FROM session_queue AS q WHERE q.target_session_id = sessions.id "
+            "AND q.status = 'queued') AS queue_size FROM sessions WHERE workspace = ?",
             (str(workspace.resolve()),),
         ).fetchall()
         entries = []
         for row in rows:
-            info = SessionInfo(**dict(row))
+            info = _session_info(row)
             if needle and needle not in info.alias.casefold() and needle not in info.title.casefold():
                 continue
             pane_slot = mounted.get(info.id)
@@ -372,13 +419,15 @@ class SessionStore:
     def session_info(self, session_id: str) -> SessionInfo:
         row = self.connection.execute(
             "SELECT id, alias, title, model, updated_at, parent_id, "
-            "origin_terminal_id, origin_pane_slot "
+            "origin_terminal_id, origin_pane_slot, profile, paused, status, activity, active_turn_id, "
+            "(SELECT COUNT(*) FROM session_queue AS q WHERE q.target_session_id = sessions.id "
+            "AND q.status = 'queued') AS queue_size "
             "FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
         if row is None:
             raise KeyError(session_id)
-        return SessionInfo(**dict(row))
+        return _session_info(row)
 
     @_synchronized
     def session_capsule(
@@ -494,6 +543,24 @@ class SessionStore:
                     message.content,
                     message.created_at,
                 ),
+            )
+            # Keep the legacy unread projection for old callers while making
+            # the durable Session Queue the source consumed by new actors.
+            self.connection.execute(
+                "INSERT INTO session_queue "
+                "(id, target_session_id, source_session_id, content, kind, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'message', 'queued', ?)",
+                (
+                    message.id,
+                    message.target_session_id,
+                    message.source_session_id,
+                    message.content,
+                    message.created_at,
+                ),
+            )
+            self.connection.execute(
+                "UPDATE session_queue SET queue_position = sequence WHERE id = ?",
+                (message.id,),
             )
         return message
 
@@ -611,296 +678,17 @@ class SessionStore:
         return row is not None
 
     @_synchronized
-    def session_id_for_alias(self, workspace: Path, alias: str) -> str:
-        return self._session_id_for_alias(workspace, alias)
+    def session_id_for_reference(self, workspace: Path, reference: str) -> str:
+        """Resolve a same-workspace Session by stable id or display alias."""
 
-    @_synchronized
-    def create_orchestration_run(self, run: OrchestrationRun) -> None:
-        with self.connection:
-            self.connection.execute(
-                "INSERT INTO orchestration_runs "
-                "(id, workspace, coordinator_session_id, objective, status, "
-                "max_tasks, model_requests, max_model_requests, deadline, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    run.id,
-                    run.workspace,
-                    run.coordinator_session_id,
-                    run.objective,
-                    run.status,
-                    run.max_tasks,
-                    run.model_requests,
-                    run.max_model_requests,
-                    run.deadline,
-                    run.created_at,
-                    run.updated_at,
-                ),
-            )
-
-    @_synchronized
-    def orchestration_run(self, run_id: str) -> OrchestrationRun:
+        root = str(workspace.resolve())
         row = self.connection.execute(
-            "SELECT * FROM orchestration_runs WHERE id = ?", (run_id,)
+            "SELECT id FROM sessions WHERE workspace = ? AND (id = ? OR alias = ?)",
+            (root, reference, reference),
         ).fetchone()
         if row is None:
-            raise KeyError(run_id)
-        return _orchestration_run(row)
-
-    @_synchronized
-    def active_orchestration_run(
-        self, workspace: Path, coordinator_session_id: str
-    ) -> OrchestrationRun | None:
-        row = self.connection.execute(
-            "SELECT * FROM orchestration_runs WHERE workspace = ? "
-            "AND coordinator_session_id = ? "
-            "AND status IN ('proposed', 'running', 'paused') "
-            "ORDER BY created_at DESC LIMIT 1",
-            (str(workspace.resolve()), coordinator_session_id),
-        ).fetchone()
-        return _orchestration_run(row) if row is not None else None
-
-    @_synchronized
-    def active_orchestration_runs(
-        self, workspace: Path
-    ) -> tuple[OrchestrationRun, ...]:
-        rows = self.connection.execute(
-            "SELECT * FROM orchestration_runs WHERE workspace = ? "
-            "AND status IN ('proposed', 'running', 'paused') "
-            "ORDER BY created_at",
-            (str(workspace.resolve()),),
-        ).fetchall()
-        return tuple(_orchestration_run(row) for row in rows)
-
-    @_synchronized
-    def orchestration_runs_for_session(
-        self, workspace: Path, session_id: str
-    ) -> tuple[OrchestrationRun, ...]:
-        rows = self.connection.execute(
-            "SELECT DISTINCT run.* FROM orchestration_runs AS run "
-            "LEFT JOIN orchestration_tasks AS task ON task.run_id = run.id "
-            "WHERE run.workspace = ? AND "
-            "(run.coordinator_session_id = ? OR task.target_session_id = ?) "
-            "ORDER BY run.created_at",
-            (str(workspace.resolve()), session_id, session_id),
-        ).fetchall()
-        return tuple(_orchestration_run(row) for row in rows)
-
-    @_synchronized
-    def update_orchestration_run_status(
-        self, run_id: str, status: RunStatus
-    ) -> OrchestrationRun:
-        with self.connection:
-            cursor = self.connection.execute(
-                "UPDATE orchestration_runs SET status = ?, updated_at = ? WHERE id = ?",
-                (status, time.time(), run_id),
-            )
-        if cursor.rowcount != 1:
-            raise KeyError(run_id)
-        return self.orchestration_run(run_id)
-
-    @_synchronized
-    def consume_orchestration_model_request(self, run_id: str, now: float) -> None:
-        with self.connection:
-            cursor = self.connection.execute(
-                "UPDATE orchestration_runs SET model_requests = model_requests + 1, "
-                "updated_at = ? WHERE id = ? AND status = 'running' "
-                "AND model_requests < max_model_requests AND deadline >= ?",
-                (now, run_id, now),
-            )
-        if cursor.rowcount != 1:
-            raise RuntimeError("orchestration model request budget changed concurrently")
-
-    @_synchronized
-    def create_orchestration_task(self, task: OrchestrationTask) -> None:
-        with self.connection:
-            self.connection.execute(
-                "INSERT INTO orchestration_tasks "
-                "(id, run_id, parent_task_id, source_session_id, target_session_id, "
-                "role, objective, acceptance_json, allowed_paths_json, write_policy, "
-                "status, attempt, hop, summary, evidence_json, changed_files_json, "
-                "created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    task.id,
-                    task.run_id,
-                    task.parent_task_id,
-                    task.source_session_id,
-                    task.target_session_id,
-                    task.role,
-                    task.objective,
-                    json.dumps(task.acceptance, ensure_ascii=False),
-                    json.dumps(task.allowed_paths, ensure_ascii=False),
-                    task.write_policy,
-                    task.status,
-                    task.attempt,
-                    task.hop,
-                    task.summary,
-                    json.dumps(task.evidence, ensure_ascii=False),
-                    json.dumps(task.changed_files, ensure_ascii=False),
-                    task.created_at,
-                    task.updated_at,
-                ),
-            )
-
-    @_synchronized
-    def orchestration_task(self, task_id: str) -> OrchestrationTask:
-        row = self.connection.execute(
-            "SELECT * FROM orchestration_tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if row is None:
-            raise KeyError(task_id)
-        return _orchestration_task(row)
-
-    @_synchronized
-    def orchestration_tasks(self, run_id: str) -> tuple[OrchestrationTask, ...]:
-        rows = self.connection.execute(
-            "SELECT * FROM orchestration_tasks WHERE run_id = ? ORDER BY created_at, id",
-            (run_id,),
-        ).fetchall()
-        return tuple(_orchestration_task(row) for row in rows)
-
-    @_synchronized
-    def running_task_for_session(
-        self, session_id: str
-    ) -> OrchestrationTask | None:
-        row = self.connection.execute(
-            "SELECT * FROM orchestration_tasks WHERE target_session_id = ? "
-            "AND status = 'running' ORDER BY created_at LIMIT 1",
-            (session_id,),
-        ).fetchone()
-        return _orchestration_task(row) if row is not None else None
-
-    @_synchronized
-    def update_orchestration_task_status(
-        self, task_id: str, status: TaskStatus
-    ) -> OrchestrationTask:
-        with self.connection:
-            cursor = self.connection.execute(
-                "UPDATE orchestration_tasks SET status = ?, updated_at = ? WHERE id = ?",
-                (status, time.time(), task_id),
-            )
-        if cursor.rowcount != 1:
-            raise KeyError(task_id)
-        return self.orchestration_task(task_id)
-
-    @_synchronized
-    def complete_orchestration_task(
-        self,
-        task_id: str,
-        status: TaskStatus,
-        *,
-        summary: str,
-        evidence: tuple[str, ...],
-        changed_files: tuple[str, ...],
-    ) -> OrchestrationTask:
-        with self.connection:
-            cursor = self.connection.execute(
-                "UPDATE orchestration_tasks SET status = ?, summary = ?, "
-                "evidence_json = ?, changed_files_json = ?, updated_at = ? "
-                "WHERE id = ?",
-                (
-                    status,
-                    summary,
-                    json.dumps(evidence, ensure_ascii=False),
-                    json.dumps(changed_files, ensure_ascii=False),
-                    time.time(),
-                    task_id,
-                ),
-            )
-        if cursor.rowcount != 1:
-            raise KeyError(task_id)
-        return self.orchestration_task(task_id)
-
-    @_synchronized
-    def cancel_orchestration_tasks(self, run_id: str) -> None:
-        with self.connection:
-            self.connection.execute(
-                "UPDATE orchestration_tasks SET status = 'cancelled', updated_at = ? "
-                "WHERE run_id = ? AND status IN ('queued', 'running')",
-                (time.time(), run_id),
-            )
-
-    @_synchronized
-    def add_orchestration_event(
-        self,
-        run_id: str,
-        *,
-        kind: str,
-        actor_session_id: str | None,
-        source_session_id: str | None,
-        target_session_id: str | None,
-        summary: str,
-        task_id: str | None = None,
-    ) -> OrchestrationEvent:
-        created_at = time.time()
-        with self.connection:
-            cursor = self.connection.execute(
-                "INSERT INTO orchestration_events "
-                "(run_id, task_id, kind, actor_session_id, source_session_id, "
-                "target_session_id, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    run_id,
-                    task_id,
-                    kind,
-                    actor_session_id,
-                    source_session_id,
-                    target_session_id,
-                    summary,
-                    created_at,
-                ),
-            )
-        return OrchestrationEvent(
-            int(cursor.lastrowid),
-            run_id,
-            task_id,
-            kind,
-            actor_session_id,
-            source_session_id,
-            target_session_id,
-            summary,
-            created_at,
-        )
-
-    @_synchronized
-    def orchestration_events(
-        self, run_id: str
-    ) -> tuple[OrchestrationEvent, ...]:
-        rows = self.connection.execute(
-            "SELECT * FROM orchestration_events WHERE run_id = ? ORDER BY id",
-            (run_id,),
-        ).fetchall()
-        return tuple(_orchestration_event(row) for row in rows)
-
-    @_synchronized
-    def recover_interrupted_orchestrations(self, workspace: Path) -> None:
-        rows = self.connection.execute(
-            "SELECT task.id AS task_id, task.run_id, task.target_session_id, "
-            "run.coordinator_session_id FROM orchestration_tasks AS task "
-            "JOIN orchestration_runs AS run ON run.id = task.run_id "
-            "WHERE run.workspace = ? AND task.status = 'running'",
-            (str(workspace.resolve()),),
-        ).fetchall()
-        for row in rows:
-            with self.connection:
-                self.connection.execute(
-                    "UPDATE orchestration_tasks SET status = 'interrupted', "
-                    "updated_at = ? WHERE id = ?",
-                    (time.time(), row["task_id"]),
-                )
-                self.connection.execute(
-                    "UPDATE orchestration_runs SET status = 'paused', updated_at = ? "
-                    "WHERE id = ?",
-                    (time.time(), row["run_id"]),
-                )
-            self.add_orchestration_event(
-                row["run_id"],
-                task_id=row["task_id"],
-                kind="run_interrupted",
-                actor_session_id=None,
-                source_session_id=row["target_session_id"],
-                target_session_id=row["coordinator_session_id"],
-                summary="进程中断；任务未自动重放，等待用户恢复",
-            )
+            raise KeyError(reference)
+        return str(row["id"])
 
     def _migrate_schema(self) -> None:
         row = self.connection.execute(
@@ -914,11 +702,17 @@ class SessionStore:
             self._migrate_terminal_origins()
             self._write_schema_version(3)
         if version < 4:
-            self._migrate_orchestration()
+            # Version 4 belonged to the retired coordination repository.  Do
+            # not create or mutate those legacy tables while upgrading.
             self._write_schema_version(4)
         if version < 5:
-            self._migrate_orchestration_budgets()
             self._write_schema_version(5)
+        if version < 6:
+            self._migrate_session_actors()
+            self._write_schema_version(6)
+        if version < 7:
+            self._migrate_queue_positions()
+            self._write_schema_version(7)
 
     def _migrate_aliases(self) -> None:
         columns = {
@@ -965,85 +759,81 @@ class SessionStore:
                 (str(version),),
             )
 
-    def _migrate_orchestration(self) -> None:
-        # New databases create these tables in the initial DDL. Keeping this
-        # migration idempotent makes version 2/3 databases upgrade explicitly.
-        self.connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS orchestration_runs (
-                id TEXT PRIMARY KEY,
-                workspace TEXT NOT NULL,
-                coordinator_session_id TEXT NOT NULL REFERENCES sessions(id),
-                objective TEXT NOT NULL,
-                status TEXT NOT NULL,
-                max_tasks INTEGER NOT NULL,
-                model_requests INTEGER NOT NULL DEFAULT 0,
-                max_model_requests INTEGER NOT NULL DEFAULT 12,
-                deadline REAL NOT NULL DEFAULT 0,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS orchestration_tasks (
-                id TEXT PRIMARY KEY,
-                run_id TEXT NOT NULL REFERENCES orchestration_runs(id) ON DELETE CASCADE,
-                parent_task_id TEXT,
-                source_session_id TEXT NOT NULL REFERENCES sessions(id),
-                target_session_id TEXT NOT NULL REFERENCES sessions(id),
-                role TEXT NOT NULL,
-                objective TEXT NOT NULL,
-                acceptance_json TEXT NOT NULL,
-                allowed_paths_json TEXT NOT NULL,
-                write_policy TEXT NOT NULL,
-                status TEXT NOT NULL,
-                attempt INTEGER NOT NULL,
-                hop INTEGER NOT NULL,
-                summary TEXT NOT NULL,
-                evidence_json TEXT NOT NULL,
-                changed_files_json TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS orchestration_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL REFERENCES orchestration_runs(id) ON DELETE CASCADE,
-                task_id TEXT,
-                kind TEXT NOT NULL,
-                actor_session_id TEXT,
-                source_session_id TEXT,
-                target_session_id TEXT,
-                summary TEXT NOT NULL,
-                created_at REAL NOT NULL
-            );
-            """
-        )
-
-    def _migrate_orchestration_budgets(self) -> None:
+    def _migrate_queue_positions(self) -> None:
         columns = {
             row["name"]
-            for row in self.connection.execute(
-                "PRAGMA table_info(orchestration_runs)"
-            )
+            for row in self.connection.execute("PRAGMA table_info(session_queue)")
         }
+        if "queue_position" not in columns:
+            with self.connection:
+                self.connection.execute(
+                    "ALTER TABLE session_queue ADD COLUMN "
+                    "queue_position REAL NOT NULL DEFAULT 0"
+                )
+                self.connection.execute(
+                    "UPDATE session_queue SET queue_position = sequence"
+                )
         with self.connection:
-            if "model_requests" not in columns:
-                self.connection.execute(
-                    "ALTER TABLE orchestration_runs ADD COLUMN "
-                    "model_requests INTEGER NOT NULL DEFAULT 0"
-                )
-            if "max_model_requests" not in columns:
-                self.connection.execute(
-                    "ALTER TABLE orchestration_runs ADD COLUMN "
-                    "max_model_requests INTEGER NOT NULL DEFAULT 12"
-                )
-            if "deadline" not in columns:
-                self.connection.execute(
-                    "ALTER TABLE orchestration_runs ADD COLUMN "
-                    "deadline REAL NOT NULL DEFAULT 0"
-                )
-                self.connection.execute(
-                    "UPDATE orchestration_runs SET deadline = updated_at + 600 "
-                    "WHERE deadline = 0"
-                )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS session_queue_order_idx "
+                "ON session_queue(target_session_id, status, queue_position, sequence)"
+            )
+
+    def _migrate_session_actors(self) -> None:
+        """Add the mailbox actor tables without rewriting old histories."""
+
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(sessions)")
+        }
+        additions = (
+            ("profile", "TEXT NOT NULL DEFAULT 'general'"),
+            ("paused", "INTEGER NOT NULL DEFAULT 0"),
+            ("status", "TEXT NOT NULL DEFAULT 'idle'"),
+            ("activity", "TEXT NOT NULL DEFAULT ''"),
+            ("active_turn_id", "TEXT"),
+        )
+        with self.connection:
+            for name, declaration in additions:
+                if name not in columns:
+                    self.connection.execute(
+                        f"ALTER TABLE sessions ADD COLUMN {name} {declaration}"
+                    )
+            self.connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS session_queue (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
+                    target_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    source_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                    content TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'message',
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    created_at REAL NOT NULL,
+                    started_at REAL,
+                    finished_at REAL,
+                    result TEXT,
+                    queue_position REAL NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS session_queue_target_idx
+                    ON session_queue(target_session_id, status, sequence);
+                CREATE TABLE IF NOT EXISTS session_turns (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    input TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    root_turn_id TEXT NOT NULL,
+                    parent_turn_id TEXT REFERENCES session_turns(id) ON DELETE SET NULL,
+                    output TEXT,
+                    reason TEXT,
+                    created_at REAL NOT NULL,
+                    started_at REAL,
+                    finished_at REAL
+                );
+                CREATE INDEX IF NOT EXISTS session_turns_session_idx
+                    ON session_turns(session_id, created_at);
+                """
+            )
 
     def _new_alias(self, identifier: str, created_at: float) -> str:
         prefix = datetime.fromtimestamp(created_at).strftime("%y%m%d-%H%M")
@@ -1070,6 +860,557 @@ class SessionStore:
         if row is None:
             raise KeyError(alias)
         return str(row["id"])
+
+    # ------------------------------------------------------------------
+    # Session Actor persistence.  This is the only mailbox API used by the
+    # runtime; legacy coordination tables remain migration-only.
+
+    @_synchronized
+    def create_child(
+        self,
+        parent_id: str,
+        model: str | None = None,
+        messages: Sequence[Message] = (),
+        *,
+        title: str = "子会话",
+        profile: str = "general",
+        session_id: str | None = None,
+    ) -> str:
+        parent = self.connection.execute(
+            "SELECT workspace, model FROM sessions WHERE id = ?", (parent_id,)
+        ).fetchone()
+        if parent is None:
+            raise KeyError(parent_id)
+        return self.create(
+            Path(parent["workspace"]),
+            model or str(parent["model"]),
+            messages,
+            session_id=session_id,
+            title=title,
+            parent_id=parent_id,
+            profile=profile,
+        )
+
+    @_synchronized
+    def children(self, session_id: str) -> tuple[SessionInfo, ...]:
+        rows = self.connection.execute(
+            "SELECT id, alias, title, model, updated_at, parent_id, "
+            "origin_terminal_id, origin_pane_slot, profile, paused, status, activity, active_turn_id, "
+            "(SELECT COUNT(*) FROM session_queue AS q WHERE q.target_session_id = sessions.id "
+            "AND q.status = 'queued') AS queue_size "
+            "FROM sessions WHERE parent_id = ? ORDER BY created_at, id",
+            (session_id,),
+        ).fetchall()
+        return tuple(_session_info(row) for row in rows)
+
+    @_synchronized
+    def descendants(self, session_id: str) -> tuple[SessionInfo, ...]:
+        """Return the child tree in stable depth-first creation order."""
+
+        result: list[SessionInfo] = []
+
+        def visit(parent_id: str) -> None:
+            rows = self.connection.execute(
+                "SELECT id, alias, title, model, updated_at, parent_id, "
+                "origin_terminal_id, origin_pane_slot, profile, paused, status, activity, active_turn_id, "
+                "(SELECT COUNT(*) FROM session_queue AS q WHERE q.target_session_id = sessions.id "
+                "AND q.status = 'queued') AS queue_size "
+                "FROM sessions WHERE parent_id = ? ORDER BY created_at, id",
+                (parent_id,),
+            ).fetchall()
+            for row in rows:
+                info = _session_info(row)
+                result.append(info)
+                visit(info.id)
+
+        visit(session_id)
+        return tuple(result)
+
+    @_synchronized
+    def session_tree(
+        self, workspace: Path, *, limit: int = 500
+    ) -> tuple[tuple[int, SessionInfo], ...]:
+        """Return all sessions as a depth-first tree, most recently used first."""
+
+        root = str(workspace.resolve())
+        rows = self.connection.execute(
+            "SELECT id, alias, title, model, updated_at, parent_id, "
+            "origin_terminal_id, origin_pane_slot, profile, paused, status, activity, active_turn_id, "
+            "(SELECT COUNT(*) FROM session_queue AS q WHERE q.target_session_id = sessions.id "
+            "AND q.status = 'queued') AS queue_size, created_at "
+            "FROM sessions WHERE workspace = ? ORDER BY updated_at DESC, id LIMIT ?",
+            (root, limit),
+        ).fetchall()
+        infos = {str(row["id"]): _session_info(row) for row in rows}
+        children: dict[str | None, list[str]] = {}
+        for row in rows:
+            children.setdefault(row["parent_id"], []).append(str(row["id"]))
+        result: list[tuple[int, SessionInfo]] = []
+
+        def visit(parent: str | None, depth: int) -> None:
+            for identifier in children.get(parent, []):
+                info = infos[identifier]
+                result.append((depth, info))
+                visit(identifier, depth + 1)
+
+        visit(None, 0)
+        return tuple(result)
+
+    @_synchronized
+    def session_depth(self, session_id: str) -> int:
+        depth = 0
+        current = session_id
+        seen: set[str] = set()
+        while True:
+            if current in seen:
+                raise RuntimeError("session parent cycle detected")
+            seen.add(current)
+            row = self.connection.execute(
+                "SELECT parent_id FROM sessions WHERE id = ?", (current,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            parent = row["parent_id"]
+            if parent is None:
+                return depth
+            depth += 1
+            current = str(parent)
+
+    @_synchronized
+    def set_session_state(
+        self,
+        session_id: str,
+        *,
+        paused: bool | None = None,
+        status: str | None = None,
+        activity: str | None = None,
+        active_turn_id: str | None = None,
+    ) -> SessionInfo:
+        values: list[object] = []
+        assignments: list[str] = []
+        if paused is not None:
+            assignments.append("paused = ?")
+            values.append(int(paused))
+        if status is not None:
+            assignments.append("status = ?")
+            values.append(status)
+        if activity is not None:
+            assignments.append("activity = ?")
+            values.append(activity)
+        if active_turn_id is not None:
+            assignments.append("active_turn_id = ?")
+            values.append(active_turn_id)
+        elif status in {"idle", "interrupted", "completed", "failed", "cancelled"}:
+            assignments.append("active_turn_id = NULL")
+        if not assignments:
+            return self.session_info(session_id)
+        assignments.append("updated_at = ?")
+        values.append(time.time())
+        values.append(session_id)
+        with self.connection:
+            cursor = self.connection.execute(
+                f"UPDATE sessions SET {', '.join(assignments)} WHERE id = ?",
+                values,
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(session_id)
+        return self.session_info(session_id)
+
+    @_synchronized
+    def set_paused(self, session_id: str, paused: bool) -> SessionInfo:
+        row = self.connection.execute(
+            "SELECT active_turn_id, status FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(session_id)
+        # Pausing is a gate for the next queue item, never an interruption of
+        # the turn already in flight.  Keep its running/waiting status visible
+        # until the worker reaches its normal boundary.
+        if paused and row["active_turn_id"] is not None:
+            return self.set_session_state(
+                session_id,
+                paused=True,
+                activity="当前轮完成后暂停",
+            )
+        if not paused and row["active_turn_id"] is not None:
+            return self.set_session_state(
+                session_id,
+                paused=False,
+                activity="正在执行",
+            )
+        return self.set_session_state(
+            session_id,
+            paused=paused,
+            status="paused" if paused else "idle",
+            activity="已暂停" if paused else "等待队列",
+        )
+
+    @_synchronized
+    def enqueue_message(
+        self,
+        target_session_id: str,
+        content: str,
+        *,
+        source_session_id: str | None = None,
+        workspace: Path | None = None,
+        kind: str = "message",
+        message_id: str | None = None,
+    ) -> QueuedMessage:
+        content = content.strip()
+        if not content:
+            raise ValueError("queued message content must not be empty")
+        target = self.connection.execute(
+            "SELECT workspace FROM sessions WHERE id = ?", (target_session_id,)
+        ).fetchone()
+        if target is None:
+            raise KeyError(target_session_id)
+        root = str(workspace.resolve()) if workspace is not None else None
+        if root is not None and target["workspace"] != root:
+            raise KeyError(target_session_id)
+        if source_session_id is not None:
+            source = self.connection.execute(
+                "SELECT workspace FROM sessions WHERE id = ?", (source_session_id,)
+            ).fetchone()
+            if source is None or source["workspace"] != target["workspace"]:
+                raise KeyError(source_session_id)
+        identifier = message_id or str(uuid.uuid4())
+        created_at = time.time()
+        with self.connection:
+            cursor = self.connection.execute(
+                "INSERT INTO session_queue "
+                "(id, target_session_id, source_session_id, content, kind, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 'queued', ?)",
+                (
+                    identifier,
+                    target_session_id,
+                    source_session_id,
+                    content,
+                    kind,
+                    created_at,
+                ),
+            )
+            self.connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (created_at, target_session_id),
+            )
+            self.connection.execute(
+                "UPDATE session_queue SET queue_position = sequence WHERE id = ?",
+                (identifier,),
+            )
+        row = self.connection.execute(
+            "SELECT * FROM session_queue WHERE sequence = ?", (cursor.lastrowid,)
+        ).fetchone()
+        assert row is not None
+        return _queued_message(row)
+
+    @_synchronized
+    def queue(
+        self,
+        session_id: str,
+        *,
+        include_finished: bool = False,
+        limit: int = 100,
+    ) -> tuple[QueuedMessage, ...]:
+        if not 1 <= limit <= 1_000:
+            raise ValueError("limit must be between 1 and 1000")
+        statuses = "('queued', 'running', 'completed', 'cancelled')" if include_finished else "('queued', 'running')"
+        rows = self.connection.execute(
+            "SELECT * FROM session_queue WHERE target_session_id = ? "
+            f"AND status IN {statuses} ORDER BY queue_position, sequence LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+        return tuple(_queued_message(row) for row in rows)
+
+    @_synchronized
+    def queue_message(self, message_id: str) -> QueuedMessage:
+        row = self.connection.execute(
+            "SELECT * FROM session_queue WHERE id = ?", (message_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(message_id)
+        return _queued_message(row)
+
+    @_synchronized
+    def claim_next_message(self, session_id: str) -> QueuedMessage | None:
+        """Atomically claim the queue head; only a Session runner may call it."""
+
+        session = self.connection.execute(
+            "SELECT paused, active_turn_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if session is None:
+            raise KeyError(session_id)
+        if session["paused"] or session["active_turn_id"] is not None:
+            return None
+        row = self.connection.execute(
+            "SELECT * FROM session_queue WHERE target_session_id = ? "
+            "AND status = 'queued' ORDER BY queue_position, sequence LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        started_at = time.time()
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE session_queue SET status = 'running', started_at = ? "
+                "WHERE id = ? AND status = 'queued'",
+                (started_at, row["id"]),
+            )
+        if cursor.rowcount != 1:
+            return None
+        claimed = self.connection.execute(
+            "SELECT * FROM session_queue WHERE id = ?", (row["id"],)
+        ).fetchone()
+        assert claimed is not None
+        return _queued_message(claimed)
+
+    @_synchronized
+    def finish_message(
+        self,
+        message_id: str,
+        *,
+        status: str = "completed",
+        result: str | None = None,
+    ) -> QueuedMessage:
+        if status not in {"completed", "cancelled"}:
+            raise ValueError("finished message status must be completed or cancelled")
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE session_queue SET status = ?, finished_at = ?, result = ? "
+                "WHERE id = ? AND status = 'running'",
+                (status, time.time(), result, message_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(message_id)
+        return self.queue_message(message_id)
+
+    @_synchronized
+    def cancel_queued_message(self, message_id: str) -> QueuedMessage:
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE session_queue SET status = 'cancelled', finished_at = ? "
+                "WHERE id = ? AND status = 'queued'",
+                (time.time(), message_id),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError("only a queued message can be cancelled")
+        return self.queue_message(message_id)
+
+    @_synchronized
+    def reorder_queued_message(
+        self, session_id: str, message_id: str, before_message_id: str
+    ) -> QueuedMessage:
+        """Move one queued item before another item in the same mailbox."""
+
+        rows = self.connection.execute(
+            "SELECT id, queue_position, sequence FROM session_queue "
+            "WHERE target_session_id = ? AND status = 'queued' "
+            "ORDER BY queue_position, sequence",
+            (session_id,),
+        ).fetchall()
+        ordered = [str(row["id"]) for row in rows]
+        if message_id not in ordered or before_message_id not in ordered:
+            raise ValueError("both messages must be queued in the same session")
+        if message_id == before_message_id:
+            raise ValueError("a message cannot be moved before itself")
+        remaining = [identifier for identifier in ordered if identifier != message_id]
+        before_index = remaining.index(before_message_id)
+        previous_id = remaining[before_index - 1] if before_index else None
+        next_id = before_message_id
+        positions = {str(row["id"]): float(row["queue_position"]) for row in rows}
+        previous = positions[previous_id] if previous_id is not None else None
+        following = positions[next_id]
+        position = following - 1.0 if previous is None else (previous + following) / 2.0
+        if (previous is not None and position == previous) or position == following:
+            self._renumber_queue(session_id, remaining)
+            rows = self.connection.execute(
+                "SELECT id, queue_position FROM session_queue "
+                "WHERE target_session_id = ? AND status = 'queued' "
+                "ORDER BY queue_position, sequence",
+                (session_id,),
+            ).fetchall()
+            positions = {str(row["id"]): float(row["queue_position"]) for row in rows}
+            previous = positions[previous_id] if previous_id is not None else None
+            following = positions[next_id]
+            position = following - 1.0 if previous is None else (previous + following) / 2.0
+        with self.connection:
+            self.connection.execute(
+                "UPDATE session_queue SET queue_position = ? "
+                "WHERE id = ? AND target_session_id = ? AND status = 'queued'",
+                (position, message_id, session_id),
+            )
+        return self.queue_message(message_id)
+
+    @_synchronized
+    def move_queued_message(
+        self, session_id: str, message_id: str, direction: int
+    ) -> QueuedMessage:
+        """Move a queued item one place up (-1) or down (+1)."""
+
+        if direction not in {-1, 1}:
+            raise ValueError("queue direction must be -1 or 1")
+        rows = self.connection.execute(
+            "SELECT id FROM session_queue WHERE target_session_id = ? "
+            "AND status = 'queued' ORDER BY queue_position, sequence",
+            (session_id,),
+        ).fetchall()
+        ordered = [str(row["id"]) for row in rows]
+        if message_id not in ordered:
+            raise ValueError("only a queued message can be moved")
+        index = ordered.index(message_id)
+        target_index = index + direction
+        if not 0 <= target_index < len(ordered):
+            return self.queue_message(message_id)
+        before_id = ordered[target_index] if direction < 0 else (
+            ordered[target_index + 1] if target_index + 1 < len(ordered) else None
+        )
+        if before_id is None:
+            # Put the item after the current queue tail by moving the last item
+            # before it and preserving the same public operation semantics.
+            last_id = ordered[-1]
+            positions = self.connection.execute(
+                "SELECT queue_position FROM session_queue WHERE id = ?", (last_id,)
+            ).fetchone()
+            assert positions is not None
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE session_queue SET queue_position = ? WHERE id = ?",
+                    (float(positions["queue_position"]) + 1.0, message_id),
+                )
+            return self.queue_message(message_id)
+        return self.reorder_queued_message(session_id, message_id, before_id)
+
+    def _renumber_queue(self, session_id: str, ordered: list[str]) -> None:
+        """Restore roomy positions after many midpoint moves."""
+
+        with self.connection:
+            for index, identifier in enumerate(ordered, start=1):
+                self.connection.execute(
+                    "UPDATE session_queue SET queue_position = ? "
+                    "WHERE target_session_id = ? AND id = ? AND status = 'queued'",
+                    (float(index), session_id, identifier),
+                )
+
+    @_synchronized
+    def start_turn(
+        self,
+        session_id: str,
+        input_text: str,
+        *,
+        parent_turn_id: str | None = None,
+        root_turn_id: str | None = None,
+        turn_id: str | None = None,
+        status: str = "queued",
+    ) -> SessionTurn:
+        identifier = turn_id or str(uuid.uuid4())
+        root = root_turn_id or identifier
+        created_at = time.time()
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO session_turns "
+                "(id, session_id, input, status, root_turn_id, parent_turn_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    identifier,
+                    session_id,
+                    input_text,
+                    status,
+                    root,
+                    parent_turn_id,
+                    created_at,
+                ),
+            )
+        return self.turn(identifier)
+
+    @_synchronized
+    def turn(self, turn_id: str) -> SessionTurn:
+        row = self.connection.execute(
+            "SELECT * FROM session_turns WHERE id = ?", (turn_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(turn_id)
+        return _session_turn(row)
+
+    @_synchronized
+    def turns(
+        self, session_id: str, *, limit: int = 100
+    ) -> tuple[SessionTurn, ...]:
+        rows = self.connection.execute(
+            "SELECT * FROM session_turns WHERE session_id = ? "
+            "ORDER BY created_at, id LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+        return tuple(_session_turn(row) for row in rows)
+
+    @_synchronized
+    def update_turn(
+        self,
+        turn_id: str,
+        *,
+        status: str | None = None,
+        output: str | None = None,
+        reason: str | None = None,
+    ) -> SessionTurn:
+        assignments: list[str] = []
+        values: list[object] = []
+        if status is not None:
+            assignments.extend(["status = ?", "started_at = COALESCE(started_at, ?)"])
+            values.extend([status, time.time()])
+            if status in {"completed", "failed", "cancelled", "interrupted"}:
+                assignments.extend(["finished_at = ?"])
+                values.append(time.time())
+        if output is not None:
+            assignments.append("output = ?")
+            values.append(output)
+        if reason is not None:
+            assignments.append("reason = ?")
+            values.append(reason)
+        if not assignments:
+            return self.turn(turn_id)
+        values.append(turn_id)
+        with self.connection:
+            cursor = self.connection.execute(
+                f"UPDATE session_turns SET {', '.join(assignments)} WHERE id = ?",
+                values,
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(turn_id)
+        return self.turn(turn_id)
+
+    @_synchronized
+    def recover_session_runtime(self, workspace: Path) -> tuple[SessionTurn, ...]:
+        """Mark active turns interrupted while retaining all messages/queue items."""
+
+        rows = self.connection.execute(
+            "SELECT turn.* FROM session_turns AS turn "
+            "JOIN sessions AS session ON session.id = turn.session_id "
+            "WHERE session.workspace = ? AND turn.status IN ('queued', 'running', 'waiting')",
+            (str(workspace.resolve()),),
+        ).fetchall()
+        recovered: list[SessionTurn] = []
+        now = time.time()
+        with self.connection:
+            for row in rows:
+                self.connection.execute(
+                    "UPDATE session_turns SET status = 'interrupted', reason = ?, "
+                    "finished_at = ? WHERE id = ?",
+                    ("LitCode 进程退出", now, row["id"]),
+                )
+            self.connection.execute(
+                "UPDATE sessions SET status = 'interrupted', active_turn_id = NULL, "
+                "activity = '上次进程退出时中断' , updated_at = ? "
+                "WHERE workspace = ? AND status IN ('queued', 'waiting', 'running')",
+                (now, str(workspace.resolve())),
+            )
+            self.connection.execute(
+                "UPDATE session_queue SET status = 'queued', started_at = NULL "
+                "WHERE target_session_id IN (SELECT id FROM sessions WHERE workspace = ?) "
+                "AND status = 'running'",
+                (str(workspace.resolve()),),
+            )
+        for row in rows:
+            recovered.append(self.turn(row["id"]))
+        return tuple(recovered)
 
     @_synchronized
     def add_checkpoint(
@@ -1253,6 +1594,81 @@ def _latest_content(messages: Sequence[Message], role: str) -> str:
     return ""
 
 
+def _session_info(row: sqlite3.Row) -> SessionInfo:
+    return SessionInfo(
+        id=str(row["id"]),
+        alias=str(row["alias"]),
+        title=str(row["title"]),
+        model=str(row["model"]),
+        updated_at=float(row["updated_at"]),
+        parent_id=str(row["parent_id"]) if row["parent_id"] is not None else None,
+        origin_terminal_id=(
+            str(row["origin_terminal_id"])
+            if row["origin_terminal_id"] is not None
+            else None
+        ),
+        origin_pane_slot=(
+            int(row["origin_pane_slot"])
+            if row["origin_pane_slot"] is not None
+            else None
+        ),
+        profile=str(row["profile"]) if row["profile"] is not None else "general",
+        paused=bool(row["paused"]),
+        status=str(row["status"]) if row["status"] is not None else "idle",
+        activity=str(row["activity"]) if row["activity"] is not None else "",
+        queue_size=int(row["queue_size"]) if row["queue_size"] is not None else 0,
+        active_turn_id=(
+            str(row["active_turn_id"]) if row["active_turn_id"] is not None else None
+        ),
+    )
+
+
+def _queued_message(row: sqlite3.Row) -> QueuedMessage:
+    return QueuedMessage(
+        id=str(row["id"]),
+        sequence=int(row["sequence"]),
+        target_session_id=str(row["target_session_id"]),
+        source_session_id=(
+            str(row["source_session_id"])
+            if row["source_session_id"] is not None
+            else None
+        ),
+        content=str(row["content"]),
+        kind=str(row["kind"]),
+        status=str(row["status"]),
+        created_at=float(row["created_at"]),
+        started_at=(
+            float(row["started_at"]) if row["started_at"] is not None else None
+        ),
+        finished_at=(
+            float(row["finished_at"]) if row["finished_at"] is not None else None
+        ),
+        result=str(row["result"]) if row["result"] is not None else None,
+    )
+
+
+def _session_turn(row: sqlite3.Row) -> SessionTurn:
+    return SessionTurn(
+        id=str(row["id"]),
+        session_id=str(row["session_id"]),
+        input=str(row["input"]),
+        status=str(row["status"]),
+        root_turn_id=str(row["root_turn_id"]),
+        parent_turn_id=(
+            str(row["parent_turn_id"]) if row["parent_turn_id"] is not None else None
+        ),
+        output=str(row["output"]) if row["output"] is not None else None,
+        reason=str(row["reason"]) if row["reason"] is not None else None,
+        created_at=float(row["created_at"]),
+        started_at=(
+            float(row["started_at"]) if row["started_at"] is not None else None
+        ),
+        finished_at=(
+            float(row["finished_at"]) if row["finished_at"] is not None else None
+        ),
+    )
+
+
 def _crockford(value: int, width: int) -> str:
     alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
     chars: list[str] = []
@@ -1260,59 +1676,6 @@ def _crockford(value: int, width: int) -> str:
         value, remainder = divmod(value, len(alphabet))
         chars.append(alphabet[remainder])
     return "".join(reversed(chars))
-
-
-def _orchestration_run(row: sqlite3.Row) -> OrchestrationRun:
-    return OrchestrationRun(
-        row["id"],
-        row["workspace"],
-        row["coordinator_session_id"],
-        row["objective"],
-        row["status"],
-        row["max_tasks"],
-        row["model_requests"],
-        row["max_model_requests"],
-        row["deadline"],
-        row["created_at"],
-        row["updated_at"],
-    )
-
-
-def _orchestration_task(row: sqlite3.Row) -> OrchestrationTask:
-    return OrchestrationTask(
-        row["id"],
-        row["run_id"],
-        row["parent_task_id"],
-        row["source_session_id"],
-        row["target_session_id"],
-        row["role"],
-        row["objective"],
-        tuple(json.loads(row["acceptance_json"])),
-        tuple(json.loads(row["allowed_paths_json"])),
-        row["write_policy"],
-        row["status"],
-        row["attempt"],
-        row["hop"],
-        row["summary"],
-        tuple(json.loads(row["evidence_json"])),
-        tuple(json.loads(row["changed_files_json"])),
-        row["created_at"],
-        row["updated_at"],
-    )
-
-
-def _orchestration_event(row: sqlite3.Row) -> OrchestrationEvent:
-    return OrchestrationEvent(
-        row["id"],
-        row["run_id"],
-        row["task_id"],
-        row["kind"],
-        row["actor_session_id"],
-        row["source_session_id"],
-        row["target_session_id"],
-        row["summary"],
-        row["created_at"],
-    )
 
 
 def _read_optional(path: Path) -> str | None:

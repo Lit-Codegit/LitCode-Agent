@@ -5,11 +5,15 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
-import threading
 from pathlib import Path
 from typing import Mapping
 
 from litcode_agent.tools.base import FileChange, ToolError, ToolResult
+from litcode_agent.mutation_locks import (
+    MutationLocks,
+    WorkspaceMutationLocks,
+    file_version,
+)
 from litcode_agent.tools.workspace import Workspace
 from litcode_agent.read_scope import ReadScope
 
@@ -136,7 +140,8 @@ class ReadFileTool:
         if not path.is_file():
             raise ToolError(f"path is not a file: {raw_path}")
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            raw_content = path.read_bytes()
+            lines = raw_content.decode("utf-8").splitlines()
         except UnicodeDecodeError as error:
             raise ToolError(f"file is not valid UTF-8 text: {raw_path}") from error
         selected = lines[start - 1 : end]
@@ -146,6 +151,12 @@ class ReadFileTool:
         )
         if not content:
             content = f"(no lines in requested range; file has {len(lines)} lines)"
+        # The writer can use this content hash as an optimistic-concurrency
+        # token.  It is deliberately plain text so the existing tool result
+        # protocol stays small and model-provider independent.
+        version = file_version(path)
+        assert version is not None
+        content = f"file_version: {version}\n{content}"
         return ToolResult(truncate_output(content, self.max_output_chars))
 
 
@@ -218,6 +229,10 @@ class ApplyPatchTool:
             "path": {"type": "string"},
             "old_text": {"type": "string"},
             "new_text": {"type": "string"},
+            "expected_version": {
+                "type": ["string", "null"],
+                "description": "Hash returned by read_file; reject stale edits.",
+            },
         },
         "required": ["path", "old_text", "new_text"],
         "additionalProperties": False,
@@ -226,41 +241,59 @@ class ApplyPatchTool:
     def __init__(
         self,
         workspace: Workspace,
-        execution_lock: threading.RLock | None = None,
+        execution_lock: MutationLocks | None = None,
     ) -> None:
         self.workspace = workspace
-        self.execution_lock = execution_lock or threading.RLock()
+        self.execution_lock = execution_lock or WorkspaceMutationLocks.for_workspace(
+            workspace.root
+        )
 
     def execute(self, arguments: Mapping[str, object]) -> ToolResult:
-        with self.execution_lock:
-            return self._execute_locked(arguments)
+        raw_path = _string_argument(arguments, "path")
+        path = self.workspace.resolve(raw_path, must_exist=False)
+        with self.execution_lock.write(path):
+            return self._execute_locked(arguments, path)
 
-    def _execute_locked(self, arguments: Mapping[str, object]) -> ToolResult:
+    def _execute_locked(
+        self, arguments: Mapping[str, object], path: Path | None = None
+    ) -> ToolResult:
         raw_path = _string_argument(arguments, "path")
         old_text = arguments.get("old_text")
         new_text = arguments.get("new_text")
         if not isinstance(old_text, str) or not isinstance(new_text, str):
             raise ToolError("old_text and new_text must be strings")
-        path = self.workspace.resolve(raw_path, must_exist=False)
+        resolved = path or self.workspace.resolve(raw_path, must_exist=False)
+        expected_version = arguments.get("expected_version")
+        if expected_version is not None and not isinstance(expected_version, str):
+            raise ToolError("expected_version must be a string or null")
+        try:
+            current_version = file_version(resolved)
+        except IsADirectoryError as error:
+            raise ToolError(f"path is not a file: {raw_path}") from error
+        if expected_version is not None and current_version != expected_version:
+            raise ToolError(
+                f"file version conflict for {raw_path}: expected {expected_version}, "
+                f"found {current_version or 'missing'}"
+            )
 
-        if not path.exists():
+        if not resolved.exists():
             if old_text:
                 raise ToolError("cannot replace text because the file does not exist")
             if not new_text:
                 raise ToolError("new_text must not be empty when creating a file")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self._atomic_write(path, new_text)
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            self._atomic_write(resolved, new_text)
             return ToolResult(
                 f"created {raw_path} ({len(new_text)} characters)",
                 file_change=FileChange(raw_path, None, new_text, False),
             )
 
-        if not path.is_file():
+        if not resolved.is_file():
             raise ToolError(f"path is not a file: {raw_path}")
         if not old_text:
             raise ToolError("old_text must not be empty when editing an existing file")
         try:
-            content = path.read_text(encoding="utf-8")
+            content = resolved.read_text(encoding="utf-8")
         except UnicodeDecodeError as error:
             raise ToolError(f"file is not valid UTF-8 text: {raw_path}") from error
         occurrences = content.count(old_text)
@@ -269,7 +302,7 @@ class ApplyPatchTool:
                 f"old_text must match exactly once; found {occurrences} matches"
             )
         updated = content.replace(old_text, new_text, 1)
-        self._atomic_write(path, updated)
+        self._atomic_write(resolved, updated)
         return ToolResult(
             f"updated {raw_path}",
             file_change=FileChange(raw_path, content, updated, True),
