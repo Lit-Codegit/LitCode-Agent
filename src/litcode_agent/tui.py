@@ -71,6 +71,7 @@ class CommandSpec:
 COMMANDS = (
     CommandSpec("/help", "显示命令帮助", "help"),
     CommandSpec("/model", "查询并选择模型", "model", ("/models",)),
+    CommandSpec("/new", "新建会话并切换当前 pane", "new"),
     CommandSpec("/clear", "新建空白会话", "clear"),
     CommandSpec("/sessions", "选择并恢复会话", "sessions", ("/resume",)),
     CommandSpec("/compact", "压缩当前上下文", "compact"),
@@ -515,6 +516,7 @@ class LitCodeTUI(App[None]):
         self._pane_layout_generation = 0
         self._pane_leader_until = 0.0
         self._exit_armed_until = 0.0
+        self.running_sessions: set[str] = set()
 
     def compose(self) -> ComposeResult:
         yield Vertical(self._pane_widget(self._active_runtime()), id="pane-area")
@@ -762,22 +764,41 @@ class LitCodeTUI(App[None]):
         if event.option.id is not None:
             self._insert_completion(int(event.option.id))
 
-    def _run_turn(self, value: str, pane_id: str) -> None:
-        runtime = self.panes[pane_id]
+    def _runtime_for_session(self, session_id: str) -> PaneRuntime | None:
+        return next(
+            (
+                runtime
+                for runtime in self.panes.values()
+                if runtime.session.session_id == session_id
+            ),
+            None,
+        )
+
+    def _run_turn(
+        self,
+        value: str,
+        session: AgentSession,
+        cancel_event: threading.Event,
+        session_id: str,
+        task_id: str | None,
+    ) -> None:
         try:
-            result = runtime.session.ask(value, runtime.cancel_requested.is_set)
+            result = session.ask(value, cancel_event.is_set)
         except ModelError as error:
-            self.call_from_thread(self._finish_with_error, str(error), pane_id)
+            self.call_from_thread(
+                self._finish_with_error, str(error), session_id, task_id
+            )
             return
         except Exception as error:  # keep an unexpected worker error visible
             self.call_from_thread(
                 self._finish_with_error,
                 f"未预期错误：{type(error).__name__}: {error}",
-                pane_id,
+                session_id,
+                task_id,
             )
             return
         self.call_from_thread(
-            self._finish_turn, result.output, result.succeeded, pane_id
+            self._finish_turn, result.output, result.succeeded, session_id, task_id
         )
 
     def _start_runtime_turn(
@@ -792,10 +813,14 @@ class LitCodeTUI(App[None]):
         runtime.orchestration_task_id = task_id
         self._set_pane_busy(runtime, True, "正在启动…")
         runtime.cancel_requested.clear()
+        session_id = runtime.session.session_id
+        self.running_sessions.add(session_id)
         self.run_worker(
-            lambda: self._run_turn(value, runtime.pane_id),
-            name=f"agent-turn-{runtime.pane_id}",
-            group=f"agent-{runtime.pane_id}",
+            lambda: self._run_turn(
+                value, runtime.session, runtime.cancel_requested, session_id, task_id
+            ),
+            name=f"agent-turn-{session_id}",
+            group=f"agent-{session_id}",
             thread=True,
             exclusive=True,
             exit_on_error=False,
@@ -813,6 +838,7 @@ class LitCodeTUI(App[None]):
                 for runtime in self.panes.values()
                 if runtime.busy
             }
+            busy |= self.running_sessions
             action = self.scheduler.next_action(mounted=mounted, busy=busy)
             if action is None:
                 return
@@ -889,6 +915,7 @@ class LitCodeTUI(App[None]):
             "exit": lambda: self.action_cancel_or_quit(),
             "help": self._show_help,
             "model": self.action_choose_model,
+            "new": self.action_new_session,
             "clear": self.action_clear_session,
             "sessions": self.action_choose_session,
             "compact": lambda: self.action_compact(arguments),
@@ -1176,14 +1203,26 @@ class LitCodeTUI(App[None]):
             return
         self.sessions.clear_active()
         self._sync_runtime(self.sessions.active)
+        self._reset_pane_view()
+        self._append_notice("对话上下文已清空。")
+
+    def action_new_session(self) -> None:
+        self.sessions.new_active()
+        self._sync_runtime(self.sessions.active)
+        self._reset_pane_view()
+        self._set_pane_busy(self._active_runtime(), False, "就绪")
+        self._append_notice(
+            "已创建新会话，当前 pane 已切换；原会话没有结束，仍在后台，可用 /sessions 返回。"
+        )
+
+    def _reset_pane_view(self) -> None:
         runtime = self._active_runtime()
-        timeline = self._timeline(self._active_runtime())
+        timeline = self._timeline(runtime)
         timeline.remove_children()
         runtime.tool_bodies.clear()
         runtime.tool_cards.clear()
         runtime.streaming_markdown = None
         runtime.rendered_output = None
-        self._append_notice("对话上下文已清空。")
 
     def action_choose_session(self) -> None:
         if self.busy:
@@ -1226,6 +1265,14 @@ class LitCodeTUI(App[None]):
             self._update_status("运行中" if runtime.busy else "就绪")
             return
         self._sync_runtime(self.sessions.switch_active(identifier))
+        runtime = self._active_runtime()
+        if runtime.session.session_id in self.running_sessions:
+            runtime.busy = True
+            prompt = self.query_one(PromptArea)
+            prompt.disabled = True
+            self._update_status("运行中")
+            self._append_notice("已恢复仍在运行中的会话；任务结束后恢复输入。")
+            return
         self._render_session_history("已恢复会话")
 
     def action_compact(self, instructions: str = "") -> None:
@@ -1233,27 +1280,31 @@ class LitCodeTUI(App[None]):
             self._append_notice("当前任务结束后才能压缩。", error=True)
             return
         self._set_busy(True, "正在压缩上下文…")
-        pane_id = self.active_pane_id
+        session_id = self.session.session_id
         self.run_worker(
-            lambda: self._compact_worker(instructions, pane_id),
-            name=f"compact-{pane_id}",
-            group=f"agent-{pane_id}",
+            lambda: self._compact_worker(instructions, session_id),
+            name=f"compact-{session_id}",
+            group=f"agent-{session_id}",
             thread=True,
             exclusive=True,
             exit_on_error=False,
         )
 
-    def _compact_worker(self, instructions: str, pane_id: str) -> None:
-        runtime = self.panes[pane_id]
+    def _compact_worker(self, instructions: str, session_id: str) -> None:
+        runtime = self._runtime_for_session(session_id)
+        if runtime is None:
+            return
         try:
             summary = runtime.session.compact(instructions)
         except (ModelError, ValueError) as error:
-            self.call_from_thread(self._finish_with_error, str(error), pane_id)
+            self.call_from_thread(self._finish_with_error, str(error), session_id)
             return
-        self.call_from_thread(self._compact_finished, summary, pane_id)
+        self.call_from_thread(self._compact_finished, summary, session_id)
 
-    def _compact_finished(self, summary: str, pane_id: str) -> None:
-        runtime = self.panes[pane_id]
+    def _compact_finished(self, summary: str, session_id: str) -> None:
+        runtime = self._runtime_for_session(session_id)
+        if runtime is None:
+            return
         self._append_notice(
             f"上下文已压缩：\n{summary[:1200]}", runtime=runtime
         )
@@ -1473,14 +1524,19 @@ class LitCodeTUI(App[None]):
         for item in self.panes.values():
             self._update_pane_header(item, "运行中" if item.busy else "就绪")
 
-    def _finish_turn(self, output: str, succeeded: bool, pane_id: str) -> None:
-        runtime = self.panes[pane_id]
-        if output != runtime.rendered_output:
+    def _finish_turn(
+        self, output: str, succeeded: bool, session_id: str, task_id: str | None
+    ) -> None:
+        self.running_sessions.discard(session_id)
+        runtime = self._runtime_for_session(session_id)
+        if runtime is None:
+            self._finish_detached_task(task_id)
+            return
+        if output and output != runtime.rendered_output:
             self._append_assistant(output, runtime)
         runtime.rendered_output = None
         if not succeeded:
             self._append_notice("本轮未正常完成。", error=True, runtime=runtime)
-        task_id = runtime.orchestration_task_id
         runtime.orchestration_task_id = None
         if task_id is not None:
             task = self.orchestrator.get_task(task_id)
@@ -1492,8 +1548,22 @@ class LitCodeTUI(App[None]):
         self._set_pane_busy(runtime, False, "就绪")
         self._drive_orchestration()
 
-    def _finish_with_error(self, message: str, pane_id: str | None = None) -> None:
-        runtime = self.panes[pane_id] if pane_id is not None else self._active_runtime()
+    def _finish_detached_task(self, task_id: str | None) -> None:
+        if task_id is None:
+            return
+        task = self.orchestrator.get_task(task_id)
+        if task.status == "running":
+            self.orchestrator.interrupt_task(task_id, "目标会话已离开 pane，turn 结束。")
+        self._drive_orchestration()
+
+    def _finish_with_error(
+        self, message: str, session_id: str, task_id: str | None = None
+    ) -> None:
+        self.running_sessions.discard(session_id)
+        runtime = self._runtime_for_session(session_id)
+        if runtime is None:
+            self._finish_detached_task(task_id)
+            return
         if runtime.streaming_markdown is not None:
             partial = runtime.streaming_buffer
             runtime.streaming_markdown.update(
@@ -1504,7 +1574,6 @@ class LitCodeTUI(App[None]):
             runtime.streaming_markdown = None
             runtime.streaming_buffer = ""
         self._append_notice(message, error=True, runtime=runtime)
-        task_id = runtime.orchestration_task_id
         runtime.orchestration_task_id = None
         if task_id is not None:
             self.orchestrator.interrupt_task(task_id, f"目标会话运行失败：{message}")

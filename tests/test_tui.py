@@ -541,6 +541,71 @@ def test_command_registry_includes_session_workflows() -> None:
     }
 
 
+def test_new_command_detaches_session_and_keeps_running_task(
+    tmp_path: Path,
+) -> None:
+    class BlockingModel(FakeModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release = threading.Event()
+
+        def complete(self, messages, tools):
+            self.requests.append(list(messages))
+            self.release.wait(timeout=5)
+            return AssistantTurn("TUI 回答")
+
+    async def exercise() -> None:
+        model = BlockingModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = "问题"
+            await pilot.press("enter")
+            for _ in range(30):
+                await pilot.pause(0.02)
+                if app.busy:
+                    break
+            previous = app._active_runtime().session
+            assert app.busy
+
+            app._handle_command("/new")
+            await pilot.pause(0.05)
+
+            assert app.active_pane_id == "pane-1"
+            assert app.session.session_id != previous.session_id
+            assert not previous.closed
+            assert previous.session_id in app.sessions.detached
+            assert previous.session_id in app.running_sessions
+            assert not app.busy
+            timeline = app._timeline(app._active_runtime())
+            assert not any(
+                "问题" in str(child.render()) for child in timeline.children
+            )
+
+            app._session_selected(previous.session_id)
+            await pilot.pause(0.05)
+            assert app.session.session_id == previous.session_id
+            assert app.busy
+            assert app.query_one(PromptArea).disabled
+            assert previous.session_id in app.running_sessions
+
+            model.release.set()
+            for _ in range(50):
+                await pilot.pause(0.02)
+                if previous.session_id not in app.running_sessions:
+                    break
+            assert previous.session_id not in app.sessions.detached
+            assert any(
+                message.get("content") == "TUI 回答"
+                for message in previous.messages
+            )
+            assert app.busy is False
+            assert not app.query_one(PromptArea).disabled
+            assert app.session.messages[-1]["content"] == "TUI 回答"
+
+    asyncio.run(exercise())
+
+
 def test_tui_manual_compaction_keeps_session_available(tmp_path: Path) -> None:
     class CompactModel(FakeModel):
         def complete(self, messages, tools):

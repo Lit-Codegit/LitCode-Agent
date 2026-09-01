@@ -103,6 +103,12 @@ class SessionWorkspace:
         pane.session = pane.agent.start_session()
         return pane.session
 
+    def new_active(self) -> AgentSession:
+        pane = self.active
+        self.detached[pane.session.session_id] = pane.session
+        pane.session = pane.agent.start_session()
+        return pane.session
+
     def switch_active(self, session_id: str) -> PaneSession:
         pane = self.active
         if session_id == pane.session.session_id:
