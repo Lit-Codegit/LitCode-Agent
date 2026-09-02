@@ -2937,8 +2937,21 @@ class LitCodeTUI(App[None]):
             return
         if direction is not None:
             pane_slot = self._active_runtime().pane_slot
+            runtime_id = self._active_runtime().pane_id
 
-            def start_visible_subagent() -> None:
+            def start_visible_subagent(attempt: int = 0) -> None:
+                if attempt < 100:
+                    try:
+                        self.query_one(
+                            (f"#timeline-{runtime_id}", VerticalScroll)
+                            if runtime_id != "pane-1"
+                            else ("#timeline", VerticalScroll)
+                        )
+                    except Exception:
+                        self.call_after_refresh(
+                            start_visible_subagent, attempt + 1
+                        )
+                        return
                 try:
                     self._append_notice(
                         f"已创建子会话 {info.alias}，挂载到 {pane_slot} 号 pane 并开始运行。"

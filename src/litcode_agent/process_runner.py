@@ -24,13 +24,20 @@ class ShellSpec:
             # PowerShell 7.4+ -Command 只把“最后一个语句”的成败映射为进程
             # 退出码（失败一律 1），不会透传原生命令的 $LASTEXITCODE；显式
             # exit 才能保留真实退出码（hook 依赖 return code == 2 的约定）。
+            # 同时把会话编码钉为 UTF-8：非控制台管道下 PowerShell 会用代码页
+            # 转义不可表示字符（如 \u7981），导致非 ASCII 输出被改写。
             return (
                 [
                     self.executable,
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    f"{command}\nexit $LASTEXITCODE",
+                    (
+                        "$OutputEncoding = [Console]::OutputEncoding = "
+                        "[System.Text.Encoding]::UTF8\n"
+                        f"{command}\n"
+                        "exit $LASTEXITCODE"
+                    ),
                 ],
                 False,
             )
@@ -92,6 +99,8 @@ def run_shell(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         creationflags=creationflags,
     )
     try:

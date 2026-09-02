@@ -64,7 +64,12 @@ def test_windows_shell_prefers_powershell_core() -> None:
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Get-Location\nexit $LASTEXITCODE",
+            (
+                "$OutputEncoding = [Console]::OutputEncoding = "
+                "[System.Text.Encoding]::UTF8\n"
+                "Get-Location\n"
+                "exit $LASTEXITCODE"
+            ),
         ],
         False,
     )
