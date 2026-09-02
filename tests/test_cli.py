@@ -61,6 +61,35 @@ def test_auth_login_stores_key_in_private_user_file(
     assert "0600" in output.getvalue()
 
 
+def test_skill_create_and_list_do_not_require_model_credentials(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    ui, output = make_ui()
+
+    assert main(
+        [
+            "skill",
+            "--workspace",
+            str(tmp_path),
+            "create",
+            "plan-work",
+            "--description",
+            "Create an implementation plan.",
+        ],
+        ui,
+    ) == 0
+    assert main(
+        ["skill", "--workspace", str(tmp_path), "list"], ui
+    ) == 0
+
+    rendered = output.getvalue()
+    assert "Skill" in rendered
+    assert (tmp_path / ".litcode" / "skills" / "plan-work" / "SKILL.md").is_file()
+    assert "plan-work · project · Create an implementation plan." in rendered
+
+
 def test_auth_login_uses_selected_project_credential_name(
     tmp_path: Path, monkeypatch
 ) -> None:

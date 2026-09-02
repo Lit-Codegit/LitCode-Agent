@@ -80,7 +80,9 @@ TUI 会话保存在 `.litcode/sessions.db`，包括原始消息、摘要检查�
 
 ## Agent Skills
 
-项目 Skill 使用标准目录 `.agents/skills/<name>/SKILL.md`。`SKILL.md` 必须包含合法 YAML frontmatter，`name` 要与目录一致，并提供非空 `description`。LitCode 不跟随 Skill 符号链接，不自动扫描全局目录，也不自动安装远程 Skill。
+项目 Skill 使用原生目录 `.litcode/skills/<name>/SKILL.md`，兼容读取 `.agents/skills/` 和 `.agent/skills/`，且原生目录优先。用户级 Skill 使用便于跨 Agent 共享的 `~/.agents/skills/<name>/SKILL.md`。`SKILL.md` 必须包含合法 YAML frontmatter，`name` 要与目录一致，并提供非空 `description`。LitCode 不跟随 Skill 符号链接。
+
+外部使用 `litcode skill list|create|install|validate|sync` 管理；TUI 内输入 `/skill` 打开独立的可搜索选择器，也可使用相同子命令。远程安装先暂存并校验，绝不执行 Skill 脚本；同步只为受支持 Agent 创建指向 canonical Skill 的缺失链接，拒绝覆盖已有目录。
 
 命令行中的 `--profile` 对应 `LITCODE_DEFAULT_MODEL`，用于选择一整套 API 配置；`--model` 只覆盖其中的具体模型 ID。交互会话还可以用 `/model` 查询 API 并临时切换模型，这一操作不会写回 `settings.json`。
 

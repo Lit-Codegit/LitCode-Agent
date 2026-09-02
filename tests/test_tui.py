@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from rich.style import Style
-from textual.widgets import Collapsible, Input, Label, Markdown, Static, Tree
+from textual.widgets import Collapsible, Input, Label, Markdown, OptionList, Static, Tree
 from textual.events import MouseScrollDown
 
 from litcode_agent.agent import AgentEvent
@@ -15,12 +15,14 @@ from litcode_agent.config import Settings
 from litcode_agent.model import AssistantTurn, ModelDelta, ToolCall
 from litcode_agent.tui import (
     COMMANDS,
+    ChoicePicker,
     ConfirmCommand,
     HistoryPicker,
     LitCodeTUI,
     ModelPicker,
     PaneDivider,
     PromptArea,
+    SkillPicker,
     WelcomeBanner,
     run_tui,
 )
@@ -45,7 +47,11 @@ class FakeModel:
 def settings(tmp_path: Path) -> Settings:
     return Settings.from_env(
         tmp_path,
-        {"OPENAI_API_KEY": "secret", "LITCODE_MODEL": "model-a"},
+        {
+            "HOME": str(tmp_path / "home"),
+            "OPENAI_API_KEY": "secret",
+            "LITCODE_MODEL": "model-a",
+        },
     )
 
 
@@ -70,6 +76,39 @@ def test_tui_mounts_status_timeline_and_fixed_prompt(tmp_path: Path) -> None:
             meta_right = str(app.query_one("#prompt-meta-right", Label).render())
             assert "工作区" in meta_right
             assert tmp_path.name in meta_right
+
+    asyncio.run(exercise())
+
+
+def test_skill_command_opens_searchable_picker_and_inserts_invocation(
+    tmp_path: Path,
+) -> None:
+    skill = tmp_path / ".agents" / "skills" / "review-code"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: review-code\ndescription: Review changes carefully.\n---\nbody",
+        encoding="utf-8",
+    )
+
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            app._handle_command("/skill")
+            await pilot.pause()
+
+            assert isinstance(app.screen, SkillPicker)
+            skill_list = app.screen.query_one("#skill-list", OptionList)
+            assert "Review changes carefully" in str(
+                skill_list.get_option_at_index(0).prompt
+            )
+            await pilot.press("r", "e", "v", "i", "e", "w", "enter")
+            await pilot.pause()
+
+            assert app.query_one(PromptArea).text == "$review-code "
+            notices = [
+                str(widget.render()) for widget in app.query(".notice").results(Static)
+            ]
+            assert not any("Review changes carefully" in item for item in notices)
 
     asyncio.run(exercise())
 
@@ -162,6 +201,9 @@ def test_model_request_receives_current_terminal_and_pane_location(
         app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
         async with app.run_test(size=(140, 40)) as pilot:
             app.action_split("right")
+            await pilot.pause()
+            assert isinstance(app.screen, ChoicePicker)
+            await pilot.press("enter")
             await pilot.pause()
             prompt = app.query_one(PromptArea)
             prompt.text = "我在哪里"
@@ -398,6 +440,83 @@ def test_mouse_wheel_scrolls_each_split_timeline_independently(
                 )
                 await pilot.pause()
                 assert timeline.scroll_y > before
+
+    asyncio.run(exercise())
+
+
+def test_split_preserves_original_pane_visual_timeline(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 30)) as pilot:
+            original = app._active_runtime()
+            app._append_notice("SPLIT-PRESERVE-MARKER", runtime=original)
+            await pilot.pause()
+
+            app.action_split("right")
+            await pilot.pause()
+
+            original_notices = [
+                str(widget.render())
+                for widget in app.query("#view-pane-1 .notice").results(Static)
+            ]
+            assert any("SPLIT-PRESERVE-MARKER" in item for item in original_notices)
+
+    asyncio.run(exercise())
+
+
+def test_split_opens_new_pane_session_choice_and_cancel_rolls_back(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        app.store.create(tmp_path, "model-a", [], title="可挂载历史")
+        async with app.run_test(size=(120, 30)) as pilot:
+            original = app.session.session_id
+
+            app.action_split("right")
+            await pilot.pause()
+
+            assert isinstance(app.screen, ChoicePicker)
+            labels = [label for _, label in app.screen.choices]
+            assert any("新会话" in label for label in labels)
+            assert any("可挂载历史" in label for label in labels)
+            app.screen.action_cancel()
+            await pilot.pause()
+
+            assert tuple(app.panes) == ("pane-1",)
+            assert app.session.session_id == original
+
+    asyncio.run(exercise())
+
+
+def test_split_choice_keeps_new_session_as_draft_or_mounts_history(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
+        target = app.store.create(tmp_path, "model-a", [], title="待挂载历史")
+        async with app.run_test(size=(120, 30)) as pilot:
+            original = app.session.session_id
+
+            app.action_split("right")
+            await pilot.pause()
+            assert isinstance(app.screen, ChoicePicker)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.active_pane_id == "pane-2"
+            assert app.panes["pane-2"].session is None
+            assert app.panes["pane-1"].session.session_id == original
+
+            app.action_close_pane()
+            await pilot.pause()
+            app.action_split("right")
+            await pilot.pause()
+            assert isinstance(app.screen, ChoicePicker)
+            app.screen.dismiss(target)
+            await pilot.pause()
+            assert app.active_pane_id == "pane-2"
+            assert app.session.session_id == target
+            assert app.panes["pane-1"].session.session_id == original
 
     asyncio.run(exercise())
 
@@ -961,6 +1080,9 @@ def test_split_panes_run_concurrently_and_keep_streams_isolated(
             await pilot.pause()
             assert len(app.panes) == 2
             assert app.active_pane_id == "pane-2"
+            assert isinstance(app.screen, ChoicePicker)
+            await pilot.press("enter")
+            await pilot.pause()
 
             app._handle_command("/focus left")
             prompt = app.query_one(PromptArea)

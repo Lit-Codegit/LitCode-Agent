@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Mapping, cast
 
@@ -55,6 +55,7 @@ class Settings:
     session_send_policy: CommandPolicy = "confirm"
     session_wake_policy: CommandPolicy = "confirm"
     read_roots: tuple[ReadRoot, ...] = ()
+    user_skill_root: Path | None = None
     session_database: Path | None = None
     hooks: HookSettings = HookSettings()
     config_files: tuple[Path, ...] = ()
@@ -71,13 +72,15 @@ class Settings:
         if not root.is_dir():
             raise ConfigurationError(f"workspace is not a directory: {root}")
         merged, loaded = _load_project_config(root)
-        return cls._from_values(
+        settings = cls._from_values(
             root,
             os.environ if environ is None else environ,
             merged,
             loaded,
             use_credential_store=True,
         )
+        values = os.environ if environ is None else environ
+        return replace(settings, user_skill_root=_user_skill_root(values))
 
     @classmethod
     def load_tui(
@@ -95,7 +98,7 @@ class Settings:
         if not root.is_dir():
             raise ConfigurationError(f"workspace is not a directory: {root}")
         merged, loaded = _load_project_config(root)
-        return cls._from_values(
+        settings = cls._from_values(
             root,
             os.environ if environ is None else environ,
             merged,
@@ -103,6 +106,8 @@ class Settings:
             use_credential_store=True,
             allow_unconfigured=True,
         )
+        values = os.environ if environ is None else environ
+        return replace(settings, user_skill_root=_user_skill_root(values))
 
     @classmethod
     def from_env(
@@ -115,13 +120,15 @@ class Settings:
         root = workspace.expanduser().resolve()
         if not root.is_dir():
             raise ConfigurationError(f"workspace is not a directory: {root}")
-        return cls._from_values(
+        values = os.environ if environ is None else environ
+        settings = cls._from_values(
             root,
-            os.environ if environ is None else environ,
+            values,
             {},
             (),
             use_credential_store=False,
         )
+        return replace(settings, user_skill_root=_user_skill_root(values))
 
     @classmethod
     def configured_api_key_name(
@@ -404,6 +411,9 @@ class Settings:
                 }
                 for root in self.read_roots
             ],
+            "user_skill_root": (
+                str(self.user_skill_root) if self.user_skill_root is not None else None
+            ),
             "session_database": str(self.session_database),
             "hooks_enabled": not self.hooks.disabled,
             "hook_commands": self.hooks.count,
@@ -414,6 +424,11 @@ class Settings:
         """Backward-compatible name for the now-explicit send permission."""
 
         return self.session_send_policy
+
+
+def _user_skill_root(environ: Mapping[str, str]) -> Path:
+    home = environ.get("HOME")
+    return (Path(home).expanduser() if home else Path.home()) / ".agents" / "skills"
 
 
 def _read_json_object(path: Path) -> dict[str, object]:

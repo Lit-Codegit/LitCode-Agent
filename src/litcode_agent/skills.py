@@ -9,6 +9,11 @@ from pathlib import Path
 import yaml
 
 SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+PROJECT_SKILL_ROOT = Path(".litcode/skills")
+COMPATIBLE_PROJECT_SKILL_ROOTS = (
+    Path(".agent/skills"),
+    Path(".agents/skills"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,29 +50,42 @@ class SkillCatalog:
         self.issues = issues
 
     @classmethod
-    def discover(cls, workspace: Path) -> SkillCatalog:
-        root = workspace.resolve() / ".agents" / "skills"
-        if not root.is_dir():
-            return cls({}, ())
+    def discover(
+        cls, workspace: Path, user_root: Path | None = None
+    ) -> SkillCatalog:
+        roots: list[tuple[str, Path]] = []
+        if user_root is not None:
+            roots.append(("user", user_root.expanduser().resolve()))
+        project = workspace.resolve()
+        roots.extend(
+            (f"project:{relative}", project / relative)
+            for relative in (*COMPATIBLE_PROJECT_SKILL_ROOTS, PROJECT_SKILL_ROOT)
+        )
         skills: dict[str, Skill] = {}
         issues: list[str] = []
-        for directory in sorted(root.iterdir(), key=lambda item: item.name):
-            source = directory / "SKILL.md"
-            try:
-                if directory.is_symlink() or source.is_symlink():
-                    raise ValueError("Skill 目录或 SKILL.md 不得是符号链接")
-                if not directory.is_dir() or not source.is_file():
-                    continue
-                resolved = source.resolve(strict=True)
-                if not resolved.is_relative_to(root):
-                    raise ValueError("Skill 路径逃逸工作区目录")
-                skill = _read_skill(source, directory.name)
-                if skill.name in skills:
-                    raise ValueError(f"Skill 名称重复：{skill.name}")
-                skills[skill.name] = skill
-            except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as error:
-                issues.append(f"{directory.name}: {error}")
+        for scope, root in roots:
+            if not root.is_dir():
+                continue
+            for directory in sorted(root.iterdir(), key=lambda item: item.name):
+                source = directory / "SKILL.md"
+                try:
+                    if directory.is_symlink() or source.is_symlink():
+                        raise ValueError("Skill 目录或 SKILL.md 不得是符号链接")
+                    if not directory.is_dir() or not source.is_file():
+                        continue
+                    resolved = source.resolve(strict=True)
+                    if not resolved.is_relative_to(root):
+                        raise ValueError("Skill 路径逃逸 Skill 根目录")
+                    skill = read_skill(source, directory.name)
+                    skills[skill.name] = skill
+                except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as error:
+                    issues.append(f"{scope}/{directory.name}: {error}")
         return cls(skills, tuple(issues))
+
+    def reload(self, workspace: Path, user_root: Path | None = None) -> None:
+        fresh = self.discover(workspace, user_root)
+        self._skills = fresh._skills
+        self.issues = fresh.issues
 
     def metadata(self) -> tuple[SkillMetadata, ...]:
         return tuple(
@@ -83,7 +101,7 @@ class SkillCatalog:
             raise ValueError(f"找不到 Skill：{name}；可用：{available}") from error
 
 
-def _read_skill(source: Path, directory_name: str) -> Skill:
+def read_skill(source: Path, directory_name: str) -> Skill:
     raw = source.read_text(encoding="utf-8")
     if not raw.startswith("---\n"):
         raise ValueError("SKILL.md 缺少 YAML frontmatter")

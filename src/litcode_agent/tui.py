@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -20,6 +21,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.fuzzy import Matcher
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Collapsible,
@@ -71,6 +73,7 @@ from litcode_agent.prompt import PromptBuilder
 from litcode_agent.session_store import Checkpoint, SessionInfo, SessionStore, SessionTurn
 from litcode_agent.session_runtime import SessionRuntime, SessionRuntimeError
 from litcode_agent.session_workspace import PaneSession, SessionWorkspace
+from litcode_agent.skill_manager import ManagedSkill, SkillManagementError, SkillManager
 from litcode_agent.skills import SkillCatalog
 from litcode_agent.tool_display import (
     change_result_summary,
@@ -112,6 +115,7 @@ COMMANDS = (
         ("/sessions", "/tree", "/resume"),
     ),
     CommandSpec("/compact", "压缩当前上下文", "compact"),
+    CommandSpec("/skill", "列出、创建、安装、校验或同步 Skill", "skill", ("/skills",)),
     CommandSpec("/rewind", "回到历史检查点", "rewind"),
     CommandSpec("/redo", "撤销最近一次 rewind", "redo"),
     CommandSpec("/fork", "从检查点创建分支", "fork"),
@@ -139,6 +143,7 @@ LIST_CARD_LINE_THRESHOLD = 12
 PICKER_LABEL_CELLS = 60
 PICKER_GUIDE_DEPTH = 3
 MODEL_ID_CUSTOM = "\0enter-model-id"
+PANE_NEW_SESSION = "\0pane-new-session"
 SUBAGENT_SPINNER_FRAMES = (
     "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
 )
@@ -441,6 +446,105 @@ class ModelPicker(ModalScreen[str | None]):
             return
         if event.list_view.index < len(self.models):
             self.dismiss(self.models[event.list_view.index])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SkillPicker(ModalScreen[str | None]):
+    """OpenCode-style searchable Skill menu with compact metadata rows."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "取消"),
+        Binding("tab", "toggle_focus", "切换焦点", show=False),
+    ]
+
+    def __init__(self, skills: tuple[ManagedSkill, ...]) -> None:
+        super().__init__()
+        self.skills = skills
+        self.filtered = skills
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="skill-dialog"):
+            yield Label("选择 Skill", classes="dialog-title")
+            yield Input(
+                placeholder="搜索名称或描述",
+                id="skill-filter",
+            )
+            yield OptionList(id="skill-list", markup=False)
+            yield Label(
+                "Enter 插入调用 · ↑↓ 选择 · Tab 切换 · Esc 取消",
+                classes="dialog-help",
+                id="skill-help",
+            )
+
+    def on_mount(self) -> None:
+        self._refresh_options()
+        self.query_one("#skill-filter", Input).focus()
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key not in {"up", "down"}:
+            return
+        if not self.query_one("#skill-filter", Input).has_focus or not self.filtered:
+            return
+        options = self.query_one("#skill-list", OptionList)
+        current = options.highlighted or 0
+        offset = -1 if event.key == "up" else 1
+        options.highlighted = max(0, min(len(self.filtered) - 1, current + offset))
+        event.prevent_default()
+        event.stop()
+
+    @on(Input.Changed, "#skill-filter")
+    def filter_changed(self, event: Input.Changed) -> None:
+        query = event.value.strip()
+        if not query:
+            self.filtered = self.skills
+        else:
+            matcher = Matcher(query)
+            self.filtered = tuple(
+                item
+                for item in self.skills
+                if matcher.match(
+                    f"{item.skill.name} {item.skill.description} {item.scope}"
+                )
+                > 0
+            )
+        self._refresh_options()
+
+    @on(Input.Submitted, "#skill-filter")
+    def filter_submitted(self, event: Input.Submitted) -> None:
+        self._select_highlighted()
+
+    @on(OptionList.OptionSelected, "#skill-list")
+    def option_selected(self, event: OptionList.OptionSelected) -> None:
+        identifier = event.option.id
+        self.dismiss(str(identifier) if identifier is not None else None)
+
+    def _refresh_options(self) -> None:
+        options = self.query_one("#skill-list", OptionList)
+        options.clear_options()
+        options.add_options(
+            Option(_skill_picker_label(item), id=item.skill.name)
+            for item in self.filtered
+        )
+        if self.filtered:
+            options.highlighted = 0
+        count = len(self.filtered)
+        total = len(self.skills)
+        self.query_one("#skill-help", Label).update(
+            f"{count}/{total} · Enter 插入调用 · ↑↓ 选择 · Tab 切换 · Esc 取消"
+        )
+
+    def _select_highlighted(self) -> None:
+        options = self.query_one("#skill-list", OptionList)
+        index = options.highlighted
+        if index is not None and 0 <= index < len(self.filtered):
+            self.dismiss(self.filtered[index].skill.name)
+
+    def action_toggle_focus(self) -> None:
+        options = self.query_one("#skill-list", OptionList)
+        filter_input = self.query_one("#skill-filter", Input)
+        (options if filter_input.has_focus else filter_input).focus()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1489,13 +1593,13 @@ class LitCodeTUI(App[None]):
     Footer {
         display: none;
     }
-    ModelPicker, ConfirmCommand, ChoicePicker, RewindMode, HistoryPicker,
+    ModelPicker, SkillPicker, ConfirmCommand, ChoicePicker, RewindMode, HistoryPicker,
     QuestionPrompt, ProviderPicker, SecretPrompt, CustomEndpointPrompt,
     ModelIDPrompt {
         align: center middle;
         background: $background 80%;
     }
-    #model-dialog, #confirm-dialog, #history-dialog, #question-dialog {
+    #model-dialog, #skill-dialog, #confirm-dialog, #history-dialog, #question-dialog {
         width: 72;
         max-width: 90%;
         height: auto;
@@ -1509,6 +1613,22 @@ class LitCodeTUI(App[None]):
         border: none;
         background: $boost;
         width: 100%;
+    }
+    #skill-dialog {
+        width: 88;
+        max-width: 94%;
+    }
+    #skill-filter {
+        margin: 1 0 0 0;
+        border: none;
+        background: $boost;
+        width: 100%;
+    }
+    #skill-list {
+        height: auto;
+        max-height: 16;
+        margin: 1 0;
+        background: $background;
     }
     #model-dialog #custom-error {
         height: auto;
@@ -1602,7 +1722,12 @@ class LitCodeTUI(App[None]):
         self.pending_confirmations: set[threading.Event] = set()
         self.pending_questions: dict[str, _PendingQuestion] = {}
         self.workspace = Workspace(settings.workspace)
-        self.skills = SkillCatalog.discover(settings.workspace)
+        self.skills = SkillCatalog.discover(
+            settings.workspace, settings.user_skill_root
+        )
+        self.skill_manager = SkillManager(
+            settings.workspace, settings.user_skill_root
+        )
         assert settings.session_database is not None
         self.store = SessionStore(settings.session_database)
         self.system_prompt = PromptBuilder(
@@ -1662,7 +1787,7 @@ class LitCodeTUI(App[None]):
                 yield Label(id="prompt-meta-left")
                 yield Label(id="prompt-meta-right")
             yield Label(
-                "Enter 发送 · Shift+Enter 换行 · ↑↓ 历史 · / @ # 补全命令/文件/会话 · Ctrl+W 分屏 · F2 切换模型",
+                "Shift+Enter 换行 · ↑↓ 历史 · / @ # 命令/文件/会话 · Ctrl+W 分屏 · F2 切换模型",
                 id="prompt-hint",
             )
         yield Footer()
@@ -1776,14 +1901,33 @@ class LitCodeTUI(App[None]):
         self._rebuild_panes()
 
     def _rebuild_panes(self) -> None:
+        snapshots: dict[str, tuple[tuple[Widget, ...], float]] = {}
+        for runtime in self.panes.values():
+            try:
+                timeline = self._timeline(runtime)
+            except Exception:
+                continue
+            snapshots[runtime.pane_id] = (
+                tuple(timeline.children),
+                float(timeline.scroll_y),
+            )
         self._pane_layout_generation += 1
         generation = self._pane_layout_generation
         area = self.query_one("#pane-area", Vertical)
         area.remove_children()
         area.mount(self._layout_widget(self.pane_layout.root))
-        self.call_after_refresh(self._render_all_pane_histories, generation)
+        self.call_after_refresh(
+            self._restore_all_pane_timelines, generation, snapshots
+        )
 
-    def _render_all_pane_histories(self, generation: int, attempt: int = 0) -> None:
+    def _restore_all_pane_timelines(
+        self,
+        generation: int,
+        snapshots: dict[str, tuple[tuple[Widget, ...], float]],
+        attempt: int = 0,
+    ) -> None:
+        """Move existing visual timelines into the rebuilt topology unchanged."""
+
         if generation != self._pane_layout_generation:
             return
         timeline_ids = [
@@ -1793,11 +1937,35 @@ class LitCodeTUI(App[None]):
         if any(len(self.query(f"#{timeline_id}")) == 0 for timeline_id in timeline_ids):
             if attempt < 5:
                 self.call_after_refresh(
-                    self._render_all_pane_histories, generation, attempt + 1
+                    self._restore_all_pane_timelines,
+                    generation,
+                    snapshots,
+                    attempt + 1,
+                )
+            return
+        if any(
+            widget.parent is not None
+            for widgets, _ in snapshots.values()
+            for widget in widgets
+        ):
+            if attempt < 5:
+                self.call_after_refresh(
+                    self._restore_all_pane_timelines,
+                    generation,
+                    snapshots,
+                    attempt + 1,
                 )
             return
         for runtime in self.panes.values():
-            self._render_runtime_history(runtime)
+            snapshot = snapshots.get(runtime.pane_id)
+            if snapshot is None:
+                self._render_runtime_history(runtime)
+                continue
+            widgets, scroll_y = snapshot
+            timeline = self._timeline(runtime)
+            if widgets:
+                timeline.mount(*widgets)
+            timeline.scroll_to(y=scroll_y, animate=False)
 
     def action_pane_leader(self) -> None:
         now = time.monotonic()
@@ -2156,6 +2324,7 @@ class LitCodeTUI(App[None]):
             "clear": self.action_clear_session,
             "history": lambda: self.action_history(arguments),
             "compact": lambda: self.action_compact(arguments),
+            "skill": lambda: self.action_skill(arguments),
             "rewind": self.action_rewind,
             "redo": self.action_redo,
             "fork": self.action_fork,
@@ -2169,6 +2338,130 @@ class LitCodeTUI(App[None]):
             "schedule": lambda: self.action_schedule(arguments),
         }
         handlers[spec.handler]()
+
+    def action_skill(self, arguments: str = "") -> None:
+        """Manage Skills from inside the TUI through the shared manager."""
+
+        try:
+            tokens = shlex.split(arguments)
+        except ValueError as error:
+            self._append_notice(f"/skill 参数错误：{error}", error=True)
+            return
+        operation = tokens.pop(0) if tokens else "list"
+        try:
+            if operation == "list":
+                scope = _skill_scope(tokens, default="all")
+                if tokens:
+                    raise SkillManagementError(f"未知参数：{' '.join(tokens)}")
+                items = self.skill_manager.list(scope)
+                if not items:
+                    self._append_notice("没有发现 Skill。")
+                    return
+                self.push_screen(SkillPicker(items), self._skill_selected)
+                return
+            if operation == "create":
+                scope = _skill_scope(tokens, default="project")
+                description = _take_skill_option(tokens, "--description")
+                resources = _take_skill_options(tokens, "--resources")
+                if len(tokens) != 1 or description is None:
+                    raise SkillManagementError(
+                        '用法：/skill create <name> --description "说明" '
+                        "[--scope project|user] [--resources references]"
+                    )
+                skill = self.skill_manager.create(
+                    tokens[0], description, scope=scope, resources=resources
+                )
+                self._reload_skill_catalog()
+                self._append_notice(f"已创建 Skill：{skill.root}")
+                return
+            if operation == "install":
+                scope = _skill_scope(tokens, default="project")
+                name = _take_skill_option(tokens, "--name")
+                if len(tokens) != 1:
+                    raise SkillManagementError(
+                        "用法：/skill install <source> [--name <skill>] "
+                        "[--scope project|user]"
+                    )
+                self._set_busy(True, "正在安装 Skill…")
+                self.run_worker(
+                    lambda: self._install_skill(tokens[0], name, scope),
+                    name="skill-install",
+                    group="skill-install",
+                    thread=True,
+                    exclusive=True,
+                    exit_on_error=False,
+                )
+                return
+            if operation == "validate":
+                scope = _skill_scope(tokens, default="all")
+                if len(tokens) != 1:
+                    raise SkillManagementError(
+                        "用法：/skill validate <name-or-path> [--scope all|project|user]"
+                    )
+                skill = self.skill_manager.validate(tokens[0], scope)
+                self._append_notice(f"Skill 校验通过：{skill.name} · {skill.root}")
+                return
+            if operation == "sync":
+                scope = _skill_scope(tokens, default="project")
+                agents = _take_skill_options(tokens, "--agent")
+                links = self.skill_manager.sync(tokens, scope=scope, agents=agents)
+                lines = [
+                    f"{'已创建' if link.created else '已存在'} · "
+                    f"{link.agent}/{link.skill} -> {link.destination}"
+                    for link in links
+                ]
+                self._append_notice_card(
+                    "Skill 同步",
+                    "\n".join(lines) or "没有检测到需要同步的 Agent 目录。",
+                )
+                return
+            raise SkillManagementError(
+                "子命令必须是 list、create、install、validate 或 sync"
+            )
+        except (OSError, SkillManagementError) as error:
+            self._append_notice(str(error), error=True)
+
+    def _skill_selected(self, name: str | None) -> None:
+        prompt = self.query_one(PromptArea)
+        if name:
+            invocation = f"${name} "
+            prompt.text = invocation + prompt.text
+            prompt.move_cursor((0, len(invocation)))
+        prompt.focus()
+
+    def _install_skill(self, source: str, name: str | None, scope: str) -> None:
+        try:
+            skill = self.skill_manager.install(source, name=name, scope=scope)  # type: ignore[arg-type]
+        except (OSError, SkillManagementError) as error:
+            self.call_from_thread(self._finish_with_error, str(error))
+            return
+        self.call_from_thread(self._finish_skill_install, skill.name, skill.root)
+
+    def _finish_skill_install(self, name: str, root: Path) -> None:
+        self._reload_skill_catalog()
+        self._set_busy(False, "就绪")
+        self._append_notice(f"已安装 Skill：{name} · {root}")
+        self.query_one(PromptArea).focus()
+
+    def _reload_skill_catalog(self) -> None:
+        self.skills.reload(self.settings.workspace, self.settings.user_skill_root)
+        system_prompt = PromptBuilder(
+            self.settings.workspace,
+            self.settings.max_iterations,
+            self.skills.metadata(),
+        ).build()
+        self.system_prompt = system_prompt
+        self.sessions.system_prompt = system_prompt
+        self.runtime.system_prompt = system_prompt
+        for runtime in self.panes.values():
+            runtime.agent.system_prompt = system_prompt
+            if runtime.session is not None and runtime.session.messages:
+                first = runtime.session.messages[0]
+                if first.get("role") == "system":
+                    runtime.session.messages[0] = {
+                        "role": "system",
+                        "content": system_prompt,
+                    }
 
     def _command_direction(self, arguments: str, action) -> None:
         direction = arguments.strip().lower()
@@ -2262,6 +2555,7 @@ class LitCodeTUI(App[None]):
                 "等待所有 pane 当前任务结束后再改变布局。", error=True
             )
             return
+        previous_pane_id = self.active_pane_id
         pane = self.sessions.split(direction, session_id=session_id)
         runtime = self._pane_runtime(pane)
         self.panes[pane.pane_id] = runtime
@@ -2269,6 +2563,60 @@ class LitCodeTUI(App[None]):
         self.model = runtime.model
         self._rebuild_panes()
         self._set_pane_busy(runtime, False, "新 pane")
+        if session_id is None:
+            self._open_pane_session_picker(pane.pane_id, previous_pane_id)
+
+    def _open_pane_session_picker(
+        self, pane_id: str, previous_pane_id: str
+    ) -> None:
+        if pane_id not in self.panes or self.active_pane_id != pane_id:
+            return
+        mounted = set(self.sessions.mounted_sessions())
+        choices = [(PANE_NEW_SESSION, "＋ 新会话（/new，首次输入时创建）")]
+        choices.extend(
+            (info.id, _session_label(info))
+            for _, info in self.store.session_tree(self.settings.workspace)
+            if info.id not in mounted
+        )
+        self.push_screen(
+            ChoicePicker(
+                f"为 {self.panes[pane_id].pane_slot} 号 pane 选择会话",
+                tuple(choices),
+            ),
+            lambda choice: self._pane_session_selected(
+                pane_id, previous_pane_id, choice
+            ),
+        )
+
+    def _pane_session_selected(
+        self,
+        pane_id: str,
+        previous_pane_id: str,
+        choice: str | None,
+    ) -> None:
+        if pane_id not in self.panes:
+            return
+        self.sessions.active_pane_id = pane_id
+        if choice == PANE_NEW_SESSION:
+            runtime = self._active_runtime()
+            if not tuple(self._timeline(runtime).children):
+                self._mount_welcome(runtime)
+            self.query_one(PromptArea).focus()
+            self._update_status("新会话 · 首次输入后创建")
+            return
+        if choice is not None:
+            self._session_selected(choice)
+            return
+
+        removed_id, fallback = self.sessions.close_active_pane()
+        del self.panes[removed_id]
+        if previous_pane_id in self.panes:
+            self.sessions.active_pane_id = previous_pane_id
+            fallback = self.sessions.active
+        self._sync_runtime(fallback)
+        self._rebuild_panes()
+        self.query_one(PromptArea).focus()
+        self._update_status("已取消新建 pane")
 
     def action_focus_pane(self, direction: str) -> None:
         if direction not in {"left", "right", "up", "down"}:
@@ -3885,6 +4233,60 @@ def _relative_time(timestamp: float) -> str:
 
 def _cell_width(text: str) -> int:
     return sum(2 if ord(character) > 0x2E80 else 1 for character in text)
+
+
+def _skill_picker_label(item: ManagedSkill) -> Text:
+    name, _ = _truncate_cells(item.skill.name, 24)
+    description = " ".join(item.skill.description.split())
+    description, _ = _truncate_cells(description, 48)
+    label = Text()
+    label.append("◆ ", style="cyan")
+    label.append(name, style="bold")
+    label.append("  ")
+    label.append(description, style="dim")
+    label.append("  ")
+    label.append(item.scope, style="magenta" if item.scope == "project" else "blue")
+    return label
+
+
+def _skill_scope(tokens: list[str], *, default: str) -> str:
+    value = _take_skill_option(tokens, "--scope") or default
+    allowed = {"all", "project", "user"} if default == "all" else {"project", "user"}
+    if value not in allowed:
+        raise SkillManagementError(
+            f"scope 必须是 {'、'.join(sorted(allowed))}"
+        )
+    return value
+
+
+def _take_skill_option(tokens: list[str], option: str) -> str | None:
+    values = _take_skill_options(tokens, option)
+    if len(values) > 1:
+        raise SkillManagementError(f"{option} 只能出现一次")
+    return values[0] if values else None
+
+
+def _take_skill_options(tokens: list[str], option: str) -> list[str]:
+    values: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == option:
+            if index + 1 >= len(tokens):
+                raise SkillManagementError(f"{option} 缺少值")
+            values.append(tokens[index + 1])
+            del tokens[index : index + 2]
+            continue
+        prefix = f"{option}="
+        if token.startswith(prefix):
+            value = token[len(prefix) :]
+            if not value:
+                raise SkillManagementError(f"{option} 缺少值")
+            values.append(value)
+            del tokens[index]
+            continue
+        index += 1
+    return values
 
 
 def _diff_style(line: str) -> str:

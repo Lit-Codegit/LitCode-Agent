@@ -43,7 +43,9 @@ def build_default_registry(
 
     workspace = Workspace(settings.workspace)
     read_scope = ReadScope(workspace, settings.read_roots)
-    skill_catalog = skills or SkillCatalog.discover(settings.workspace)
+    skill_catalog = skills or SkillCatalog.discover(
+        settings.workspace, settings.user_skill_root
+    )
     execution_lock = WorkspaceMutationLocks.for_workspace(workspace.root)
     tools = [
         ListFilesTool(read_scope, settings.max_output_chars),

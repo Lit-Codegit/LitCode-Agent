@@ -25,19 +25,20 @@ from litcode_agent.prompt import PromptBuilder
 from litcode_agent.scheduler import Scheduler, describe_task
 from litcode_agent.session_runtime import SessionRuntime, SessionRuntimeError
 from litcode_agent.session_store import SessionStore
+from litcode_agent.skill_manager import SkillManagementError, SkillManager
 from litcode_agent.skills import SkillCatalog
 from litcode_agent.tools import build_default_registry
 from litcode_agent.tools.base import ToolExecutionContext
 from litcode_agent.tui import run_tui
 from litcode_agent.ui import TerminalUI
 
-COMMANDS = {"auth", "doctor", "models", "run", "chat", "schedule"}
+COMMANDS = {"auth", "doctor", "models", "run", "chat", "schedule", "skill"}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="litcode",
-        usage="litcode [PATH] | litcode {auth,doctor,models,run,chat,schedule} ...",
+        usage="litcode [PATH] | litcode {auth,doctor,models,run,chat,schedule,skill} ...",
         description="一个透明、可解释的本地编程智能体。",
         epilog="不带参数时打开当前目录；传入路径时打开该目录的全屏 TUI。",
     )
@@ -57,6 +58,57 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path.cwd(),
         help="用于自动识别 apiKeyEnv 的工作区（默认：当前目录）",
+    )
+
+    skill = subparsers.add_parser("skill", help="管理标准 Agent Skills")
+    skill.add_argument(
+        "--workspace", type=Path, default=Path.cwd(), help="项目 Skill 所属工作区"
+    )
+    skill_commands = skill.add_subparsers(dest="skill_command", required=True)
+    skill_list = skill_commands.add_parser("list", help="列出已发现的 Skill")
+    skill_list.add_argument(
+        "--scope", choices=("all", "project", "user"), default="all"
+    )
+    skill_create = skill_commands.add_parser("create", help="创建通用 Skill 骨架")
+    skill_create.add_argument("name")
+    skill_create.add_argument("--description", required=True)
+    skill_create.add_argument(
+        "--scope", choices=("project", "user"), default="project"
+    )
+    skill_create.add_argument(
+        "--resources",
+        action="append",
+        choices=("scripts", "references", "assets"),
+        default=[],
+    )
+    skill_install = skill_commands.add_parser("install", help="从目录或 Git 仓库安装 Skill")
+    skill_install.add_argument("source")
+    skill_install.add_argument("--name", help="来源包含多个 Skill 时选择名称")
+    skill_install.add_argument(
+        "--scope", choices=("project", "user"), default="project"
+    )
+    skill_validate = skill_commands.add_parser("validate", help="校验 Skill 目录和元数据")
+    skill_validate.add_argument("target")
+    skill_validate.add_argument(
+        "--scope", choices=("all", "project", "user"), default="all"
+    )
+    skill_sync = skill_commands.add_parser("sync", help="同步到本机其他 Agent")
+    skill_sync.add_argument("names", nargs="*")
+    skill_sync.add_argument(
+        "--scope", choices=("project", "user"), default="project"
+    )
+    skill_sync.add_argument(
+        "--agent",
+        action="append",
+        choices=(
+            "codex",
+            "claude-code",
+            "opencode",
+            "cursor",
+            "gemini-cli",
+            "github-copilot",
+        ),
+        default=[],
     )
 
     doctor = subparsers.add_parser("doctor", help="校验配置且不显示密钥")
@@ -140,6 +192,8 @@ def main(
     terminal = ui or TerminalUI()
     if args.command == "auth":
         return _auth_login(args, terminal)
+    if args.command == "skill":
+        return _skill_command(args, terminal)
     if args.command == "chat":
         args.workspace = args.path or args.workspace or Path.cwd()
     settings = _load_settings(
@@ -173,7 +227,7 @@ def main(
         return 0
 
     model = OpenAIChatModel(settings)
-    skills = SkillCatalog.discover(settings.workspace)
+    skills = SkillCatalog.discover(settings.workspace, settings.user_skill_root)
     if getattr(args, "model", None):
         model.select_model(args.model)
 
@@ -246,6 +300,53 @@ def _auth_login(args: argparse.Namespace, terminal: TerminalUI) -> int:
         return 1
     terminal.show_info(f"凭据 {credential} 已保存到 {path}（权限 0600）。")
     return 0
+
+
+def _skill_command(args: argparse.Namespace, terminal: TerminalUI) -> int:
+    manager = SkillManager(args.workspace)
+    try:
+        if args.skill_command == "list":
+            items = manager.list(args.scope)
+            if not items:
+                terminal.show_info("没有发现 Skill。")
+            for item in items:
+                terminal.show_info(
+                    f"{item.skill.name} · {item.scope} · {item.skill.description}"
+                )
+            return 0
+        if args.skill_command == "create":
+            skill = manager.create(
+                args.name,
+                args.description,
+                scope=args.scope,
+                resources=args.resources,
+            )
+            terminal.show_info(f"已创建 Skill：{skill.root}")
+            return 0
+        if args.skill_command == "install":
+            skill = manager.install(args.source, name=args.name, scope=args.scope)
+            terminal.show_info(f"已安装 Skill：{skill.root}")
+            return 0
+        if args.skill_command == "validate":
+            skill = manager.validate(args.target, args.scope)
+            terminal.show_info(f"Skill 校验通过：{skill.name} · {skill.root}")
+            return 0
+        if args.skill_command == "sync":
+            links = manager.sync(
+                args.names, scope=args.scope, agents=args.agent
+            )
+            if not links:
+                terminal.show_info("没有检测到需要同步的 Agent 目录。")
+            for link in links:
+                status = "已创建" if link.created else "已存在"
+                terminal.show_info(
+                    f"{status}：{link.agent}/{link.skill} -> {link.destination}"
+                )
+            return 0
+        raise AssertionError(f"unhandled skill command: {args.skill_command}")
+    except (OSError, SkillManagementError) as error:
+        terminal.show_error(str(error))
+        return 1
 
 
 def _load_settings(
