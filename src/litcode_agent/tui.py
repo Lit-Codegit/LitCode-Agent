@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.text import Text
+from textual.css.query import NoMatches
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -1112,8 +1113,16 @@ class QuestionPrompt(ModalScreen[list[list[str]] | None]):
 
     def on_mount(self) -> None:
         # 屏幕的子组件由 compose 异步挂载；慢机器上可能晚于本回调一帧，
-        # 推迟到下一帧再填充首屏内容。
-        self.call_after_refresh(self._refresh_tab)
+        # 推迟到下一帧再填充首屏内容，未就绪时继续尝试。
+        self._refresh_tab_safe()
+
+    def _refresh_tab_safe(self, attempt: int = 0) -> None:
+        if attempt >= 100:
+            return
+        try:
+            self._refresh_tab()
+        except NoMatches:
+            self.call_after_refresh(self._refresh_tab_safe, attempt + 1)
 
     @on(OptionList.OptionSelected, "#question-options")
     def option_selected(self, event: OptionList.OptionSelected) -> None:

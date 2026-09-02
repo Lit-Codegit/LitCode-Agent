@@ -130,7 +130,9 @@ def test_welcome_banner_disappears_after_first_message(tmp_path: Path) -> None:
             prompt = app.query_one(PromptArea)
             prompt.text = "你好"
             prompt.action_submit()
-            await pilot.pause()
+            assert await wait_until(
+                pilot, lambda: not list(app.query(WelcomeBanner))
+            )
             assert not list(app.query(WelcomeBanner))
 
     asyncio.run(exercise())
@@ -1648,6 +1650,11 @@ def test_tui_ask_user_modal_returns_answer_and_cards(tmp_path: Path) -> None:
                 if isinstance(app.screen, QuestionPrompt):
                     break
             assert isinstance(app.screen, QuestionPrompt)
+            assert await wait_until(
+                pilot,
+                lambda: "继续还是回退？"
+                in str(app.screen.query_one("#question-text", Static).render()),
+            )
             assert "继续还是回退？" in str(app.screen.query_one("#question-text", Static).render())
 
             await pilot.press("1")
