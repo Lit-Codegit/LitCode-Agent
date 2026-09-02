@@ -1953,7 +1953,12 @@ class LitCodeTUI(App[None]):
         snapshots: dict[str, tuple[tuple[Widget, ...], float]],
         attempt: int = 0,
     ) -> None:
-        """Move existing visual timelines into the rebuilt topology unchanged."""
+        """Move existing visual timelines into the rebuilt topology unchanged.
+
+        新拓扑的挂载与旧部件的卸载都由事件循环异步完成，在慢机器（如
+        Windows CI）上可能超过“下一帧”才能就绪；轮询直到条件满足，耗尽
+        预算后按会话状态重放，绝不让 pane 时间线静默清空。
+        """
 
         if generation != self._pane_layout_generation:
             return
@@ -1961,27 +1966,28 @@ class LitCodeTUI(App[None]):
             "timeline" if runtime.pane_slot == 1 else f"timeline-{runtime.pane_id}"
             for runtime in self.panes.values()
         ]
-        if any(len(self.query(f"#{timeline_id}")) == 0 for timeline_id in timeline_ids):
-            if attempt < 5:
+        ready = (
+            all(len(self.query(f"#{timeline_id}")) > 0 for timeline_id in timeline_ids)
+            and all(
+                widget.parent is None
+                for widgets, _ in snapshots.values()
+                for widget in widgets
+            )
+        )
+        if not ready:
+            if attempt < 200:
                 self.call_after_refresh(
                     self._restore_all_pane_timelines,
                     generation,
                     snapshots,
                     attempt + 1,
                 )
-            return
-        if any(
-            widget.parent is not None
-            for widgets, _ in snapshots.values()
-            for widget in widgets
-        ):
-            if attempt < 5:
-                self.call_after_refresh(
-                    self._restore_all_pane_timelines,
-                    generation,
-                    snapshots,
-                    attempt + 1,
-                )
+            else:
+                for runtime in self.panes.values():
+                    try:
+                        self._render_runtime_history(runtime)
+                    except Exception:
+                        pass
             return
         for runtime in self.panes.values():
             snapshot = snapshots.get(runtime.pane_id)

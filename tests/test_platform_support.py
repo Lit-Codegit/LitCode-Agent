@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -63,7 +64,7 @@ def test_windows_shell_prefers_powershell_core() -> None:
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Get-Location",
+            "Get-Location\nexit $LASTEXITCODE",
         ],
         False,
     )
@@ -81,6 +82,27 @@ def test_windows_shell_falls_back_to_comspec() -> None:
         ["C:/Windows/System32/cmd.exe", "/d", "/s", "/c", "cd"],
         False,
     )
+
+
+def test_powershell_propagates_native_exit_code() -> None:
+    """PowerShell 7.4+ -Command 默认不传播 $LASTEXITCODE，hook 依赖退出码
+    2 表示拦截；显式 exit 包装后必须保留原退出码。"""
+
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("pwsh not installed")
+    spec = ShellSpec("PowerShell", pwsh)
+    script = f"{sys.executable} -c 'import sys; sys.exit(2)'"
+    invocation, implicit = spec.invocation(script)
+    completed = subprocess.run(
+        invocation,
+        capture_output=True,
+        text=True,
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert completed.returncode == 2
 
 
 def test_windows_timeout_falls_back_when_taskkill_fails(

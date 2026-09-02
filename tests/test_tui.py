@@ -28,6 +28,15 @@ from litcode_agent.tui import (
 )
 
 
+async def wait_until(pilot, predicate, attempts: int = 200, delay: float = 0.05):
+    """Poll a TUI condition until it holds; CI 平台越慢，单次 pause 越不可靠。"""
+    for _ in range(attempts):
+        if predicate():
+            return True
+        await pilot.pause(delay)
+    return predicate()
+
+
 class FakeModel:
     def __init__(self) -> None:
         self.model = "model-a"
@@ -489,7 +498,18 @@ def test_split_preserves_original_pane_visual_timeline(tmp_path: Path) -> None:
             await pilot.pause()
 
             app.action_split("right")
-            await pilot.pause()
+            assert await wait_until(
+                pilot,
+                lambda: any(
+                    "SPLIT-PRESERVE-MARKER" in item
+                    for item in [
+                        str(widget.render())
+                        for widget in app.query(
+                            "#view-pane-1 .notice"
+                        ).results(Static)
+                    ]
+                ),
+            )
 
             original_notices = [
                 str(widget.render())
@@ -813,7 +833,7 @@ def test_new_command_detaches_session_and_keeps_running_task(
             assert app.busy
 
             app._handle_command("/new")
-            await pilot.pause(0.05)
+            assert await wait_until(pilot, lambda: not app.busy)
 
             assert app.active_pane_id == "pane-1"
             assert app.session.session_id != previous.session_id
@@ -821,13 +841,19 @@ def test_new_command_detaches_session_and_keeps_running_task(
             assert previous.session_id in app.sessions.detached
             assert previous.session_id in app.running_sessions
             assert not app.busy
-            timeline = app._timeline(app._active_runtime())
-            assert not any(
-                "问题" in str(child.render()) for child in timeline.children
+            assert await wait_until(
+                pilot,
+                lambda: not any(
+                    "问题" in str(child.render())
+                    for child in app._timeline(app._active_runtime()).children
+                ),
             )
+            timeline = app._timeline(app._active_runtime())
 
             app._session_selected(previous.session_id)
-            await pilot.pause(0.05)
+            assert await wait_until(
+                pilot, lambda: app.session.session_id == previous.session_id
+            )
             assert app.session.session_id == previous.session_id
             assert app.busy
             assert not app.query_one(PromptArea).disabled
@@ -926,13 +952,13 @@ def test_subagent_command_can_create_mount_and_start_a_child_pane(
             assert child.parent_id == parent_id
             assert model.requests[0][-1]["content"] == "检查测试"
             assert app.session.messages[-1]["content"] == "TUI 回答"
-            for _ in range(120):
-                await pilot.pause(0.05)
-                if any(
+            assert await wait_until(
+                pilot,
+                lambda: any(
                     "挂载到 2 号 pane" in str(widget.render())
                     for widget in app.query(".notice").results(Static)
-                ):
-                    break
+                ),
+            )
             assert any(
                 "挂载到 2 号 pane" in str(widget.render())
                 for widget in app.query(".notice").results(Static)
@@ -1556,10 +1582,9 @@ def test_history_switch_keeps_running_task_in_background(tmp_path: Path) -> None
             other = app.store.create(tmp_path, "model-a", [], title="切换目标")
 
             app._session_selected(other)
-            for _ in range(160):
-                await pilot.pause(0.05)
-                if app.session.session_id == other and not app.busy:
-                    break
+            assert await wait_until(
+                pilot, lambda: app.session.session_id == other and not app.busy
+            )
 
             assert app.session.session_id == other
             assert busy_id in app.sessions.detached

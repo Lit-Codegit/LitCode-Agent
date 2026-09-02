@@ -21,13 +21,16 @@ class ShellSpec:
         if self.executable is None:
             return command, True
         if self.name == "PowerShell":
+            # PowerShell 7.4+ -Command 只把“最后一个语句”的成败映射为进程
+            # 退出码（失败一律 1），不会透传原生命令的 $LASTEXITCODE；显式
+            # exit 才能保留真实退出码（hook 依赖 return code == 2 的约定）。
             return (
                 [
                     self.executable,
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    command,
+                    f"{command}\nexit $LASTEXITCODE",
                 ],
                 False,
             )
