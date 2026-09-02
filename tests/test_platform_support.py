@@ -8,7 +8,11 @@ from pathlib import Path
 import pytest
 
 import litcode_agent.process_runner as process_runner
-from litcode_agent.process_runner import ShellSpec, resolve_shell
+from litcode_agent.process_runner import (
+    ShellSpec,
+    resolve_shell,
+    run_shell,
+)
 from litcode_agent.workspace_lock import WorkspaceProcessLock, WorkspaceLockError
 
 
@@ -90,42 +94,33 @@ def test_windows_shell_falls_back_to_comspec() -> None:
 
 
 def test_powershell_propagates_native_exit_code() -> None:
-    """PowerShell 7.4+ -Command 默认不传播 $LASTEXITCODE，hook 依赖退出码
-    2 表示拦截；显式 exit 包装后必须保留原退出码。"""
+    """PowerShell 7.4+ -Command 默认不传播 $LASTEXITCODE（失败一律 1），
+    hook 依赖 return code == 2 的拦截约定；显式 exit 包装后必须保留。"""
 
-    pwsh = shutil.which("pwsh")
-    if pwsh is None:
+    if shutil.which("pwsh") is None:
         pytest.skip("pwsh not installed")
-    spec = ShellSpec("PowerShell", pwsh)
-    script = f"{sys.executable} -c 'import sys; sys.exit(2)'"
-    invocation, implicit = spec.invocation(script)
-    completed = subprocess.run(
-        invocation,
-        capture_output=True,
-        text=True,
-        check=False,
-        stdin=subprocess.DEVNULL,
+    completed = run_shell(
+        f"{sys.executable} -c 'import sys; sys.exit(2)'",
+        cwd=Path.cwd(),
+        timeout=30,
     )
 
     assert completed.returncode == 2
 
 
 def test_powershell_preserves_utf8_stderr() -> None:
-    """Windows 本地代码页会把中文输出改写为 \\uXXXX 转义；子进程环境必须
-    钉 UTF-8，hook 的非 ASCII 错误信息才能原样到达模型。"""
+    """Windows 本地代码页会把子进程中文输出改写为 \\uXXXX 转义；run_shell
+    必须给子进程钉 PYTHONUTF8=1，hook 的非 ASCII 错误信息才能原样到达。"""
 
-    pwsh = shutil.which("pwsh")
-    if pwsh is None:
+    if shutil.which("pwsh") is None:
         pytest.skip("pwsh not installed")
-    spec = ShellSpec("PowerShell", pwsh)
-    script = f"{sys.executable} -c 'import sys; print(\"禁止执行\", file=sys.stderr); sys.exit(2)'"
-    invocation, implicit = spec.invocation(script)
-    completed = subprocess.run(
-        invocation,
-        capture_output=True,
-        text=True,
-        check=False,
-        stdin=subprocess.DEVNULL,
+    completed = run_shell(
+        (
+            f"{sys.executable} -c "
+            "'import sys; print(\"禁止执行\", file=sys.stderr); sys.exit(2)'"
+        ),
+        cwd=Path.cwd(),
+        timeout=30,
     )
 
     assert completed.returncode == 2

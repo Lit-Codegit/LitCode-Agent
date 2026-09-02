@@ -1998,7 +1998,9 @@ class LitCodeTUI(App[None]):
             timeline = self._timeline(runtime)
             if widgets:
                 timeline.mount(*widgets)
-            timeline.scroll_to(y=scroll_y, animate=False)
+                # 只有原本有内容才恢复滚动位置：新 pane 的恢复可能与用户
+                # 滚动交错，空快照不应把用户位置重置回 0。
+                timeline.scroll_to(y=scroll_y, animate=False)
 
     def action_pane_leader(self) -> None:
         now = time.monotonic()

@@ -465,8 +465,14 @@ def test_mouse_wheel_scrolls_each_split_timeline_independently(
     async def exercise() -> None:
         app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
         async with app.run_test(size=(120, 24)) as pilot:
+            original = app._active_runtime()
+            snapshot_count = len(app._timeline(original).children)
             app.action_split("right")
-            await pilot.pause()
+            assert await wait_until(
+                pilot,
+                lambda: len(app._timeline(original).children) == snapshot_count
+                and len(app.query("#timeline-pane-2")) > 0,
+            )
             for runtime in app.panes.values():
                 for number in range(40):
                     app._append_notice(f"line {number}", runtime=runtime)
