@@ -45,4 +45,4 @@ uv run litcode run "检查测试，修复失败并验证结果。"
 - 文件工具以真实路径限制读写范围；命令设置超时和输出截断；Agent 循环设置最大轮数。
 - SQLite 保留原始会话、检查点和分支，支持 `@` 文件引用、`#` 会话引用、rewind/redo、多 pane 和后台子会话。
 - 支持流式响应、模型切换、Agent Skills 与本地定时任务；厂商差异集中在模型适配器中。
-- 跨平台细节：优先使用 ripgrep 搜索，未安装时自动回退 Python 实现；命令用平台默认 shell（Windows 优先 PowerShell 7）。Skill 同步需要符号链接，Windows 若提示权限不足，请开启 Developer Mode 或使用管理员终端。
+- 跨平台细节：优先使用 ripgrep 搜索，未安装时自动回退 Python 实现；命令用平台默认 shell（Windows 优先 PowerShell 7），hooks 中配置的命令同样按该 shell 执行，Windows 用户请用 PowerShell 语法（如避免使用 `python -c '...'` 这类内嵌引号写法）。Skill 同步需要符号链接，Windows 若提示权限不足，请开启 Developer Mode 或使用管理员终端。

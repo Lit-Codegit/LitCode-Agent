@@ -1556,7 +1556,10 @@ def test_history_switch_keeps_running_task_in_background(tmp_path: Path) -> None
             other = app.store.create(tmp_path, "model-a", [], title="切换目标")
 
             app._session_selected(other)
-            await pilot.pause()
+            for _ in range(160):
+                await pilot.pause(0.05)
+                if app.session.session_id == other and not app.busy:
+                    break
 
             assert app.session.session_id == other
             assert busy_id in app.sessions.detached
