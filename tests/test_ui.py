@@ -50,6 +50,21 @@ def test_renders_tool_call_and_result() -> None:
     assert "文件内容" in rendered
 
 
+def test_renders_automatic_compaction_events() -> None:
+    ui, output = make_ui()
+
+    ui.handle_event(
+        AgentEvent("compaction_start", 2, content="正在自动压缩上下文")
+    )
+    ui.handle_event(
+        AgentEvent("compaction_end", 2, content="自动上下文压缩完成")
+    )
+
+    rendered = output.getvalue()
+    assert "正在自动压缩上下文" in rendered
+    assert "自动上下文压缩完成" in rendered
+
+
 def test_invalid_model_selection_keeps_current_model() -> None:
     ui, output = make_ui("99")
 

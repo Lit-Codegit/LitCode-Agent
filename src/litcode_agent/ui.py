@@ -108,6 +108,12 @@ class TerminalUI:
         return models[index - 1]
 
     def handle_event(self, event: AgentEvent) -> None:
+        if event.kind in {"compaction_start", "compaction_end"}:
+            if event.is_error:
+                self.show_error(event.content or "自动上下文压缩失败")
+            else:
+                self.show_info(event.content or "自动上下文压缩完成")
+            return
         if event.kind == "model_start":
             self.console.print(
                 f"[dim]第 {event.iteration} 轮 · 正在请求模型…[/dim]"

@@ -275,6 +275,7 @@ class SessionWorkspace:
             tool_context=lambda current_id: self._tool_context(pane_id, current_id),
             origin_terminal_id=self.terminal_id,
             origin_pane_slot=pane_slot,
+            auto_compact_chars=self.settings.auto_compact_chars,
         )
         session = agent.start_session(session_id) if session_id is not None else None
         return PaneSession(pane_id, pane_slot, agent, model, session)
@@ -423,6 +424,7 @@ class SessionWorkspace:
             tool_context=lambda current_id: self._tool_context(None, current_id),
             origin_terminal_id=self.terminal_id,
             origin_pane_slot=None,
+            auto_compact_chars=self.settings.auto_compact_chars,
         )
         return agent.start_session(session_id)
 

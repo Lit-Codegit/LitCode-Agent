@@ -269,6 +269,7 @@ def main(
         PromptBuilder(
             settings.workspace, settings.max_iterations, skills.metadata()
         ).build(),
+        auto_compact_chars=settings.auto_compact_chars,
     )
     if args.command == "run":
         terminal.show_user(args.task)
@@ -495,6 +496,7 @@ def _schedule_tick(
             model_name=info.model,
             workspace=settings.workspace,
             tool_context=tool_context,
+            auto_compact_chars=settings.auto_compact_chars,
         )
         return agent.start_session(session_id)
 

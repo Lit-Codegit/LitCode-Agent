@@ -63,6 +63,8 @@ TerminationReason = Literal[
 @dataclass(frozen=True, slots=True)
 class AgentEvent:
     kind: Literal[
+        "compaction_start",
+        "compaction_end",
         "model_start",
         "model_delta",
         "model_end",
@@ -111,9 +113,12 @@ class Agent:
         tool_context: Callable[[str], ToolExecutionContext] | None = None,
         origin_terminal_id: str | None = None,
         origin_pane_slot: int | None = None,
+        auto_compact_chars: int = 0,
     ) -> None:
         if max_iterations <= 0:
             raise ValueError("max_iterations must be positive")
+        if auto_compact_chars < 0:
+            raise ValueError("auto_compact_chars must be non-negative")
         self.model = model
         self.tools = tools
         self.max_iterations = max_iterations
@@ -127,6 +132,7 @@ class Agent:
         self.tool_context = tool_context
         self.origin_terminal_id = origin_terminal_id
         self.origin_pane_slot = origin_pane_slot
+        self.auto_compact_chars = auto_compact_chars
 
     def start_session(self, session_id: str | None = None) -> AgentSession:
         """创建一段保留消息历史的交互会话。"""
@@ -245,6 +251,10 @@ class AgentSession:
         for iteration in range(1, self.agent.max_iterations + 1):
             if cancelled():
                 return self._cancelled(iteration - 1)
+            if self._should_auto_compact(iteration):
+                self._auto_compact(iteration)
+                if cancelled():
+                    return self._cancelled(iteration - 1)
             self.agent.event_sink(
                 AgentEvent(
                     kind="model_start",
@@ -630,6 +640,47 @@ class AgentSession:
                 "需要更多工时请委派子会话或明示预算不足。"
             )
         return note
+
+    def _should_auto_compact(self, iteration: int) -> bool:
+        threshold = self.agent.auto_compact_chars
+        if threshold == 0 or len(self.messages) <= 1:
+            return False
+        payload = {
+            "messages": self._model_messages(iteration),
+            "tools": self.agent.tools.schemas(),
+        }
+        return len(json.dumps(payload, ensure_ascii=False)) >= threshold
+
+    def _auto_compact(self, iteration: int) -> None:
+        self.agent.event_sink(
+            AgentEvent(
+                kind="compaction_start",
+                iteration=iteration,
+                content="上下文达到自动压缩边界，正在生成摘要。",
+                session_id=self.session_id,
+            )
+        )
+        try:
+            self.compact("这是自动压缩；保留当前任务、未完成步骤和继续执行所需细节。")
+        except (ModelError, ValueError) as error:
+            self.agent.event_sink(
+                AgentEvent(
+                    kind="compaction_end",
+                    iteration=iteration,
+                    content=f"自动上下文压缩失败：{error}",
+                    is_error=True,
+                    session_id=self.session_id,
+                )
+            )
+            raise
+        self.agent.event_sink(
+            AgentEvent(
+                kind="compaction_end",
+                iteration=iteration,
+                content="自动上下文压缩完成。",
+                session_id=self.session_id,
+            )
+        )
 
     def compact(self, instructions: str = "") -> str:
         """Create a manual summary checkpoint without deleting raw history."""

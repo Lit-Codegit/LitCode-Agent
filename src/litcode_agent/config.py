@@ -45,6 +45,7 @@ class Settings:
     api_key_source: str = "environment"
     configured: bool = True
     max_iterations: int = 60
+    auto_compact_chars: int = 200_000
     command_timeout_seconds: float = 30.0
     max_output_chars: int = 20_000
     max_reference_file_chars: int = 32_768
@@ -197,6 +198,7 @@ class Settings:
             agent_config,
             {
                 "maxIterations",
+                "autoCompactChars",
                 "maxOutputChars",
                 "maxReferenceFileChars",
                 "maxReferenceChars",
@@ -264,6 +266,13 @@ class Settings:
             agent_config.get("maxIterations"),
             "agent.maxIterations",
             60,
+        )
+        auto_compact_chars = _environment_or_non_negative_int(
+            environ,
+            "LITCODE_AUTO_COMPACT_CHARS",
+            agent_config.get("autoCompactChars"),
+            "agent.autoCompactChars",
+            200_000,
         )
         max_output_chars = _environment_or_positive_int(
             environ,
@@ -365,6 +374,7 @@ class Settings:
             api_key_source=api_key_source,
             configured=configured,
             max_iterations=max_iterations,
+            auto_compact_chars=auto_compact_chars,
             command_timeout_seconds=command_timeout,
             max_output_chars=max_output_chars,
             max_reference_file_chars=max_reference_file_chars,
@@ -394,6 +404,7 @@ class Settings:
             "api_key_source": self.api_key_source,
             "configured": self.configured,
             "max_iterations": self.max_iterations,
+            "auto_compact_chars": self.auto_compact_chars,
             "command_timeout_seconds": self.command_timeout_seconds,
             "max_output_chars": self.max_output_chars,
             "max_reference_file_chars": self.max_reference_file_chars,
@@ -630,6 +641,32 @@ def _environment_or_positive_int(
         parsed = configured
     if parsed <= 0:
         raise ConfigurationError(f"{name} must be positive")
+    return parsed
+
+
+def _environment_or_non_negative_int(
+    environ: Mapping[str, str],
+    environment_name: str,
+    configured: object,
+    configured_name: str,
+    default: int,
+) -> int:
+    if environment_name in environ:
+        value: object = environ[environment_name]
+        name = environment_name
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as error:
+            raise ConfigurationError(f"{name} must be an integer") from error
+    elif configured is None:
+        return default
+    else:
+        name = configured_name
+        if not isinstance(configured, int) or isinstance(configured, bool):
+            raise ConfigurationError(f"{name} must be an integer")
+        parsed = configured
+    if parsed < 0:
+        raise ConfigurationError(f"{name} must be non-negative")
     return parsed
 
 

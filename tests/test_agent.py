@@ -332,6 +332,56 @@ def test_session_compaction_keeps_raw_history_and_changes_model_view(
     assert model.requests[-1][-1]["content"] == "继续"
 
 
+def test_session_automatically_compacts_before_crossing_configured_boundary() -> None:
+    model = FakeModel([AssistantTurn("自动摘要"), AssistantTurn("继续回答")])
+    events: list[AgentEvent] = []
+    session = Agent(
+        model,
+        ToolRegistry([]),
+        3,
+        events.append,
+        auto_compact_chars=5_000,
+    ).start_session()
+    original = "旧上下文" * 2_000
+    session.messages.append({"role": "user", "content": original})
+
+    result = session.ask("继续")
+
+    assert result.output == "继续回答"
+    assert session.summary == ("自动摘要", 2)
+    assert session.messages[1]["content"] == original
+    assert len(model.requests) == 2
+    assert any(
+        "受信压缩摘要" in message.get("content", "")
+        for message in model.requests[1]
+    )
+    assert original not in repr(model.requests[1])
+    assert [event.kind for event in events] == [
+        "compaction_start",
+        "compaction_end",
+        "model_start",
+        "model_end",
+    ]
+
+
+def test_zero_auto_compact_boundary_disables_automatic_compaction() -> None:
+    model = FakeModel([AssistantTurn("直接回答")])
+    session = Agent(
+        model,
+        ToolRegistry([]),
+        3,
+        auto_compact_chars=0,
+    ).start_session()
+    original = "旧上下文" * 2_000
+    session.messages.append({"role": "user", "content": original})
+
+    result = session.ask("继续")
+
+    assert result.output == "直接回答"
+    assert session.summary is None
+    assert original in repr(model.requests[0])
+
+
 def test_rewind_can_restore_agent_edits_and_redo_them(tmp_path) -> None:
     model = FakeModel(
         [

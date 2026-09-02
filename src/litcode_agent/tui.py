@@ -2241,6 +2241,10 @@ class LitCodeTUI(App[None]):
         activity = None
         if event.kind == "model_start":
             activity = f"第 {event.iteration} 轮 · 请求模型"
+        elif event.kind == "compaction_start":
+            activity = "正在自动压缩上下文"
+        elif event.kind == "compaction_end":
+            activity = "自动上下文压缩完成"
         elif event.kind == "tool_start" and event.tool_call is not None:
             activity = f"正在调用工具 · {event.tool_call.name}"
         elif event.kind == "tool_result" and event.tool_call is not None:
@@ -2327,6 +2331,17 @@ class LitCodeTUI(App[None]):
         self._set_pane_busy(runtime, False, "就绪" if status == "completed" else "错误")
 
     def _render_agent_event(self, event: AgentEvent, runtime: PaneRuntime) -> None:
+        if event.kind == "compaction_start":
+            self._append_notice(event.content or "正在自动压缩上下文…", runtime=runtime)
+            self._update_pane_status(runtime, "自动压缩上下文")
+            return
+        if event.kind == "compaction_end":
+            self._append_notice(
+                event.content or "自动上下文压缩完成。",
+                error=event.is_error,
+                runtime=runtime,
+            )
+            return
         if event.kind == "model_start":
             self._start_streaming_message(runtime)
             self._update_pane_status(runtime, f"第 {event.iteration} 轮 · 请求模型")

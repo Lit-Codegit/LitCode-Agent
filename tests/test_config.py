@@ -15,6 +15,7 @@ def test_loads_and_normalizes_settings(tmp_path: Path) -> None:
             "OPENAI_BASE_URL": "https://gateway.example/v1",
             "LITCODE_MODEL": "example-model",
             "LITCODE_MAX_ITERATIONS": "7",
+            "LITCODE_AUTO_COMPACT_CHARS": "9000",
             "LITCODE_COMMAND_TIMEOUT_SECONDS": "2.5",
             "LITCODE_MAX_OUTPUT_CHARS": "1234",
             "LITCODE_MAX_REFERENCE_FILE_CHARS": "2048",
@@ -31,6 +32,7 @@ def test_loads_and_normalizes_settings(tmp_path: Path) -> None:
     assert settings.api_key == "secret"
     assert settings.model == "example-model"
     assert settings.max_iterations == 7
+    assert settings.auto_compact_chars == 9000
     assert settings.command_timeout_seconds == 2.5
     assert settings.max_output_chars == 1234
     assert settings.max_reference_file_chars == 2048
@@ -50,6 +52,7 @@ def test_uses_safe_defaults(tmp_path: Path) -> None:
     )
 
     assert settings.max_iterations == 60
+    assert settings.auto_compact_chars == 200_000
     assert settings.command_timeout_seconds == 30.0
     assert settings.max_output_chars == 20_000
     assert settings.max_reference_file_chars == 32_768
@@ -75,6 +78,7 @@ def test_requires_model_credentials(tmp_path: Path, missing: str) -> None:
     ("name", "value"),
     [
         ("LITCODE_MAX_ITERATIONS", "0"),
+        ("LITCODE_AUTO_COMPACT_CHARS", "-1"),
         ("LITCODE_COMMAND_TIMEOUT_SECONDS", "later"),
         ("LITCODE_MAX_OUTPUT_CHARS", "-1"),
         ("LITCODE_MAX_REFERENCE_FILE_CHARS", "0"),
@@ -163,7 +167,11 @@ def test_loads_project_and_local_json_with_environment_precedence(
                         "apiKeyEnv": "CUSTOM_API_KEY",
                     }
                 },
-                "agent": {"maxIterations": 5, "maxOutputChars": 1234},
+                "agent": {
+                    "maxIterations": 5,
+                    "autoCompactChars": 8000,
+                    "maxOutputChars": 1234,
+                },
             }
         )
     )
@@ -183,6 +191,7 @@ def test_loads_project_and_local_json_with_environment_precedence(
     assert settings.model_profile == "primary"
     assert settings.base_url == "https://project.example/v1"
     assert settings.max_iterations == 7
+    assert settings.auto_compact_chars == 8000
     assert settings.max_output_chars == 1234
     assert settings.api_key_env == "CUSTOM_API_KEY"
     assert settings.config_files == (
