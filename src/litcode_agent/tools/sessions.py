@@ -175,22 +175,30 @@ class SendSessionMessageTool:
         _check_workspace(self.workspace, context)
         alias = _string(arguments, "session")
         instruction = _string(arguments, "instruction")
-        description = f"向会话 {alias} 投递指示：\n{instruction}"
-        if self.policy == "deny":
-            raise ToolError("session messaging is denied by policy")
-        if self.policy == "confirm":
-            if self.confirm is None:
-                approved = False
-            elif context.runtime is not None:
-                approved = context.runtime.request_confirmation(
-                    lambda: self.confirm(description)
-                )
-            else:
-                approved = self.confirm(description)
-            if not approved:
-                raise ToolError("session message was not approved")
         try:
             target_id = self.store.session_id_for_reference(self.workspace, alias)
+            target_info = self.store.session_info(target_id)
+        except KeyError as error:
+            raise ToolError(f"找不到会话（当前工作区）：{alias}") from error
+        # A parent session owns the subagents it spawned: instruction delivery
+        # to them is an extension of its own task and needs no confirmation.
+        # Unrelated sessions keep the configured policy below.
+        if target_info.parent_id is None or target_info.parent_id != context.session_id:
+            description = f"向会话 {alias} 投递指示：\n{instruction}"
+            if self.policy == "deny":
+                raise ToolError("session messaging is denied by policy")
+            if self.policy == "confirm":
+                if self.confirm is None:
+                    approved = False
+                elif context.runtime is not None:
+                    approved = context.runtime.request_confirmation(
+                        lambda: self.confirm(description)
+                    )
+                else:
+                    approved = self.confirm(description)
+                if not approved:
+                    raise ToolError("session message was not approved")
+        try:
             if self.runtime is not None:
                 message = self.runtime.send_message(
                     context.session_id, target_id, instruction

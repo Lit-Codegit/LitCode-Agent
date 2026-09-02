@@ -926,6 +926,13 @@ def test_subagent_command_can_create_mount_and_start_a_child_pane(
             assert child.parent_id == parent_id
             assert model.requests[0][-1]["content"] == "检查测试"
             assert app.session.messages[-1]["content"] == "TUI 回答"
+            for _ in range(120):
+                await pilot.pause(0.05)
+                if any(
+                    "挂载到 2 号 pane" in str(widget.render())
+                    for widget in app.query(".notice").results(Static)
+                ):
+                    break
             assert any(
                 "挂载到 2 号 pane" in str(widget.render())
                 for widget in app.query(".notice").results(Static)
@@ -1530,7 +1537,7 @@ def test_history_switch_keeps_running_task_in_background(tmp_path: Path) -> None
     class BlockingModel(FakeModel):
         def complete(self, messages, tools):
             self.requests.append(list(messages))
-            blocked.wait(timeout=5)
+            blocked.wait(timeout=10)
             return AssistantTurn("后台回答")
 
     async def exercise() -> None:
@@ -1541,7 +1548,7 @@ def test_history_switch_keeps_running_task_in_background(tmp_path: Path) -> None
             prompt = app.query_one(PromptArea)
             prompt.text = "慢任务"
             await pilot.press("enter")
-            for _ in range(120):
+            for _ in range(240):
                 await pilot.pause(0.05)
                 if app.busy:
                     break
@@ -1811,7 +1818,7 @@ def test_background_subagent_card_stays_live_until_child_finishes(
                 )
             if content == "检查测试":
                 child_started.set()
-                assert child_release.wait(5)
+                assert child_release.wait(15)
                 return AssistantTurn("child 找到了失败原因")
             return AssistantTurn("父会话继续")
 

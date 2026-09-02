@@ -253,7 +253,7 @@ def test_default_registry_serializes_workspace_mutations(
         assert release_command.wait(5)
         return subprocess.CompletedProcess(args="noop", returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("litcode_agent.process_runner.subprocess.run", blocking_run)
+    monkeypatch.setattr("litcode_agent.tools.command.run_shell", blocking_run)
     command_thread = threading.Thread(
         target=lambda: registry.execute_json(
             "run_command", json.dumps({"command": "noop"})
@@ -333,6 +333,59 @@ def test_session_tools_use_runtime_source_identity_and_confirmation(
     assert not result.is_error
     assert confirmations and target_alias in confirmations[0]
     assert store.inbox(target)[0].source_session_id == source
+
+
+def test_send_to_own_subagent_skips_confirmation(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    parent = store.create(tmp_path, "model", [])
+    child = store.create_child(parent)
+    child_alias = store.session_info(child).alias
+    confirmations: list[str] = []
+    settings = Settings.from_env(
+        tmp_path,
+        {"OPENAI_API_KEY": "secret", "LITCODE_MODEL": "model"},
+    )
+    registry = build_default_registry(
+        settings,
+        store=store,
+        confirm_session_message=lambda description: not confirmations.append(description),
+    )
+
+    result = registry.execute_json(
+        "send_session_message",
+        json.dumps({"session": child_alias, "instruction": "补充验收清单"}),
+        ToolExecutionContext(parent, tmp_path.resolve()),
+    )
+
+    assert not result.is_error
+    assert confirmations == []
+    assert store.inbox(child)[0].source_session_id == parent
+
+
+def test_send_to_unrelated_session_still_confirms(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    parent = store.create(tmp_path, "model", [])
+    stranger = store.create(tmp_path, "model", [])
+    stranger_alias = store.session_info(stranger).alias
+    confirmations: list[str] = []
+    settings = Settings.from_env(
+        tmp_path,
+        {"OPENAI_API_KEY": "secret", "LITCODE_MODEL": "model"},
+    )
+    registry = build_default_registry(
+        settings,
+        store=store,
+        confirm_session_message=lambda description: not confirmations.append(description),
+    )
+
+    result = registry.execute_json(
+        "send_session_message",
+        json.dumps({"session": stranger_alias, "instruction": "你好"}),
+        ToolExecutionContext(parent, tmp_path.resolve()),
+    )
+
+    assert not result.is_error
+    assert confirmations
 
 
 def test_list_sessions_exposes_same_terminal_pane_locations(tmp_path: Path) -> None:

@@ -17,7 +17,12 @@ from litcode_agent.hooks import HookRunner
 from litcode_agent.model import OpenAIChatModel
 from litcode_agent.pane_layout import PaneLayout
 from litcode_agent.scheduler import local_timezone_name
-from litcode_agent.session_store import Checkpoint, InboxMessage, SessionStore
+from litcode_agent.session_store import (
+    Checkpoint,
+    InboxMessage,
+    SessionCatalogEntry,
+    SessionStore,
+)
 from litcode_agent.session_runtime import SessionRuntime
 from litcode_agent.tools.registry import ToolRegistry
 
@@ -326,13 +331,9 @@ class SessionWorkspace:
 
     def _runtime_location(self, pane_id: str) -> str:
         pane = self.panes[pane_id]
-        time_context = (
-            f"当前本地时间：{datetime.now().astimezone().isoformat(timespec='seconds')}\n"
-            f"默认 IANA 时区：{local_timezone_name()}"
-        )
         if pane.session is None:
             return (
-                f"{time_context}\n"
+                f"{self._time_context()}\n"
                 f"当前终端：{self.terminal_id}\n"
                 f"当前 pane：{pane.pane_slot}\n"
                 "当前 pane 为空；首次输入后创建会话。"
@@ -347,14 +348,56 @@ class SessionWorkspace:
             mounted.append(f"{candidate.pane_slot}={info.alias} · {info.title}")
         return "\n".join(
             (
-                time_context,
+                self._time_context(),
                 f"当前终端：{self.terminal_id}",
                 f"当前 pane：{pane.pane_slot}",
                 f"当前会话：{current.alias}",
                 "同终端 pane：" + "；".join(mounted),
+                *(
+                    (sibling,)
+                    if (sibling := self.sibling_sessions_section(
+                        pane.session.session_id
+                    ))
+                    else ()
+                ),
                 "pane 编号只在本次 TUI 运行中有效。",
             )
         )
+
+    def _runtime_location_actor(self, session_id: str) -> str:
+        """Runtime location for a background/child actor without a Pane."""
+
+        info = self.store.session_info(session_id)
+        return "\n".join(
+            (
+                self._time_context(),
+                f"当前终端：{self.terminal_id}",
+                "当前 pane：无（后台子会话）",
+                f"当前会话：{info.alias}",
+                *(
+                    (sibling,)
+                    if (sibling := self.sibling_sessions_section(session_id))
+                    else ()
+                ),
+            )
+        )
+
+    def _time_context(self) -> str:
+        return (
+            f"当前本地时间：{datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+            f"默认 IANA 时区：{local_timezone_name()}"
+        )
+
+    def sibling_sessions_section(self, current_id: str) -> str:
+        """Bounded snapshot of other workspace sessions, for model context."""
+
+        entries = self.store.session_catalog(
+            self.settings.workspace,
+            current_terminal_id=self.terminal_id,
+            mounted=self.mounted_sessions(),
+            limit=10,
+        )
+        return format_sibling_sessions(entries, current_id)
 
     def session_factory(self, session_id: str, profile: str) -> AgentSession:
         """Build an AgentSession for a background/child actor without a Pane."""
@@ -376,7 +419,7 @@ class SessionWorkspace:
             store=self.store,
             model_name=info.model,
             workspace=self.settings.workspace,
-            runtime_context=None,
+            runtime_context=lambda: self._runtime_location_actor(session_id),
             tool_context=lambda current_id: self._tool_context(None, current_id),
             origin_terminal_id=self.terminal_id,
             origin_pane_slot=None,
@@ -399,3 +442,42 @@ def _model_from_agent(agent: Agent, fallback: OpenAIChatModel) -> OpenAIChatMode
 def _terminal_id() -> str:
     alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
     return "T-" + "".join(secrets.choice(alphabet) for _ in range(3))
+
+
+SIBLING_GUIDE = """协作工具（只读有界）：list_sessions 刷新本快照并设置查询；read_session_context 按查询读取对方会话的匹配片段；send_session_message 向对方 inbox 投递指令（不唤醒、不打断对方运行）；read_session_inbox 读取自己收到的投递。
+与这些会话协作时优先只读；不要重复对方正在做的工作；若任务需要对方同步，向对方投递明确分工，不确定就先查询再决定。"""
+
+
+def format_sibling_sessions(
+    entries: tuple[SessionCatalogEntry, ...], current_id: str
+) -> str:
+    """Render a bounded liveness snapshot of sibling sessions.
+
+    Only metadata leaves the session store; messages stay private until the
+    model deliberately queries a peer (read_session_context)."""
+
+    visible = [entry for entry in entries if entry.info.id != current_id]
+    if not visible:
+        return ""
+    lines = [
+        "<litcode_sibling_sessions>",
+        "同工作区其他会话快照（有界元数据；下面的位置号只在本次 TUI 运行中有效）：",
+    ]
+    for entry in visible:
+        info = entry.info
+        if entry.scope == "mounted":
+            where = f"pane {entry.pane_slot}"
+        elif entry.scope == "current_terminal":
+            where = "同终端后台"
+        else:
+            where = "后台"
+        status = (info.status or "idle").strip()
+        activity = (info.activity or "").strip()
+        queue = f" · 队列 {info.queue_size}" if info.queue_size else ""
+        line = f"- {info.alias} · {where} · {status or 'idle'}"
+        if activity:
+            line += f" · {activity}"
+        lines.append(line + queue)
+    lines.append(SIBLING_GUIDE)
+    lines.append("</litcode_sibling_sessions>")
+    return "\n".join(lines)

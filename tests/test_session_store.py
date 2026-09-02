@@ -46,8 +46,8 @@ def test_sessions_receive_stable_human_readable_aliases(tmp_path: Path) -> None:
 def test_existing_database_is_backfilled_with_aliases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("TZ", "Asia/Shanghai")
     import sqlite3
+    from datetime import datetime
 
     path = tmp_path / "sessions.db"
     connection = sqlite3.connect(path)
@@ -68,7 +68,8 @@ def test_existing_database_is_backfilled_with_aliases(
     store = SessionStore(path)
 
     info = store.session_info("legacy-id")
-    assert info.alias == "700101-0800-" + info.alias[-3:]
+    expected_prefix = datetime.fromtimestamp(0.0).strftime("%y%m%d-%H%M")
+    assert info.alias == expected_prefix + "-" + info.alias[-3:]
     assert len(info.alias) == 15
     assert info.origin_terminal_id is None
     assert info.origin_pane_slot is None

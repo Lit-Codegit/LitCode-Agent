@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -48,14 +49,19 @@ def test_hook_receives_json_and_respects_matcher(tmp_path: Path) -> None:
 
 
 def test_pre_tool_exit_two_blocks_with_stderr(tmp_path: Path) -> None:
+    script = tmp_path / "hook-block.py"
+    script.write_text(
+        "import sys\n"
+        "print('禁止执行', file=sys.stderr)\n"
+        "sys.exit(2)\n",
+        encoding="utf-8",
+    )
     settings = HookSettings(
         pre_tool_use=(
             HookGroup(
                 matcher="run_command",
                 hooks=(
-                    HookCommand(
-                        "python -c \"import sys; print('禁止执行', file=sys.stderr); raise SystemExit(2)\""
-                    ),
+                    HookCommand(f"{sys.executable} {script}"),
                 ),
             ),
         )
@@ -103,11 +109,13 @@ class TouchTool:
 def test_agent_returns_pre_tool_block_to_model_without_running_tool(
     tmp_path: Path,
 ) -> None:
+    script = tmp_path / "hook-block.py"
+    script.write_text("import sys\nsys.exit(2)\n", encoding="utf-8")
     hooks = HookSettings(
         pre_tool_use=(
             HookGroup(
                 matcher="touch",
-                hooks=(HookCommand('python -c "raise SystemExit(2)"'),),
+                hooks=(HookCommand(f"{sys.executable} {script}"),),
             ),
         )
     )
