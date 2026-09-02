@@ -43,6 +43,25 @@ def test_sessions_receive_stable_human_readable_aliases(tmp_path: Path) -> None:
     assert reopened.session_info(first).alias == aliases[first]
 
 
+def test_delete_if_pristine_only_removes_a_session_without_activity(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    pristine = store.create(
+        tmp_path, "model", [{"role": "system", "content": "system"}]
+    )
+    used = store.create(
+        tmp_path, "model", [{"role": "system", "content": "system"}]
+    )
+    store.enqueue_message(used, "第一条投递", workspace=tmp_path)
+
+    assert store.delete_if_pristine(pristine)
+    with pytest.raises(KeyError):
+        store.session_info(pristine)
+    assert not store.delete_if_pristine(used)
+    assert store.session_info(used).id == used
+
+
 def test_existing_database_is_backfilled_with_aliases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -98,7 +98,9 @@ class _Actor:
 
 
 SessionFactory = Callable[[str, str], AgentSession]
-EventSink = Callable[[str, str, SessionTurn | None], None]
+EventSink = Callable[
+    [str, str, SessionTurn | None, QueuedMessage | None], None
+]
 
 
 class SessionRuntime:
@@ -130,7 +132,9 @@ class SessionRuntime:
         self.max_depth = max_depth
         self.invocation_budget = invocation_budget
         self.max_slots = max_slots
-        self.event_sink = event_sink or (lambda kind, session_id, turn: None)
+        self.event_sink = event_sink or (
+            lambda kind, session_id, turn, message: None
+        )
 
         self._actors: dict[str, _Actor] = {}
         self._actors_lock = threading.RLock()
@@ -165,6 +169,19 @@ class SessionRuntime:
             actor = self._actors.setdefault(session_id, _Actor(session_id))
             actor.session = session
         self._wake(session_id)
+
+    def unregister(self, session_id: str, timeout: float = 1.0) -> None:
+        """Forget an idle actor after its pristine Session was deleted."""
+
+        with self._actors_lock:
+            actor = self._actors.pop(session_id, None)
+        if actor is None:
+            return
+        actor.stop = True
+        with actor.condition:
+            actor.condition.notify_all()
+        if actor.thread is not None:
+            actor.thread.join(timeout=max(0.0, timeout))
 
     def submit(
         self,
@@ -256,7 +273,7 @@ class SessionRuntime:
     def pause(self, session_id: str) -> SessionInfo:
         self._ensure_workspace_session(session_id)
         info = self.store.set_paused(session_id, True)
-        self.event_sink("paused", session_id, None)
+        self.event_sink("paused", session_id, None, None)
         return info
 
     def resume(self, session_id: str) -> SessionInfo:
@@ -264,7 +281,7 @@ class SessionRuntime:
         info = self.store.set_paused(session_id, False)
         self._ensure_actor(session_id)
         self._wake(session_id)
-        self.event_sink("resumed", session_id, None)
+        self.event_sink("resumed", session_id, None, None)
         return info
 
     def session_for(self, session_id: str) -> AgentSession | None:
@@ -663,9 +680,23 @@ class SessionRuntime:
                 activity="正在执行",
                 active_turn_id=turn.id,
             )
-            self.event_sink("turn_started", actor.session_id, self.store.turn(turn.id))
+            self.event_sink(
+                "turn_started",
+                actor.session_id,
+                self.store.turn(turn.id),
+                message,
+            )
             session = self._agent_session(actor.session_id, actor)
-            result = session.ask(message.content, cancel_event.is_set)
+            if isinstance(session, AgentSession):
+                result = session.ask(
+                    message.content,
+                    cancel_event.is_set,
+                    source_session_id=message.source_session_id,
+                )
+            else:
+                # Small protocol-compatible test doubles do not carry local
+                # display metadata; production factories return AgentSession.
+                result = session.ask(message.content, cancel_event.is_set)
             self._finish_result(actor, message, turn, result)
         except Exception as error:
             self._finish_error(actor, message, turn, error)
@@ -707,7 +738,9 @@ class SessionRuntime:
             result=result.output,
         )
         self._end_actor_state(actor.session_id, terminal_status, result.reason)
-        self.event_sink("turn_finished", actor.session_id, self.store.turn(turn.id))
+        self.event_sink(
+            "turn_finished", actor.session_id, self.store.turn(turn.id), None
+        )
         self._complete_invocation_for_turn(turn, result.output, result.succeeded)
         if result.reason != "completed":
             self._cancel_children(turn.id)
@@ -729,7 +762,9 @@ class SessionRuntime:
         self._end_actor_state(actor.session_id, "failed", str(error))
         self._cancel_children(turn.id)
         self._complete_invocation_for_turn(turn, str(error), False)
-        self.event_sink("turn_failed", actor.session_id, self.store.turn(turn.id))
+        self.event_sink(
+            "turn_failed", actor.session_id, self.store.turn(turn.id), None
+        )
 
     def _finish_cancelled(
         self,

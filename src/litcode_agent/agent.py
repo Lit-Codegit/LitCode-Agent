@@ -214,6 +214,8 @@ class AgentSession:
         self,
         task: str,
         should_cancel: Callable[[], bool] | None = None,
+        *,
+        source_session_id: str | None = None,
     ) -> AgentResult:
         if self.closed:
             raise RuntimeError("session is closed")
@@ -245,7 +247,10 @@ class AgentSession:
                 iteration=0,
                 match_value="startup",
             )
-        self._append_message({"role": "user", "content": task})
+        user_message: Message = {"role": "user", "content": task}
+        if source_session_id is not None:
+            user_message["_litcode_source_session_id"] = source_session_id
+        self._append_message(user_message)
         cancelled = should_cancel or (lambda: False)
 
         for iteration in range(1, self.agent.max_iterations + 1):
@@ -584,16 +589,19 @@ class AgentSession:
         self, iteration: int | None = None, *, sealed: bool = False
     ) -> list[Message]:
         if self.summary is None:
-            messages = list(self.messages)
+            messages = [_model_message(message) for message in self.messages]
         else:
             summary, boundary = self.summary
             messages = [
-                self.messages[0],
+                _model_message(self.messages[0]),
                 {
                     "role": "user",
                     "content": "以下是此前会话的受信压缩摘要：\n\n" + summary,
                 },
-                *self.messages[boundary + 1 :],
+                *(
+                    _model_message(message)
+                    for message in self.messages[boundary + 1 :]
+                ),
             ]
         budget = self._budget_note(iteration, sealed=sealed) if iteration else None
         if self.agent.runtime_context is None:
@@ -764,3 +772,13 @@ def _hook_tool_input(raw_arguments: str) -> object:
         return json.loads(raw_arguments)
     except json.JSONDecodeError:
         return {"raw_arguments": raw_arguments}
+
+
+def _model_message(message: Message) -> Message:
+    """Remove local display metadata before calling an API provider."""
+
+    return {
+        key: value
+        for key, value in message.items()
+        if not key.startswith("_litcode_")
+    }

@@ -71,7 +71,13 @@ from litcode_agent.references import (
 )
 from litcode_agent.scheduler import Scheduler, describe_task, local_timezone_name
 from litcode_agent.prompt import PromptBuilder
-from litcode_agent.session_store import Checkpoint, SessionInfo, SessionStore, SessionTurn
+from litcode_agent.session_store import (
+    Checkpoint,
+    QueuedMessage,
+    SessionInfo,
+    SessionStore,
+    SessionTurn,
+)
 from litcode_agent.session_runtime import SessionRuntime, SessionRuntimeError
 from litcode_agent.session_workspace import PaneSession, SessionWorkspace
 from litcode_agent.skill_manager import ManagedSkill, SkillManagementError, SkillManager
@@ -186,7 +192,7 @@ class PaneRuntime:
     pane_slot: int
     agent: Agent
     model: OpenAIChatModel
-    session: AgentSession | None
+    session: AgentSession
     busy: bool = False
     cancel_requested: threading.Event = field(default_factory=threading.Event)
     tool_bodies: dict[str, PagedOutput] = field(default_factory=dict)
@@ -199,11 +205,6 @@ class PaneRuntime:
     prompt_history_index: int | None = None
     prompt_draft: str = ""
     pending_user_bundles: list[str] = field(default_factory=list)
-
-    @property
-    def empty(self) -> bool:
-        return self.session is None
-
 
 class PromptArea(TextArea):
     """Enter 发送、组合键换行，并支持 shell 风格历史。"""
@@ -351,12 +352,31 @@ class PaneDivider(Static):
         self.axis = axis
         self._dragging = False
         self._last_coordinate = 0
+        self._drag_delta = 0.0
+        self._initial_ratio = 0.5
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
         self._dragging = True
+        self._drag_delta = 0.0
         self._last_coordinate = (
             event.screen_x if self.axis == "horizontal" else event.screen_y
         )
+        siblings = tuple(self.parent.children)
+        if len(siblings) == 3:
+            first, _, second = siblings
+            first_size = (
+                first.region.width
+                if self.axis == "horizontal"
+                else first.region.height
+            )
+            second_size = (
+                second.region.width
+                if self.axis == "horizontal"
+                else second.region.height
+            )
+            available = first_size + second_size
+            if available > 0:
+                self._initial_ratio = first_size / available
         self.capture_mouse()
         event.stop()
 
@@ -373,19 +393,40 @@ class PaneDivider(Static):
                 parent_size.width if self.axis == "horizontal" else parent_size.height
             )
             if denominator > 0:
-                self.app.resize_pane(
-                    self.target_pane_id,
-                    self.axis,
-                    delta_pixels / denominator,
-                )
+                delta = delta_pixels / denominator
+                self._drag_delta += delta
+                self._preview_ratio(self._initial_ratio + self._drag_delta)
             self._last_coordinate = coordinate
         event.stop()
 
     def on_mouse_up(self, event: events.MouseUp) -> None:
         if self._dragging:
             self._dragging = False
+            delta = max(-0.8, min(0.8, self._drag_delta))
             self.release_mouse()
+            if delta and isinstance(self.app, LitCodeTUI):
+                self.app.resize_pane(
+                    self.target_pane_id,
+                    self.axis,
+                    delta,
+                    rebuild=False,
+                )
         event.stop()
+
+    def _preview_ratio(self, ratio: float) -> None:
+        """Resize the mounted siblings without replacing the captured divider."""
+
+        siblings = tuple(self.parent.children)
+        if len(siblings) != 3:
+            return
+        first, _, second = siblings
+        ratio = max(0.1, min(0.9, ratio))
+        if self.axis == "horizontal":
+            first.styles.width = f"{ratio}fr"
+            second.styles.width = f"{1.0 - ratio}fr"
+        else:
+            first.styles.height = f"{ratio}fr"
+            second.styles.height = f"{1.0 - ratio}fr"
 
 
 class ModelPicker(ModalScreen[str | None]):
@@ -1438,13 +1479,19 @@ class LitCodeTUI(App[None]):
         padding: 1 1;
         scrollbar-size: 1 1;
     }
-    .message-user, .notice, Collapsible {
+    .message-user, .message-delivery, .notice, Collapsible {
         margin: 0 0 1 0;
     }
     .message-user {
         padding: 1 2;
         background: $panel;
         border-left: thick $primary;
+    }
+    .message-delivery {
+        padding: 1 2;
+        color: $text;
+        background: $success 12%;
+        border-left: thick $success;
     }
     .message-assistant {
         margin: 0 0 1 0;
@@ -1844,21 +1891,16 @@ class LitCodeTUI(App[None]):
         runtime = PaneRuntime(
             pane.pane_id, pane.pane_slot, pane.agent, pane.model, pane.session
         )
-        if pane.session is not None:
-            runtime.prompt_history = _message_prompt_history(pane.session.messages)
+        runtime.prompt_history = _message_prompt_history(pane.session.messages)
         return runtime
 
     def _sync_runtime(self, pane: PaneSession) -> PaneRuntime:
         runtime = self.panes[pane.pane_id]
-        session_changed = (
-            runtime.session is None
-            or pane.session is None
-            or runtime.session.session_id != pane.session.session_id
-        )
+        session_changed = runtime.session.session_id != pane.session.session_id
         runtime.agent = pane.agent
         runtime.model = pane.model
         runtime.session = pane.session
-        if session_changed and pane.session is not None:
+        if session_changed:
             runtime.prompt_history = _message_prompt_history(pane.session.messages)
             runtime.prompt_history_index = None
             runtime.prompt_draft = ""
@@ -1871,29 +1913,19 @@ class LitCodeTUI(App[None]):
 
     @property
     def session(self) -> AgentSession:
-        """Return the active session, materializing an empty pane on demand.
+        """Return the Session mounted by the active Pane."""
 
-        UI actions call ``_ensure_active_session`` explicitly.  This property
-        keeps the small public test/application surface convenient for callers
-        that intentionally ask for the active conversation.
-        """
-
-        runtime = self._ensure_active_session()
-        assert runtime.session is not None
-        return runtime.session
+        return self._active_runtime().session
 
     @property
     def busy(self) -> bool:
         return self._active_runtime().busy
 
     def _pane_widget(self, runtime: PaneRuntime) -> Vertical:
-        if runtime.session is None:
-            header_text = f"{runtime.pane_slot}  空窗格 · 输入消息开始"
-        else:
-            info = self.store.session_info(runtime.session.session_id)
-            unread = len(self.store.inbox(runtime.session.session_id))
-            unread_label = f" · 未读 {unread}" if unread else ""
-            header_text = f"{runtime.pane_slot}  {_session_label(info)}{unread_label}"
+        info = self.store.session_info(runtime.session.session_id)
+        unread = len(self.store.inbox(runtime.session.session_id))
+        unread_label = f" · 未读 {unread}" if unread else ""
+        header_text = f"{runtime.pane_slot}  {_session_label(info)}{unread_label}"
         timeline_id = (
             "timeline"
             if runtime.pane_id == "pane-1"
@@ -1930,13 +1962,21 @@ class LitCodeTUI(App[None]):
         second.styles.height = f"{1.0 - node.ratio}fr"
         return Vertical(first, divider, second, classes="split-vertical")
 
-    def resize_pane(self, pane_id: str, axis: str, delta: float) -> None:
-        """Apply a bounded divider drag and rebuild only the pane view."""
+    def resize_pane(
+        self,
+        pane_id: str,
+        axis: str,
+        delta: float,
+        *,
+        rebuild: bool = True,
+    ) -> None:
+        """Apply a bounded divider drag, optionally rebuilding the pane view."""
 
         if axis not in {"horizontal", "vertical"}:
             raise ValueError(f"unknown pane axis: {axis}")
         self.pane_layout.resize(pane_id, delta)
-        self._rebuild_panes()
+        if rebuild:
+            self._rebuild_panes()
 
     def _rebuild_panes(self) -> None:
         snapshots: dict[str, tuple[tuple[Widget, ...], float]] = {}
@@ -2008,7 +2048,19 @@ class LitCodeTUI(App[None]):
             widgets, scroll_y = snapshot
             timeline = self._timeline(runtime)
             if widgets:
-                timeline.mount(*widgets)
+                restored_widgets: list[Widget] = []
+                for widget in widgets:
+                    if isinstance(widget, Markdown):
+                        replacement = Markdown(
+                            widget.source,
+                            classes=" ".join(widget.classes),
+                        )
+                        if runtime.streaming_markdown is widget:
+                            runtime.streaming_markdown = replacement
+                        restored_widgets.append(replacement)
+                    else:
+                        restored_widgets.append(widget)
+                timeline.mount(*restored_widgets)
                 # 只有原本有内容才恢复滚动位置：新 pane 的恢复可能与用户
                 # 滚动交错，空快照不应把用户位置重置回 0。
                 timeline.scroll_to(y=scroll_y, animate=False)
@@ -2157,7 +2209,6 @@ class LitCodeTUI(App[None]):
         # User messages use the same durable mailbox as Agent messages.  The
         # pane remains a view; a background/child Session can consume its own
         # queue even when no pane is mounted.
-        assert runtime.session is not None
         already_running = runtime.busy
         if already_running:
             runtime.pending_user_bundles.append(bundle.display_text)
@@ -2193,24 +2244,15 @@ class LitCodeTUI(App[None]):
             (
                 runtime
                 for runtime in self.panes.values()
-                if runtime.session is not None
-                and runtime.session.session_id == session_id
+                if runtime.session.session_id == session_id
             ),
             None,
         )
 
     def _ensure_active_session(self) -> PaneRuntime:
-        """Materialize a root Session only when an Empty Pane receives input."""
+        """Return the active Pane runtime under the mounted-Session invariant."""
 
         runtime = self._active_runtime()
-        if runtime.session is not None:
-            return runtime
-        prompt_history = list(runtime.prompt_history)
-        self.sessions.materialize(runtime.pane_id)
-        self._sync_runtime(self.sessions.active)
-        runtime.prompt_history = prompt_history
-        self._reset_pane_view()
-        self._update_pane_header(runtime, "就绪")
         return runtime
 
     def receive_agent_event(self, event: AgentEvent) -> None:
@@ -2221,8 +2263,7 @@ class LitCodeTUI(App[None]):
             (
                 item
                 for item in self.panes.values()
-                if item.session is not None
-                and item.session.session_id == event.session_id
+                if item.session.session_id == event.session_id
             ),
             None,
         )
@@ -2257,7 +2298,11 @@ class LitCodeTUI(App[None]):
             return
 
     def _runtime_event(
-        self, kind: str, session_id: str, turn: SessionTurn | None
+        self,
+        kind: str,
+        session_id: str,
+        turn: SessionTurn | None,
+        message: QueuedMessage | None,
     ) -> None:
         """Project background actor lifecycle into the mounted pane when present."""
 
@@ -2281,13 +2326,13 @@ class LitCodeTUI(App[None]):
         }.get(kind, kind)
         if threading.get_ident() == self.ui_thread_id:
             if kind == "turn_started":
-                self._runtime_turn_started(runtime)
+                self._runtime_turn_started(runtime, message)
             else:
                 self._append_notice(text, runtime=runtime)
                 self._update_pane_header(runtime, "就绪")
             return
         if kind == "turn_started":
-            self.call_from_thread(self._runtime_turn_started, runtime)
+            self.call_from_thread(self._runtime_turn_started, runtime, message)
             return
         self.call_from_thread(self._append_notice, text, runtime=runtime)
         self.call_from_thread(
@@ -2296,10 +2341,15 @@ class LitCodeTUI(App[None]):
             "运行中" if kind == "turn_started" else "就绪",
         )
 
-    def _runtime_turn_started(self, runtime: PaneRuntime) -> None:
-        assert runtime.session is not None
+    def _runtime_turn_started(
+        self, runtime: PaneRuntime, message: QueuedMessage | None
+    ) -> None:
         self.running_sessions.add(runtime.session.session_id)
-        if runtime.pending_user_bundles:
+        if message is not None and message.source_session_id is not None:
+            self._append_delivery(
+                message.content, message.source_session_id, runtime
+            )
+        elif runtime.pending_user_bundles:
             content = runtime.pending_user_bundles.pop(0)
             self._mount_timeline(
                 Static(Text(content), classes="message-user"), runtime
@@ -2522,7 +2572,7 @@ class LitCodeTUI(App[None]):
         self.runtime.system_prompt = system_prompt
         for runtime in self.panes.values():
             runtime.agent.system_prompt = system_prompt
-            if runtime.session is not None and runtime.session.messages:
+            if runtime.session.messages:
                 first = runtime.session.messages[0]
                 if first.get("role") == "system":
                     runtime.session.messages[0] = {
@@ -2639,7 +2689,7 @@ class LitCodeTUI(App[None]):
         if pane_id not in self.panes or self.active_pane_id != pane_id:
             return
         mounted = set(self.sessions.mounted_sessions())
-        choices = [(PANE_NEW_SESSION, "＋ 新会话（/new，首次输入时创建）")]
+        choices = [(PANE_NEW_SESSION, "＋ 新会话（已创建，可接收 Agent 投递）")]
         choices.extend(
             (info.id, _session_label(info))
             for _, info in self.store.session_tree(self.settings.workspace)
@@ -2669,7 +2719,7 @@ class LitCodeTUI(App[None]):
             if not tuple(self._timeline(runtime).children):
                 self._mount_welcome(runtime)
             self.query_one(PromptArea).focus()
-            self._update_status("新会话 · 首次输入后创建")
+            self._update_status("新会话已就绪")
             return
         if choice is not None:
             self._session_selected(choice)
@@ -2786,9 +2836,6 @@ class LitCodeTUI(App[None]):
         """Let the user inspect and mutate queued-but-not-started messages."""
 
         runtime = self._active_runtime()
-        if runtime.session is None:
-            self._append_notice("当前 pane 为空，没有消息队列。")
-            return
         parts = arguments.split()
         messages = self.store.queue(runtime.session.session_id, include_finished=True)
         if not parts:
@@ -2899,9 +2946,6 @@ class LitCodeTUI(App[None]):
         """Detach the mounted Session while leaving its actor alive."""
 
         runtime = self._active_runtime()
-        if runtime.session is None:
-            self._append_notice("当前 pane 已经是空窗格。")
-            return
         current = runtime.session.session_id
         if self.busy:
             self._append_notice("当前会话已卸载；正在运行的 turn 会继续。")
@@ -2912,10 +2956,11 @@ class LitCodeTUI(App[None]):
             self._rebuild_panes()
         else:
             self.sessions.detach_active()
-            runtime.session = None
+            self._sync_runtime(self.sessions.active)
             runtime.busy = False
             self._reset_pane_view()
-            self._update_pane_header(runtime, "空窗格")
+            self._mount_welcome(runtime)
+            self._update_pane_header(runtime, "就绪")
         info = self.store.session_info(current)
         self._append_notice(
             f"会话 {info.alias} 已转入后台；可用 /sessions 重新挂载。"
@@ -3011,7 +3056,7 @@ class LitCodeTUI(App[None]):
             self._append_notice("当前还没有会话。")
             return
         active = self.sessions.active
-        current_id = active.session.session_id if active.session is not None else None
+        current_id = active.session.session_id
         self.push_screen(
             HistoryPicker(
                 rows,
@@ -3049,10 +3094,10 @@ class LitCodeTUI(App[None]):
         active = self._active_runtime()
         if identifier is None:
             return
-        if active.session is not None and identifier == active.session.session_id:
+        if identifier == active.session.session_id:
             self._append_notice("该会话已经挂载在当前 pane。")
             return
-        previous_id = active.session.session_id if active.session is not None else None
+        previous_id = active.session.session_id
         mounted = self.sessions.pane_for_session(identifier)
         if mounted is not None:
             previous = self.active_pane_id
@@ -3068,7 +3113,6 @@ class LitCodeTUI(App[None]):
             return
         self._sync_runtime(self.sessions.switch_active(identifier))
         runtime = self._active_runtime()
-        assert runtime.session is not None
         running = runtime.session.session_id in self.running_sessions
         runtime.busy = running
         if running:
@@ -3193,20 +3237,39 @@ class LitCodeTUI(App[None]):
         runtime.streaming_markdown = None
         runtime.streaming_buffer = ""
         runtime.rendered_output = None
-        if runtime.session is None:
-            return
         session = runtime.session
         for message in session.messages[1:]:
             content = message.get("content")
             if not isinstance(content, str) or not content:
                 continue
             if message.get("role") == "user":
-                self._mount_timeline(
-                    Static(Text(_display_user_content(content)), classes="message-user"),
-                    runtime,
-                )
+                source = message.get("_litcode_source_session_id")
+                if isinstance(source, str):
+                    self._append_delivery(content, source, runtime)
+                else:
+                    self._mount_timeline(
+                        Static(
+                            Text(_display_user_content(content)),
+                            classes="message-user",
+                        ),
+                        runtime,
+                    )
             elif message.get("role") == "assistant":
                 self._append_assistant(content, runtime)
+
+    def _append_delivery(
+        self, content: str, source_session_id: str, runtime: PaneRuntime
+    ) -> None:
+        try:
+            source = self.store.session_info(source_session_id).alias
+        except KeyError:
+            source = "其他会话"
+        display = Text()
+        display.append(f"↳ {source} 投递", style="bold")
+        display.append("\n" + _display_user_content(content))
+        self._mount_timeline(
+            Static(display, classes="message-delivery"), runtime
+        )
 
     def action_choose_model(self) -> None:
         if self.busy:
@@ -3704,7 +3767,7 @@ class LitCodeTUI(App[None]):
                 invocation = self.runtime.invocation(state.invocation_id)
             except SessionRuntimeError:
                 return
-        elif runtime.session is not None:
+        else:
             used = {
                 item.invocation_id
                 for item in runtime.subagent_cards.values()
@@ -3774,15 +3837,7 @@ class LitCodeTUI(App[None]):
 
     def _finish_with_error(self, message: str, session_id: str | None = None) -> None:
         if session_id is None:
-            session_id = (
-                self._active_runtime().session.session_id
-                if self._active_runtime().session is not None
-                else None
-            )
-        if session_id is None:
-            self._append_notice(message, error=True)
-            self._set_busy(False, "错误")
-            return
+            session_id = self._active_runtime().session.session_id
         self.running_sessions.discard(session_id)
         runtime = self._runtime_for_session(session_id)
         if runtime is None:
@@ -3825,9 +3880,6 @@ class LitCodeTUI(App[None]):
         try:
             header = self.query_one(f"#view-{runtime.pane_id} .pane-header", Static)
         except Exception:
-            return
-        if runtime.session is None:
-            header.update(Text(f"{runtime.pane_slot}  空窗格 · {status}"))
             return
         info = self.store.session_info(runtime.session.session_id)
         unread = len(self.store.inbox(runtime.session.session_id))
@@ -3905,7 +3957,6 @@ class LitCodeTUI(App[None]):
             return
         runtime.cancel_requested.set()
         try:
-            assert runtime.session is not None
             self.runtime.cancel_turn(runtime.session.session_id)
         except (KeyError, RuntimeError, AssertionError):
             pass
@@ -4454,7 +4505,11 @@ def _message_prompt_history(messages: list[ModelMessage]) -> list[str]:
     history: list[str] = []
     for message in messages:
         content = message.get("content")
-        if message.get("role") != "user" or not isinstance(content, str):
+        if (
+            message.get("role") != "user"
+            or not isinstance(content, str)
+            or isinstance(message.get("_litcode_source_session_id"), str)
+        ):
             continue
         visible = _display_user_content(content).strip()
         if visible and (not history or history[-1] != visible):

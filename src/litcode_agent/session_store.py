@@ -373,6 +373,62 @@ class SessionStore:
         return identifier
 
     @_synchronized
+    def delete_if_pristine(self, session_id: str) -> bool:
+        """Delete a never-used root Session without discarding durable state.
+
+        The check and delete share one transaction so a concurrent mailbox
+        write cannot be mistaken for an unused Session.
+        """
+
+        with self.connection:
+            row = self.connection.execute(
+                "SELECT parent_id, status, active_turn_id, messages_json, summary "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            messages = _parse_messages(row["messages_json"])
+            if (
+                row["parent_id"] is not None
+                or row["status"] != "idle"
+                or row["active_turn_id"] is not None
+                or row["summary"] is not None
+                or len(messages) != 1
+                or messages[0].get("role") != "system"
+            ):
+                return False
+            related = self.connection.execute(
+                "SELECT 1 WHERE "
+                "EXISTS (SELECT 1 FROM session_queue WHERE target_session_id = ? OR source_session_id = ?) OR "
+                "EXISTS (SELECT 1 FROM session_turns WHERE session_id = ?) OR "
+                "EXISTS (SELECT 1 FROM checkpoints WHERE session_id = ?) OR "
+                "EXISTS (SELECT 1 FROM file_changes WHERE session_id = ?) OR "
+                "EXISTS (SELECT 1 FROM session_inbox WHERE target_session_id = ? OR source_session_id = ?) OR "
+                "EXISTS (SELECT 1 FROM session_references WHERE target_session_id = ? OR source_session_id = ?) OR "
+                "EXISTS (SELECT 1 FROM scheduled_tasks WHERE target_session_id = ? OR creator_session_id = ?) OR "
+                "EXISTS (SELECT 1 FROM sessions WHERE parent_id = ?)",
+                (
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                    session_id,
+                ),
+            ).fetchone()
+            if related is not None:
+                return False
+            self.connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        return True
+
+    @_synchronized
     def save_messages(
         self, session_id: str, messages: Sequence[Message], *, title: str | None = None
     ) -> None:

@@ -1,7 +1,7 @@
 """Pane views and durable Session lifecycle.
 
-一个 pane 可以暂时没有会话。Session 是持久化的执行主体，pane 只是它的
-可见挂载点；因此卸载、重新挂载和后台运行都不需要伪造一个空会话。
+每个 pane 始终挂载一个可寻址 Session；pane 关闭时，只有从未承载活动的
+Session 才会被删除，其余 Session 转入后台。
 """
 
 from __future__ import annotations
@@ -29,17 +29,13 @@ from litcode_agent.tools.registry import ToolRegistry
 
 @dataclass(slots=True)
 class PaneSession:
-    """A pane configuration and its optional mounted Session."""
+    """A pane configuration and its mounted Session."""
 
     pane_id: str
     pane_slot: int
     agent: Agent
     model: OpenAIChatModel
-    session: AgentSession | None
-
-    @property
-    def empty(self) -> bool:
-        return self.session is None
+    session: AgentSession
 
 
 class SessionWorkspace:
@@ -81,22 +77,11 @@ class SessionWorkspace:
             pane.model = _clone_model(model, model.model)
             pane.agent.model = pane.model
             pane.agent.model_name = model.model
-            if pane.session is not None:
-                self.store.update_model(pane.session.session_id, model.model)
+            self.store.update_model(pane.session.session_id, model.model)
 
     @property
     def active(self) -> PaneSession:
         return self.panes[self.active_pane_id]
-
-    def materialize(self, pane_id: str | None = None) -> AgentSession:
-        """Create a root Session for an Empty Pane on its first real use."""
-
-        pane = self.panes[pane_id or self.active_pane_id]
-        if pane.session is None:
-            pane.session = pane.agent.start_session()
-            if self.runtime is not None:
-                self.runtime.register(pane.session.session_id, pane.session)
-        return pane.session
 
     def split(
         self, direction: str, session_id: str | None = None
@@ -114,6 +99,7 @@ class SessionWorkspace:
         )
         pane = self._create(pane_slot, model)
         if session_id is not None:
+            self._release_session(pane.session)
             live = self.runtime.session_for(session_id) if self.runtime else None
             detached = self.detached.pop(session_id, None)
             if live is not None:
@@ -125,7 +111,7 @@ class SessionWorkspace:
                 self._bind_runtime_location(pane)
             else:
                 pane.session = pane.agent.start_session(session_id)
-            if self.runtime is not None and pane.session is not None:
+            if self.runtime is not None:
                 self.runtime.register(session_id, pane.session)
         self.layout.split(self.active_pane_id, direction, pane_id)
         self.panes[pane_id] = pane
@@ -152,28 +138,28 @@ class SessionWorkspace:
         pane_ids = self.layout.pane_ids()
         index = pane_ids.index(removed.pane_id)
         fallback = pane_ids[index - 1] if index else pane_ids[1]
-        if removed.session is not None:
-            self.detached[removed.session.session_id] = removed.session
+        self._release_session(removed.session)
         self.layout.close(removed.pane_id)
         del self.panes[removed.pane_id]
         self.active_pane_id = fallback
         return removed.pane_id, self.active
 
     def detach_active(self) -> AgentSession:
-        """Unmount the active Session while keeping its actor alive."""
+        """Move the active Session to background and mount a new root Session."""
 
         pane = self.active
-        if pane.session is None:
-            raise ValueError("the active pane is already empty")
         session = pane.session
         self.detached[session.session_id] = session
-        pane.session = None
+        pane.session = pane.agent.start_session()
+        if self.runtime is not None:
+            self.runtime.register(pane.session.session_id, pane.session)
         return session
 
     def clear_active(self) -> AgentSession:
         pane = self.active
-        current = pane.session or self.materialize(pane.pane_id)
-        current.close("user_clear", "")
+        current = pane.session
+        if not self._delete_if_pristine(current):
+            current.close("user_clear", "")
         pane.session = pane.agent.start_session()
         if self.runtime is not None:
             self.runtime.register(pane.session.session_id, pane.session)
@@ -181,8 +167,7 @@ class SessionWorkspace:
 
     def new_active(self) -> AgentSession:
         pane = self.active
-        if pane.session is not None:
-            self.detached[pane.session.session_id] = pane.session
+        self._release_session(pane.session)
         pane.session = pane.agent.start_session()
         if self.runtime is not None:
             self.runtime.register(pane.session.session_id, pane.session)
@@ -190,11 +175,9 @@ class SessionWorkspace:
 
     def switch_active(self, session_id: str) -> PaneSession:
         pane = self.active
-        if pane.session is not None and session_id == pane.session.session_id:
+        if session_id == pane.session.session_id:
             return pane
-        if pane.session is not None:
-            self.detached[pane.session.session_id] = pane.session
-            pane.session = None
+        self._release_session(pane.session)
         detached = self.detached.pop(session_id, None)
         if detached is not None:
             pane.session = detached
@@ -216,7 +199,7 @@ class SessionWorkspace:
 
     def fork_active(self, checkpoint: Checkpoint) -> AgentSession:
         pane = self.active
-        current = pane.session or self.materialize(pane.pane_id)
+        current = pane.session
         current.close("user_fork", "")
         pane.session = current.fork(checkpoint)
         if self.runtime is not None:
@@ -229,14 +212,11 @@ class SessionWorkspace:
         pane.model = _clone_model(pane.model, model_name)
         pane.agent.model = pane.model
         pane.agent.model_name = model_name
-        if pane.session is not None:
-            self.store.update_model(pane.session.session_id, model_name)
+        self.store.update_model(pane.session.session_id, model_name)
 
     def consume_inbox(self) -> tuple[InboxMessage, ...]:
         """Return unread messages and advance their visible state."""
 
-        if self.active.session is None:
-            return ()
         session_id = self.active.session.session_id
         messages = self.store.inbox(session_id)
         for message in messages:
@@ -246,9 +226,9 @@ class SessionWorkspace:
     def close_all(self) -> None:
         closed: set[str] = set()
         for pane in self.panes.values():
-            if pane.session is not None:
+            if not self._delete_if_pristine(pane.session):
                 pane.session.close("user_exit", "")
-                closed.add(pane.session.session_id)
+            closed.add(pane.session.session_id)
         for session_id, session in self.detached.items():
             if session_id not in closed:
                 session.close("user_exit", "")
@@ -277,8 +257,25 @@ class SessionWorkspace:
             origin_pane_slot=pane_slot,
             auto_compact_chars=self.settings.auto_compact_chars,
         )
-        session = agent.start_session(session_id) if session_id is not None else None
+        session = agent.start_session(session_id)
+        if self.runtime is not None:
+            self.runtime.register(session.session_id, session)
         return PaneSession(pane_id, pane_slot, agent, model, session)
+
+    def _release_session(self, session: AgentSession) -> None:
+        """Delete an unused root Session, otherwise keep it alive in background."""
+
+        if self._delete_if_pristine(session):
+            return
+        self.detached[session.session_id] = session
+
+    def _delete_if_pristine(self, session: AgentSession) -> bool:
+        if not self.store.delete_if_pristine(session.session_id):
+            return False
+        if self.runtime is not None:
+            self.runtime.unregister(session.session_id)
+        session.close("unused_pane_closed", "")
+        return True
 
     def _bind_runtime_location(self, pane: PaneSession) -> None:
         pane.agent.runtime_context = lambda: self._runtime_location(pane.pane_id)
@@ -292,7 +289,6 @@ class SessionWorkspace:
         return {
             pane.session.session_id: pane.pane_slot
             for pane in self.panes.values()
-            if pane.session is not None
         }
 
     def pane_for_session(self, session_id: str) -> PaneSession | None:
@@ -300,7 +296,7 @@ class SessionWorkspace:
             (
                 pane
                 for pane in self.panes.values()
-                if pane.session is not None and pane.session.session_id == session_id
+                if pane.session.session_id == session_id
             ),
             None,
         )
@@ -332,19 +328,9 @@ class SessionWorkspace:
 
     def _runtime_location(self, pane_id: str) -> str:
         pane = self.panes[pane_id]
-        if pane.session is None:
-            return (
-                f"{self._time_context()}\n"
-                f"当前终端：{self.terminal_id}\n"
-                f"当前 pane：{pane.pane_slot}\n"
-                "当前 pane 为空；首次输入后创建会话。"
-            )
         current = self.store.session_info(pane.session.session_id)
         mounted = []
         for candidate in sorted(self.panes.values(), key=lambda item: item.pane_slot):
-            if candidate.session is None:
-                mounted.append(f"{candidate.pane_slot}=空窗格")
-                continue
             info = self.store.session_info(candidate.session.session_id)
             mounted.append(f"{candidate.pane_slot}={info.alias} · {info.title}")
         return "\n".join(

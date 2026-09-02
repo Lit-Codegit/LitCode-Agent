@@ -32,9 +32,9 @@ _Avoid_：Orchestration Role、一次性任务说明
 用户用于选择、挂载并观察或操作至多一个 Session 的可拆分视图。
 _Avoid_：Agent、执行容器、进程
 
-**Empty Pane（空窗格）**：
-尚未挂载 Session、显示初始会话选择与输入界面的 Pane。
-_Avoid_：空 Session、新会话
+**Pristine Session（未使用会话）**：
+已挂载到 Pane、但从未收到输入、产生 Turn、修改文件、被引用或参与计划任务的 Root Session。
+_Avoid_：Empty Pane、草稿 Pane、空 Session
 
 **Mounted Session（已挂载会话）**：
 当前显示在某个 Pane 中的 Session。
@@ -70,12 +70,12 @@ _Avoid_：Agent Turn Lock、只读锁
 
 ## Relationships
 
-- 一个 **Pane** 同一时刻挂载至多一个 **Session**。
+- 一个 **Pane** 同一时刻恰好挂载一个 **Session**，因此创建后立即可由 Session 标识寻址。
 - 一个 **Session** 同一时刻最多挂载到一个 Pane；在选择器中选择已挂载 Session 时聚焦现有 Pane，不创建重复视图。
 - 一个 **Session** 同一时刻可以处于 **Mounted Session** 或 **Background Session** 状态。
 - `/nohup` 将当前 **Session** 从 **Pane** 卸载到后台，并让相邻 Pane 合并释放出的区域。
 - `/nohup` 移除当前 Pane leaf 后，由 split tree 中与它配对的 sibling 子树接管父节点的全部区域，不固定向某个屏幕方向合并。
-- 最后一个 Pane 执行 `/nohup` 时保留 Pane 容器并回到 Empty Pane 初始状态，不创建替代 Session。
+- 最后一个 Pane 执行 `/nohup` 时保留 Pane 容器，并立即挂载一个新的 Root Session；原 Session 转入后台。
 - 用户可以拖动 Pane 之间的分界线调整相邻区域比例；调整视图尺寸不影响任何 Session 的执行状态。
 - 第一版不跨 LitCode 进程持久化 Pane split tree、分界比例或挂载关系；重新打开时从单 Pane 开始，由用户从 Session Tree 重新挂载会话。
 - Session Tree、对话历史、Session Queue 和父子关系不属于 Pane 布局，必须跨进程重启持久化。
@@ -103,9 +103,9 @@ _Avoid_：Agent Turn Lock、只读锁
 - 执行槽只由正在请求模型或执行工具的 Agent Turn 占用；等待前台 Subagent Invocation 返回的父 Agent Turn 释放执行槽。
 - 前台 child 返回后，父 Agent Turn 按进入等待状态的顺序重新取得执行槽并继续。
 - **Pane** 的拆分、合并和尺寸不决定 **Session** 是否继续运行。
-- LitCode 启动或 `/split` 创建新 Pane 时可以产生 Empty Pane；这不会创建 Session。
-- `/split` 只创建或调整 Pane，并允许选择挂载已有 Session；它不建立 Session 父子关系。
-- 用户在 Empty Pane 提交第一条输入时才创建并挂载真正的 Root Session；`/subagent` 等命令输入也遵循同一条惰性创建规则，不设置无父会话的特殊禁用分支。
+- LitCode 启动或 `/split` 创建 Pane 时立即创建并挂载一个 Root Session，使其他 Session 可以向它投递第一条 Queued Message。
+- `/split` 只创建或调整 Pane，并允许选择挂载已有 Session；它不建立 Session 父子关系。选择已有 Session 或取消创建时，临时 Root Session 仅在仍是 Pristine Session 时删除。
+- 关闭 Pane 时，Pristine Session 随 Pane 删除；已经承载任何持久活动的 Session 转为 Background Session。
 - `/subagent` 从当前 Session 创建 Subagent Session；可选的 Pane 参数只决定是否立即把子会话挂载到新 Pane。
 - 一个 **Session** 只有一个 **Session Queue**，所有用户和 Agent 共享该队列的可见状态。
 - TUI 可以展示 Session Queue 的完整来源、内容、顺序与状态；“完全透明”表示没有隐藏项目且可按需读取，不表示每轮自动注入全部队列正文。

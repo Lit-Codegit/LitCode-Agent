@@ -80,8 +80,8 @@ def test_tui_mounts_status_timeline_and_fixed_prompt(tmp_path: Path) -> None:
         async with app.run_test(size=(120, 40)):
             header = str(app.query_one(".pane-header", Static).render())
             assert header.startswith("1 ")
-            assert "空窗格" in header
-            assert app.store.list_sessions(tmp_path) == ()
+            assert "新会话" in header
+            assert len(app.store.list_sessions(tmp_path)) == 1
             assert len(app.query("#status")) == 0
             assert app.query_one(PromptArea).has_focus
             banner = app.query_one(WelcomeBanner)
@@ -208,7 +208,7 @@ def test_closed_pane_releases_its_number_for_the_next_split(tmp_path: Path) -> N
     asyncio.run(exercise())
 
 
-def test_divider_drag_updates_layout_ratio_and_uses_a_real_empty_pane(
+def test_divider_drag_updates_layout_ratio_with_addressable_sessions(
     tmp_path: Path,
 ) -> None:
     async def exercise() -> None:
@@ -216,7 +216,7 @@ def test_divider_drag_updates_layout_ratio_and_uses_a_real_empty_pane(
         async with app.run_test(size=(160, 44)) as pilot:
             app.action_split("right")
             await pilot.pause()
-            assert app.store.list_sessions(tmp_path) == ()
+            assert len(app.store.list_sessions(tmp_path)) == 2
             divider = app.query_one(PaneDivider)
             assert divider.axis == "horizontal"
             app.resize_pane(divider.target_pane_id, divider.axis, 0.2)
@@ -552,6 +552,9 @@ def test_split_opens_new_pane_session_choice_and_cancel_rolls_back(
 
             app.action_split("right")
             await pilot.pause()
+            temporary = app.panes["pane-2"].session
+            assert temporary is not None
+            temporary_id = temporary.session_id
 
             assert isinstance(app.screen, ChoicePicker)
             labels = [label for _, label in app.screen.choices]
@@ -562,11 +565,13 @@ def test_split_opens_new_pane_session_choice_and_cancel_rolls_back(
 
             assert tuple(app.panes) == ("pane-1",)
             assert app.session.session_id == original
+            with pytest.raises(KeyError):
+                app.store.session_info(temporary_id)
 
     asyncio.run(exercise())
 
 
-def test_split_choice_keeps_new_session_as_draft_or_mounts_history(
+def test_split_choice_keeps_addressable_new_session_or_mounts_history(
     tmp_path: Path,
 ) -> None:
     async def exercise() -> None:
@@ -581,7 +586,7 @@ def test_split_choice_keeps_new_session_as_draft_or_mounts_history(
             await pilot.press("enter")
             await pilot.pause()
             assert app.active_pane_id == "pane-2"
-            assert app.panes["pane-2"].session is None
+            assert app.panes["pane-2"].session is not None
             assert app.panes["pane-1"].session.session_id == original
 
             app.action_close_pane()
@@ -722,6 +727,49 @@ def test_tui_queues_messages_and_accepts_commands_while_busy(
                     break
             assert len(model.requests) == 2
             assert not app.busy
+
+    asyncio.run(exercise())
+
+
+def test_cross_session_delivery_uses_green_message_block_and_survives_rerender(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        model = FakeModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            source = app.session.session_id
+            source_alias = app.store.session_info(source).alias
+            app.action_split("right")
+            await pilot.pause()
+            assert isinstance(app.screen, ChoicePicker)
+            await pilot.press("enter")
+            await pilot.pause()
+            target = app.session.session_id
+            assert app.session.messages == [
+                {"role": "system", "content": app.system_prompt}
+            ]
+
+            app.runtime.send_message(source, target, "跨 Pane 投递")
+            assert await wait_until(
+                pilot,
+                lambda: len(model.requests) == 1 and not app.busy,
+            )
+
+            delivery = app.query_one(".message-delivery", Static)
+            assert source_alias in str(delivery.render())
+            assert "跨 Pane 投递" in str(delivery.render())
+            assert delivery.styles.background.g > delivery.styles.background.r
+            assert not any(
+                "_litcode_source_session_id" in message
+                for message in model.requests[-1]
+            )
+
+            app._render_runtime_history(app._active_runtime())
+            await pilot.pause()
+            restored = app.query_one(".message-delivery", Static)
+            assert source_alias in str(restored.render())
+            assert "跨 Pane 投递" in str(restored.render())
 
     asyncio.run(exercise())
 
@@ -898,7 +946,7 @@ def test_new_command_detaches_session_and_keeps_running_task(
     asyncio.run(exercise())
 
 
-def test_nohup_returns_last_pane_to_empty_without_creating_a_session(
+def test_nohup_returns_last_pane_to_a_new_addressable_session(
     tmp_path: Path,
 ) -> None:
     async def exercise() -> None:
@@ -910,9 +958,11 @@ def test_nohup_returns_last_pane_to_empty_without_creating_a_session(
             app._handle_command("/nohup")
             await pilot.pause()
 
-            assert app._active_runtime().empty
-            assert {item.id for item in app.store.list_sessions(tmp_path)} == before
-            assert "空窗格" in str(app.query_one(".pane-header", Static).render())
+            assert app.session.session_id != previous
+            assert {item.id for item in app.store.list_sessions(tmp_path)} == before | {
+                app.session.session_id
+            }
+            assert "新会话" in str(app.query_one(".pane-header", Static).render())
 
             prompt = app.query_one(PromptArea)
             prompt.text = "新的根会话"
@@ -921,7 +971,6 @@ def test_nohup_returns_last_pane_to_empty_without_creating_a_session(
                 await pilot.pause(0.05)
                 if model.requests and not app.busy:
                     break
-            assert app.session.session_id != previous
             assert len(app.store.list_sessions(tmp_path)) == len(before) + 1
 
     asyncio.run(exercise())
@@ -1273,7 +1322,7 @@ def test_expired_ctrl_w_prefix_does_not_consume_a_late_key(
     asyncio.run(exercise())
 
 
-def test_closing_pane_detaches_without_ending_session(tmp_path: Path) -> None:
+def test_closing_pristine_pane_deletes_its_session(tmp_path: Path) -> None:
     async def exercise() -> None:
         app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
         async with app.run_test(size=(140, 40)) as pilot:
@@ -1285,12 +1334,37 @@ def test_closing_pane_detaches_without_ending_session(tmp_path: Path) -> None:
             app.action_close_pane()
             await pilot.pause()
 
-            assert not detached_session.closed
-            assert detached_id in app.sessions.detached
-            app._session_selected(detached_id)
+            assert detached_session.closed
+            assert detached_id not in app.sessions.detached
+            with pytest.raises(KeyError):
+                app.store.session_info(detached_id)
+
+    asyncio.run(exercise())
+
+
+def test_closing_used_pane_keeps_its_session_in_background(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        model = FakeModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(140, 40)) as pilot:
+            app.action_split("right")
             await pilot.pause()
-            assert app.session is detached_session
-            assert not app.session.closed
+            assert isinstance(app.screen, ChoicePicker)
+            await pilot.press("enter")
+            await pilot.pause()
+            prompt = app.query_one(PromptArea)
+            prompt.text = "保留这个会话"
+            await pilot.press("enter")
+            assert await wait_until(pilot, lambda: not app.busy)
+            detached_id = app.session.session_id
+            detached_session = app.session
+
+            app.action_close_pane()
+            await pilot.pause()
+
+            assert not detached_session.closed
+            assert app.store.session_info(detached_id).id == detached_id
+            assert app.sessions.detached[detached_id] is detached_session
 
     asyncio.run(exercise())
 
@@ -1498,7 +1572,9 @@ def test_history_picker_filters_and_selected_session_switches_pane(
             app._session_selected(other)
             await pilot.pause()
             assert app.session.session_id == other
-            assert first in app.sessions.detached
+            assert first not in app.sessions.detached
+            with pytest.raises(KeyError):
+                app.store.session_info(first)
 
     asyncio.run(exercise())
 
@@ -2120,7 +2196,9 @@ def test_unconfigured_tui_guides_connect_and_blocks_messages(tmp_path: Path) -> 
             prompt.text = "hello"
             prompt.action_submit()
             await pilot.pause()
-            assert app.store.list_sessions(tmp_path) == ()
+            sessions = app.store.list_sessions(tmp_path)
+            assert len(sessions) == 1
+            assert sessions[0].title == "新会话"
             assert any(
                 "connect" in str(widget.render())
                 for widget in app.query(".notice").results(Static)
