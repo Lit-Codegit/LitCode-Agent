@@ -187,6 +187,12 @@ def main(
     argv: Sequence[str] | None = None,
     ui: TerminalUI | None = None,
 ) -> int:
+    # Windows 默认把重定向输出按本地区码（cp1252 等）编码，中文 help 和
+    # 状态文案会抛 UnicodeEncodeError；CLI 统一 UTF-8，不再随终端环境漂移。
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
     raw_args = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(_normalize_args(raw_args))
     terminal = ui or TerminalUI()
