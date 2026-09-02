@@ -75,6 +75,10 @@ def run_shell(
 
     spec = resolve_shell()
     invocation, use_implicit_shell = spec.invocation(command)
+    # Windows 下方差很大的地方：子进程 stdio 双字节输出会被本地区码
+    # (cp1252/GBK) 夹住，Python 再用 backslashreplace 改成 \uXXXX 转义；
+    # 统一 UTF-8 让 hook 的 JSON 输入与非 ASCII 输出都正确落地。
+    child_env = {**os.environ, "PYTHONUTF8": "1"}
     if os.name != "nt":
         # This is deliberately the pre-Windows implementation: preserving it
         # avoids changing quoting, environment expansion, and signal behaviour
@@ -84,6 +88,7 @@ def run_shell(
             cwd=cwd,
             shell=use_implicit_shell,
             input=input_text,
+            env=child_env,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -95,6 +100,7 @@ def run_shell(
         invocation,
         cwd=cwd,
         shell=False,
+        env=child_env,
         stdin=subprocess.PIPE if input_text is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

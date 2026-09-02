@@ -110,6 +110,28 @@ def test_powershell_propagates_native_exit_code() -> None:
     assert completed.returncode == 2
 
 
+def test_powershell_preserves_utf8_stderr() -> None:
+    """Windows 本地代码页会把中文输出改写为 \\uXXXX 转义；子进程环境必须
+    钉 UTF-8，hook 的非 ASCII 错误信息才能原样到达模型。"""
+
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("pwsh not installed")
+    spec = ShellSpec("PowerShell", pwsh)
+    script = f"{sys.executable} -c 'import sys; print(\"禁止执行\", file=sys.stderr); sys.exit(2)'"
+    invocation, implicit = spec.invocation(script)
+    completed = subprocess.run(
+        invocation,
+        capture_output=True,
+        text=True,
+        check=False,
+        stdin=subprocess.DEVNULL,
+    )
+
+    assert completed.returncode == 2
+    assert "禁止执行" in completed.stderr
+
+
 def test_windows_timeout_falls_back_when_taskkill_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
