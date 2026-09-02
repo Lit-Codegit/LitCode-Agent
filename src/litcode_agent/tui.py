@@ -1111,7 +1111,9 @@ class QuestionPrompt(ModalScreen[list[list[str]] | None]):
             )
 
     def on_mount(self) -> None:
-        self._refresh_tab()
+        # 屏幕的子组件由 compose 异步挂载；慢机器上可能晚于本回调一帧，
+        # 推迟到下一帧再填充首屏内容。
+        self.call_after_refresh(self._refresh_tab)
 
     @on(OptionList.OptionSelected, "#question-options")
     def option_selected(self, event: OptionList.OptionSelected) -> None:
