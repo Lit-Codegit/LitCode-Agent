@@ -1,6 +1,7 @@
 from pathlib import Path
 from io import StringIO
 import json
+import os
 import stat
 
 import litcode_agent.cli as cli
@@ -54,8 +55,9 @@ def test_auth_login_stores_key_in_private_user_file(
         "type": "api",
         "key": "stored-secret",
     }
-    assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
-    assert stat.S_IMODE(auth_file.parent.stat().st_mode) == 0o700
+    if os.name == "posix":
+        assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
+        assert stat.S_IMODE(auth_file.parent.stat().st_mode) == 0o700
     assert "stored-secret" not in output.getvalue()
     assert "litcode/auth.json" in output.getvalue()
     assert "0600" in output.getvalue()

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from litcode_agent.process_runner import resolve_shell
 from litcode_agent.scheduler import local_timezone_name
 from litcode_agent.skills import SkillMetadata
 
@@ -44,6 +45,7 @@ class PromptBuilder:
                 "environment",
                 (
                     f"Workspace: {self.workspace}\nPlatform: {platform.system()}\n"
+                    f"Shell: {resolve_shell().name}\n"
                     f"Current local time: {datetime.now().astimezone().isoformat(timespec='seconds')}\n"
                     f"Default IANA timezone: {local_timezone_name()}"
                 ),

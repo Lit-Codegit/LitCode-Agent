@@ -19,7 +19,7 @@ class ScheduleError(ValueError):
     """A visible invalid calendar rule."""
 
 
-def local_timezone_name() -> str:
+def local_timezone_name(*, platform_name: str | None = None) -> str:
     """Return an IANA name when the host exposes one, otherwise UTC."""
 
     configured = os.environ.get("TZ", "").lstrip(":")
@@ -29,6 +29,14 @@ def local_timezone_name() -> str:
             return configured
         except ZoneInfoNotFoundError:
             pass
+    target = os.name if platform_name is None else platform_name
+    if target == "nt":
+        try:
+            candidate = _windows_timezone_name()
+            ZoneInfo(candidate)
+            return candidate
+        except (ImportError, OSError, ZoneInfoNotFoundError):
+            return "UTC"
     for path in (Path("/etc/localtime"), Path("/var/db/timezone/localtime")):
         try:
             resolved = str(path.resolve())
@@ -43,6 +51,14 @@ def local_timezone_name() -> str:
             except ZoneInfoNotFoundError:
                 pass
     return "UTC"
+
+
+def _windows_timezone_name() -> str:
+    """Read Windows' local zone and return its IANA mapping via tzlocal."""
+
+    from tzlocal import get_localzone_name
+
+    return get_localzone_name()
 
 
 def normalize_schedule(

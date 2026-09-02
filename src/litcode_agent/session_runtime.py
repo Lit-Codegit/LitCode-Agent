@@ -14,14 +14,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from io import TextIOWrapper
 import threading
 import time
 import uuid
 import sqlite3
-import os
 from pathlib import Path
-import fcntl
 from typing import Literal
 
 from litcode_agent.agent import AgentResult, AgentSession
@@ -31,6 +28,7 @@ from litcode_agent.session_store import (
     SessionStore,
     SessionTurn,
 )
+from litcode_agent.workspace_lock import WorkspaceLockError, WorkspaceProcessLock
 
 
 class SessionRuntimeError(RuntimeError):
@@ -147,9 +145,9 @@ class SessionRuntime:
         self._invocations_lock = threading.RLock()
         self._children: dict[str, set[str]] = {}
         self._budgets: dict[str, int] = {}
-        self._workspace_lock_file = None
+        self._workspace_lock: WorkspaceProcessLock | None = None
         if claim_workspace:
-            self._workspace_lock_file = self._claim_workspace(self.workspace)
+            self._workspace_lock = self._claim_workspace(self.workspace)
 
         # An application restart interrupts active work, but does not erase
         # history or queued messages.  The caller may explicitly resume them.
@@ -545,30 +543,20 @@ class SessionRuntime:
             if actor.thread is not None:
                 actor.thread.join(timeout=max(0.0, deadline - time.monotonic()))
         self.store.recover_session_runtime(self.workspace)
-        if self._workspace_lock_file is not None:
+        if self._workspace_lock is not None:
             try:
-                fcntl.flock(self._workspace_lock_file.fileno(), fcntl.LOCK_UN)
-                self._workspace_lock_file.close()
+                self._workspace_lock.release()
             finally:
-                self._workspace_lock_file = None
+                self._workspace_lock = None
 
     @staticmethod
-    def _claim_workspace(workspace: Path) -> TextIOWrapper:
-        lock_path = workspace / ".litcode" / "runtime.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        stream = lock_path.open("a+", encoding="utf-8")
+    def _claim_workspace(workspace: Path) -> WorkspaceProcessLock:
         try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            stream.close()
+            return WorkspaceProcessLock.acquire(workspace)
+        except WorkspaceLockError as error:
             raise SessionRuntimeError(
                 "另一个 LitCode 进程正在使用当前工作区"
             ) from error
-        stream.seek(0)
-        stream.truncate()
-        stream.write(str(os.getpid()))
-        stream.flush()
-        return stream
 
     # ------------------------------------------------------------------
     # Internal actor loop

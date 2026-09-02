@@ -9,7 +9,14 @@ import pytest
 
 from litcode_agent.agent import Agent
 from litcode_agent.model import AssistantTurn
-from litcode_agent.scheduler import Scheduler, ScheduleError, next_occurrence, normalize_schedule
+import litcode_agent.scheduler as scheduler_module
+from litcode_agent.scheduler import (
+    Scheduler,
+    ScheduleError,
+    local_timezone_name,
+    next_occurrence,
+    normalize_schedule,
+)
 from litcode_agent.session_runtime import SessionRuntime
 from litcode_agent.session_store import SessionStore
 from litcode_agent.tools.base import ToolExecutionContext
@@ -31,6 +38,15 @@ class RecordingRuntime:
 
 def epoch(value: str, zone: str = "Asia/Shanghai") -> float:
     return datetime.fromisoformat(value).replace(tzinfo=ZoneInfo(zone)).timestamp()
+
+
+def test_windows_local_timezone_uses_tzlocal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.setattr(
+        scheduler_module, "_windows_timezone_name", lambda: "Asia/Shanghai"
+    )
+
+    assert local_timezone_name(platform_name="nt") == "Asia/Shanghai"
 
 
 def test_normalize_once_and_recurring_calendar_rules() -> None:

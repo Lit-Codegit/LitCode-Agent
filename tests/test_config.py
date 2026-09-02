@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import os
 
 import pytest
 
@@ -270,6 +271,7 @@ def test_environment_api_key_overrides_user_credential_store(
 
 
 @pytest.mark.parametrize("mode", [0o644, 0o700, 0o400])
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission modes")
 def test_rejects_credential_file_without_exact_private_mode(
     tmp_path: Path, mode: int
 ) -> None:

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping
 
+from litcode_agent.process_runner import run_shell
+
 HookEvent = Literal[
     "SessionStart",
     "PreToolUse",
@@ -120,15 +122,11 @@ class HookRunner:
             "${LITCODE_PROJECT_DIR}", str(self.workspace)
         )
         try:
-            completed = subprocess.run(
+            completed = run_shell(
                 command,
                 cwd=self.workspace,
-                shell=True,
-                input=hook_input,
-                capture_output=True,
-                text=True,
+                input_text=hook_input,
                 timeout=hook.timeout_seconds,
-                check=False,
             )
         except subprocess.TimeoutExpired as error:
             return HookExecution(

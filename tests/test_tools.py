@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -71,6 +72,25 @@ def test_search_files_uses_workspace_relative_results(tmp_path: Path) -> None:
     assert "hello.py:1:needle = 1" in result.content
 
 
+def test_search_files_falls_back_when_ripgrep_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "hello.py").write_text("first\nneedle = 1\n", encoding="utf-8")
+    (source / "binary.py").write_bytes(b"\x00needle")
+    monkeypatch.setattr(
+        "litcode_agent.tools.files.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+
+    result = SearchFilesTool(Workspace(tmp_path), 2_000, 2).execute(
+        {"pattern": "needle", "glob": "*.py"}
+    )
+
+    assert result.content == "src/hello.py:2:needle = 1"
+
+
 def test_apply_patch_creates_and_edits_file(tmp_path: Path) -> None:
     tool = ApplyPatchTool(Workspace(tmp_path))
 
@@ -110,6 +130,9 @@ def test_apply_patch_requires_one_exact_match(tmp_path: Path) -> None:
         "git reset --hard HEAD~1",
         "git push origin main",
         "chmod -R 777 .",
+        "Remove-Item -Recurse -Force .",
+        "del /s /q important.txt",
+        "Stop-Computer",
     ],
 )
 def test_detects_dangerous_commands(command: str) -> None:
@@ -118,7 +141,7 @@ def test_detects_dangerous_commands(command: str) -> None:
 
 def test_runs_safe_command(tmp_path: Path) -> None:
     result = RunCommandTool(Workspace(tmp_path), 2, 2_000, "deny").execute(
-        {"command": "pwd"}
+        {"command": f'"{sys.executable}" -c "import os; print(os.getcwd())"'}
     )
 
     assert "exit_code: 0" in result.content
@@ -157,7 +180,13 @@ def test_command_timeout_is_reported(tmp_path: Path) -> None:
     tool = RunCommandTool(Workspace(tmp_path), 0.01, 2_000, "deny")
 
     with pytest.raises(ToolError, match="timed out"):
-        tool.execute({"command": "sleep 1"})
+        tool.execute(
+            {
+                "command": (
+                    f'"{sys.executable}" -c "import time; time.sleep(1)"'
+                )
+            }
+        )
 
 
 def test_output_truncation_keeps_both_ends() -> None:
@@ -224,7 +253,7 @@ def test_default_registry_serializes_workspace_mutations(
         assert release_command.wait(2)
         return subprocess.CompletedProcess(args="noop", returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("litcode_agent.tools.command.subprocess.run", blocking_run)
+    monkeypatch.setattr("litcode_agent.process_runner.subprocess.run", blocking_run)
     command_thread = threading.Thread(
         target=lambda: registry.execute_json(
             "run_command", json.dumps({"command": "noop"})

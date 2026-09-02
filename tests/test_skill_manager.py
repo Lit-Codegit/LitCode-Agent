@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from litcode_agent.skill_manager import SkillManagementError, SkillManager
+from litcode_agent.skill_manager import (
+    SkillManagementError,
+    SkillManager,
+    _create_directory_link,
+)
 from litcode_agent.skills import SkillCatalog
 
 
@@ -98,3 +102,21 @@ def test_sync_links_canonical_skill_without_overwriting_existing_paths(tmp_path:
     destination.mkdir()
     with pytest.raises(SkillManagementError, match="拒绝覆盖"):
         manager.sync(["portable"], agents=["claude-code"])
+
+
+def test_windows_symlink_permission_error_has_actionable_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "destination"
+
+    def denied(*args: object, **kwargs: object) -> None:
+        error = OSError("privilege not held")
+        error.winerror = 1314  # type: ignore[attr-defined]
+        raise error
+
+    monkeypatch.setattr(Path, "symlink_to", denied)
+
+    with pytest.raises(SkillManagementError, match="Developer Mode"):
+        _create_directory_link(destination, source, platform_name="nt")

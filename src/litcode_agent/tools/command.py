@@ -12,6 +12,7 @@ from litcode_agent.config import CommandPolicy
 from litcode_agent.tools.base import ToolError, ToolResult
 from litcode_agent.tools.files import _string_argument, truncate_output
 from litcode_agent.mutation_locks import MutationLocks, WorkspaceMutationLocks
+from litcode_agent.process_runner import run_shell
 from litcode_agent.tools.workspace import Workspace
 
 if TYPE_CHECKING:
@@ -27,6 +28,11 @@ _DANGEROUS_PATTERNS = (
     re.compile(r"\bgit\s+(?:push|branch\s+-D)\b", re.IGNORECASE),
     re.compile(r"\b(?:mkfs|shutdown|reboot)\b", re.IGNORECASE),
     re.compile(r"\bchmod\s+-R\b", re.IGNORECASE),
+    re.compile(r"\bremove-item\b", re.IGNORECASE),
+    re.compile(r"\b(?:del|erase|rd|rmdir)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:stop-computer|restart-computer|format|diskpart)\b", re.IGNORECASE
+    ),
 )
 
 
@@ -84,14 +90,10 @@ class RunCommandTool:
                 raise ToolError("dangerous command was not approved")
         try:
             with self.execution_lock.command():
-                completed = subprocess.run(
+                completed = run_shell(
                     command,
                     cwd=self.workspace.root,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
                     timeout=self.timeout_seconds,
-                    check=False,
                 )
         except subprocess.TimeoutExpired as error:
             partial_stdout = error.stdout or ""

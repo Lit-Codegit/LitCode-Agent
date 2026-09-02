@@ -197,6 +197,7 @@ class PaneRuntime:
     prompt_history: list[str] = field(default_factory=list)
     prompt_history_index: int | None = None
     prompt_draft: str = ""
+    pending_user_bundles: list[str] = field(default_factory=list)
 
     @property
     def empty(self) -> bool:
@@ -1278,37 +1279,32 @@ class RewindMode(ModalScreen[str | None]):
 
 _WELCOME_LOGO = (
     "█   █   ███  ███  ██   ███ ███",
-    "█   █    █  █    █  █ █  █ █",
+    "█   █    █  █    █  █ █  █ █   ",
     "█   █    █  █    █  █ █  █ ███",
-    "█   █    █  █    █  █ █  █ █",
+    "█   █    █  █    █  █ █  █ █   ",
     "███ █    █   ███  ██   ███ ███",
 )
 _WELCOME_GRADIENT = ("#06b6d4", "#38bdf8", "#6366f1", "#a855f7", "#d946ef")
 _WELCOME_SHINE = "#ffffff"
-_WELCOME_VALUE = "#94a3b8"
 _WELCOME_MUTED = "#64748b"
+_WELCOME_LINE_MIN = 34
+_WELCOME_LOGO_WIDTH = max(len(line) for line in _WELCOME_LOGO)
 
 
 class WelcomeBanner(Static):
-    """新会话入场横幅：渐变 logo + 会话信息 + 快捷键；只做渲染，不含决策逻辑。"""
+    """新会话入场横幅：渐变 logo + 一行快捷键；只做渲染，不含决策逻辑。
 
-    def __init__(
-        self,
-        *,
-        workspace: str,
-        model_profile: str,
-        model_name: str,
-        configured: bool,
-    ) -> None:
+    模型、配置档、路径与状态不在这里重复——它们常驻在输入框下方的
+    prompt-meta 行，banner 的任务只是给新会话一个干净的入口视觉。
+    """
+
+    def __init__(self) -> None:
         super().__init__("")
-        self._workspace = workspace
-        self._model_profile = model_profile
-        self._model_name = model_name
-        self._configured = configured
         self._shine = -1
 
     def on_mount(self) -> None:
         self.set_interval(1.4, self._pulse)
+        self.call_after_refresh(self.refresh)
 
     def _pulse(self) -> None:
         self._shine += 1
@@ -1316,40 +1312,45 @@ class WelcomeBanner(Static):
         self.styles.border = ("round", border)
         self.refresh()
 
+    def _content_width(self) -> int:
+        """可见文本宽度：去掉圆角边框(2)与左右 padding(4)。"""
+
+        width = self.size.width
+        return max(_WELCOME_LINE_MIN, width - 6) if width else _WELCOME_LINE_MIN
+
+    def _center(self, line: str, width: int) -> str:
+        """按固定网格宽居中，保证 logo 各行字符列对齐。"""
+
+        pad = max(0, (width - _WELCOME_LOGO_WIDTH) // 2)
+        return " " * pad + line.ljust(_WELCOME_LOGO_WIDTH)
+
+    def _center_text(self, line: str, width: int) -> str:
+        pad = max(0, (width - len(line)) // 2)
+        return " " * pad + line
+
     def render(self) -> Text:
         text = Text()
+        width = self._content_width()
         active = self._shine % len(_WELCOME_LOGO) if self._shine >= 0 else None
         for index, line in enumerate(_WELCOME_LOGO):
+            line = self._center(line, width)
             if index == active:
                 text.append(line + "\n", style=f"bold {_WELCOME_SHINE}")
             else:
                 text.append(line + "\n", style=f"bold {_WELCOME_GRADIENT[index]}")
         text.append("\n")
-        text.append("─" * 33 + "\n", style=f"dim {_WELCOME_MUTED}")
-        for key, hint in (
-            ("/help", "显示命令"),
-            ("@ 文件", "引用文件"),
-            ("Ctrl+W 分屏", "切换 pane"),
-            ("F2", "切换模型"),
-            ("Ctrl+C", "停止/退出"),
-        ):
-            text.append(f"{key}   ", style=f"bold {_WELCOME_SHINE}")
-            text.append(f"{hint}  ", style=f"dim {_WELCOME_MUTED}")
-        text.append("\n")
-        text.append("─" * 33 + "\n", style=f"dim {_WELCOME_MUTED}")
-        meta = " · ".join(
-            (
-                self._model_name or "未配置",
-                self._model_profile,
-                self._workspace,
+        text.append("─" * width + "\n", style=f"dim {_WELCOME_MUTED}")
+        hint = "".join(
+            f"{key} {hint}   "
+            for key, hint in (
+                ("/help", "命令"),
+                ("@", "文件引用"),
+                ("Ctrl+W", "分屏"),
+                ("F2", "模型"),
+                ("Ctrl+C", "停止"),
             )
         )
-        text.append(f"  {meta}\n", style=_WELCOME_VALUE)
-        text.append("  ")
-        if self._configured:
-            text.append("● 就绪 · 等待第一条消息", style="bold #4ade80")
-        else:
-            text.append("✕ 未连接 · 输入 /connect 连接供应商", style="bold #fbbf24")
+        text.append(self._center_text(hint, width), style=f"bold {_WELCOME_SHINE}")
         return text
 
 
@@ -1366,6 +1367,7 @@ class LitCodeTUI(App[None]):
             priority=True,
         ),
         Binding("ctrl+l", "clear_session", "清空", show=True),
+        Binding("escape", "interrupt_or_ignore", "中断回复", show=False),
         Binding("f2", "choose_model", "模型", show=True),
         Binding(
             "ctrl+w",
@@ -1524,7 +1526,7 @@ class LitCodeTUI(App[None]):
         background: $error 5%;
     }
     #composer {
-        height: 6;
+        height: 7;
         padding: 0 1;
         background: $background;
         border-top: none;
@@ -1578,10 +1580,30 @@ class LitCodeTUI(App[None]):
         padding: 0 2;
         color: $text-muted;
     }
-    #prompt-hint {
+    #prompt-status {
         height: 1;
+    }
+    #prompt-status-left {
+        width: 1fr;
         padding: 0 2;
         color: $text-muted;
+    }
+    #prompt-status-right {
+        padding: 0 2;
+        color: $text-muted;
+    }
+    #prompt-queue {
+        display: none;
+        height: auto;
+        margin: 0 0 1 0;
+        padding: 0 2;
+        border: none;
+        border-left: $primary;
+        background: $boost;
+        color: $text-muted;
+    }
+    #prompt-queue.visible {
+        display: block;
     }
     #prompt {
         height: 4;
@@ -1782,14 +1804,17 @@ class LitCodeTUI(App[None]):
         yield Vertical(self._pane_widget(self._active_runtime()), id="pane-area")
         with Vertical(id="composer"):
             yield OptionList(id="completion", compact=True, markup=False)
+            yield Static(id="prompt-queue")
             yield PromptArea(id="prompt", language=None)
             with Horizontal(id="prompt-meta"):
                 yield Label(id="prompt-meta-left")
                 yield Label(id="prompt-meta-right")
-            yield Label(
-                "Shift+Enter 换行 · ↑↓ 历史 · / @ # 命令/文件/会话 · Ctrl+W 分屏 · F2 切换模型",
-                id="prompt-hint",
-            )
+            with Horizontal(id="prompt-status"):
+                yield Label(id="prompt-status-left")
+                yield Label(
+                    "Enter 发送（运行中自动排队） · Shift+Enter 换行 · ↑↓ 历史 · Esc 中断",
+                    id="prompt-status-right",
+                )
         yield Footer()
 
     def _active_runtime(self) -> PaneRuntime:
@@ -1829,6 +1854,8 @@ class LitCodeTUI(App[None]):
         self.agent = pane.agent
         self.model = pane.model
         self._update_prompt_meta()
+        self._set_prompt_status(None)
+        self._update_prompt_queue()
         return runtime
 
     @property
@@ -2107,13 +2134,17 @@ class LitCodeTUI(App[None]):
                 reference.updated_at,
                 reference.content,
             )
-        self._append_user_bundle(bundle)
         runtime = self._active_runtime()
         # User messages use the same durable mailbox as Agent messages.  The
         # pane remains a view; a background/child Session can consume its own
         # queue even when no pane is mounted.
         assert runtime.session is not None
         already_running = runtime.busy
+        if already_running:
+            runtime.pending_user_bundles.append(bundle.display_text)
+        else:
+            self._append_user_bundle(bundle)
+            self._update_prompt_queue()
         self.runtime.register(runtime.session.session_id, runtime.session)
         if not already_running:
             self._set_pane_busy(runtime, True, "排队中…")
@@ -2126,11 +2157,7 @@ class LitCodeTUI(App[None]):
             self._append_notice(str(error), error=True, runtime=runtime)
             return
         if already_running:
-            queued = self.store.queue(runtime.session.session_id)
-            position = sum(1 for item in queued if item.status == "queued")
-            self._append_notice(
-                f"消息已加入队列（第 {position} 条待执行）。", runtime=runtime
-            )
+            self._update_prompt_queue()
 
     @on(TextArea.Changed, "#prompt")
     @on(TextArea.SelectionChanged, "#prompt")
@@ -2249,6 +2276,12 @@ class LitCodeTUI(App[None]):
     def _runtime_turn_started(self, runtime: PaneRuntime) -> None:
         assert runtime.session is not None
         self.running_sessions.add(runtime.session.session_id)
+        if runtime.pending_user_bundles:
+            content = runtime.pending_user_bundles.pop(0)
+            self._mount_timeline(
+                Static(Text(content), classes="message-user"), runtime
+            )
+        self._update_prompt_queue()
         self._set_pane_busy(runtime, True, "运行中")
 
     def _runtime_turn_finished(self, turn: SessionTurn) -> None:
@@ -2961,7 +2994,9 @@ class LitCodeTUI(App[None]):
         runtime.tool_cards.clear()
         runtime.streaming_markdown = None
         runtime.rendered_output = None
+        runtime.pending_user_bundles.clear()
         self._mount_welcome(runtime)
+        self._update_prompt_queue()
 
     def _session_selected(self, identifier: str | None) -> None:
         active = self._active_runtime()
@@ -3732,6 +3767,7 @@ class LitCodeTUI(App[None]):
         if not busy:
             self.query_one(PromptArea).focus()
             self.refresh_completions()
+            self._set_prompt_status(None)
 
     def _update_pane_status(self, runtime: PaneRuntime, status: str) -> None:
         self._update_pane_header(runtime, status)
@@ -3798,6 +3834,64 @@ class LitCodeTUI(App[None]):
         for banner in list(timeline.query(WelcomeBanner)):
             banner.remove()
 
+    def _set_prompt_status(self, message: str | None, warning: bool = False) -> None:
+        """输入框下方的状态行：排队 / 中断等临时信息，靠近输入框展示。
+
+        样式借鉴 OpenCode 底部状态行：低权重文案 + 色点；idle 时留空。
+        """
+
+        try:
+            label = self.query_one("#prompt-status-left", Label)
+        except Exception:
+            return
+        if not message:
+            label.update("")
+            return
+        color = "#fbbf24" if warning else "#38bdf8"
+        label.update(Text(message, style=f"bold {color}"))
+
+    def action_interrupt_or_ignore(self) -> None:
+        """Esc：回复中严厉中断（与 Ctrl+C 同级，调用 cancel_turn）；空闲时不吞按键。"""
+
+        runtime = self._active_runtime()
+        if not runtime.busy:
+            return
+        runtime.cancel_requested.set()
+        try:
+            assert runtime.session is not None
+            self.runtime.cancel_turn(runtime.session.session_id)
+        except (KeyError, RuntimeError, AssertionError):
+            pass
+        self._update_pane_header(runtime, "中断中…")
+        self._set_prompt_status("⏹ 正在中断…", warning=True)
+
+    def _update_prompt_queue(self) -> None:
+        """输入框上方的排队带：只显示尚未被处理的排队消息（OpenCode 底部状态样式）。
+
+        每条消息在轮次真正开始（turn_started）时才会进入消息流。
+        """
+
+        try:
+            strip = self.query_one("#prompt-queue", Static)
+        except Exception:
+            return
+        runtime = self._active_runtime()
+        pending = runtime.pending_user_bundles
+        if not pending:
+            strip.remove_class("visible")
+            strip.update(Text(""))
+            return
+        lines = []
+        for content in pending[:3]:
+            preview = content.replace("\n", " ")
+            if len(preview) > 46:
+                preview = preview[:46] + "…"
+            lines.append(f"⏳ {preview}")
+        if len(pending) > 3:
+            lines.append(f"… 还有 {len(pending) - 3} 条待处理")
+        strip.add_class("visible")
+        strip.update(Text("\n".join(lines)))
+
     def _timeline(self, runtime: PaneRuntime) -> VerticalScroll:
         timeline_id = (
             "timeline"
@@ -3817,15 +3911,7 @@ class LitCodeTUI(App[None]):
         timeline.scroll_end(animate=False)
 
     def _mount_welcome(self, runtime: PaneRuntime) -> None:
-        self._mount_timeline(
-            WelcomeBanner(
-                workspace=str(self.settings.workspace),
-                model_profile=self.settings.model_profile,
-                model_name=self.model.model if self.settings.configured else "",
-                configured=self.settings.configured,
-            ),
-            runtime,
-        )
+        self._mount_timeline(WelcomeBanner(), runtime)
 
     def _start_streaming_message(self, runtime: PaneRuntime) -> None:
         runtime.streaming_buffer = ""

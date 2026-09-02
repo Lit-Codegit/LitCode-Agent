@@ -53,6 +53,26 @@ AGENT_DIRECTORIES: Mapping[str, tuple[str, str]] = {
 }
 
 
+def _create_directory_link(
+    destination: Path,
+    source: Path,
+    *,
+    platform_name: str | None = None,
+) -> None:
+    """Create a skill link and explain Windows' symlink prerequisite."""
+
+    target = os.name if platform_name is None else platform_name
+    try:
+        destination.symlink_to(source, target_is_directory=True)
+    except OSError as error:
+        if target == "nt" and getattr(error, "winerror", None) == 1314:
+            raise SkillManagementError(
+                "Windows 创建 Skill 符号链接需要启用 Developer Mode，"
+                "或在管理员终端中重试"
+            ) from error
+        raise
+
+
 def default_user_skill_root(environ: Mapping[str, str] | None = None) -> Path:
     values = os.environ if environ is None else environ
     home = values.get("HOME")
@@ -223,7 +243,7 @@ class SkillManager:
                 if destination.exists():
                     raise SkillManagementError(f"拒绝覆盖已有路径：{destination}")
                 target_root.mkdir(parents=True, exist_ok=True)
-                destination.symlink_to(source, target_is_directory=True)
+                _create_directory_link(destination, source)
                 links.append(SyncLink(agent, skill_name, destination, True))
         return tuple(links)
 

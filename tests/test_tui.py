@@ -67,8 +67,8 @@ def test_tui_mounts_status_timeline_and_fixed_prompt(tmp_path: Path) -> None:
             assert app.query_one(PromptArea).has_focus
             banner = app.query_one(WelcomeBanner)
             rendered = str(banner.render())
-            assert "● 就绪" in rendered
-            assert str(tmp_path) in rendered
+            assert "/help" in rendered
+            assert "Ctrl+W" in rendered
             meta = str(app.query_one("#prompt-meta-left", Label).render())
             assert "● 就绪" in meta
             assert "model-a" in meta
@@ -123,6 +123,42 @@ def test_welcome_banner_disappears_after_first_message(tmp_path: Path) -> None:
             prompt.action_submit()
             await pilot.pause()
             assert not list(app.query(WelcomeBanner))
+
+    asyncio.run(exercise())
+
+
+def test_escape_interrupts_running_reply(tmp_path: Path) -> None:
+    import time
+
+    class SlowModel(FakeModel):
+        def complete(self, messages, tools):
+            time.sleep(0.3)
+            return AssistantTurn("回答")
+
+    async def exercise() -> None:
+        model = SlowModel()
+        app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one(PromptArea)
+            prompt.text = "开始"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.busy
+
+            await pilot.press("escape")
+            await pilot.pause()
+
+            runtime = app._active_runtime()
+            assert runtime.cancel_requested.is_set()
+            assert "中断" in str(
+                app.query_one("#prompt-status-left", Label).render()
+            )
+            for _ in range(40):
+                await pilot.pause(0.02)
+                if not app.busy:
+                    break
+            assert not app.busy
+            assert list(app.query("#prompt-status-left"))[0].render() == ""
 
     asyncio.run(exercise())
 
@@ -620,10 +656,16 @@ def test_tui_queues_messages_and_accepts_commands_while_busy(
             await pilot.pause()
             queue = app.store.queue(app.session.session_id)
             assert [item.content for item in queue] == ["第一条", "第二条"]
-            assert any(
-                "已加入队列" in str(widget.render())
-                for widget in app.query(".notice").results(Static)
-            )
+            strip = app.query_one("#prompt-queue", Static)
+            assert "⏳" in str(strip.render())
+            assert "第二条" in str(strip.render())
+            user_bundles = [
+                str(widget.render())
+                for widget in app.query(".message-user").results(Static)
+            ]
+            assert len(user_bundles) == 1
+            assert "第一条" in user_bundles[0]
+            assert "第二条" not in " ".join(user_bundles)
 
             prompt.text = "/tree"
             await pilot.press("enter")

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Mapping
 
@@ -162,7 +165,7 @@ class ReadFileTool:
 
 class SearchFilesTool:
     name = "search_files"
-    description = "Search workspace text files with ripgrep."
+    description = "Search workspace text files, using ripgrep when available."
     input_schema = {
         "type": "object",
         "properties": {
@@ -204,8 +207,8 @@ class SearchFilesTool:
                 timeout=self.timeout_seconds,
                 check=False,
             )
-        except FileNotFoundError as error:
-            raise ToolError("ripgrep (rg) is not installed") from error
+        except FileNotFoundError:
+            return self._python_search(pattern, search_path, glob)
         except subprocess.TimeoutExpired as error:
             raise ToolError(
                 f"search timed out after {self.timeout_seconds:g} seconds"
@@ -215,6 +218,77 @@ class SearchFilesTool:
         if completed.returncode != 0:
             raise ToolError(completed.stderr.strip() or "ripgrep failed")
         return ToolResult(truncate_output(completed.stdout, self.max_output_chars))
+
+    def _python_search(
+        self, pattern: str, search_path: Path, glob: object
+    ) -> ToolResult:
+        """Small no-install fallback for machines without ripgrep."""
+
+        try:
+            expression = re.compile(pattern)
+        except re.error as error:
+            raise ToolError(f"invalid search pattern: {error}") from error
+        glob_pattern = glob if isinstance(glob, str) else None
+        deadline = time.monotonic() + self.timeout_seconds
+        lines: list[str] = []
+        for path in _fallback_search_files(search_path):
+            if time.monotonic() > deadline:
+                raise ToolError(
+                    f"search timed out after {self.timeout_seconds:g} seconds"
+                )
+            relative = (
+                path.relative_to(search_path)
+                if search_path.is_dir()
+                else Path(path.name)
+            )
+            if glob_pattern is not None and not relative.match(glob_pattern):
+                continue
+            try:
+                raw = path.read_bytes()
+                if len(raw) > 2 * 1024 * 1024 or b"\0" in raw:
+                    continue
+                content = raw.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                if expression.search(line):
+                    lines.append(f"{self.scope.display(path)}:{line_number}:{line}")
+        output = "\n".join(lines) or "(no matches)"
+        return ToolResult(truncate_output(output, self.max_output_chars))
+
+
+_FALLBACK_IGNORED_DIRECTORIES = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        "build",
+        "dist",
+    }
+)
+
+
+def _fallback_search_files(root: Path) -> Iterator[Path]:
+    if root.is_file() and not root.is_symlink():
+        yield root
+        return
+    for current, directories, files in os.walk(root, followlinks=False):
+        directories[:] = sorted(
+            name
+            for name in directories
+            if name not in _FALLBACK_IGNORED_DIRECTORIES
+            and not (Path(current) / name).is_symlink()
+        )
+        for filename in sorted(files):
+            path = Path(current) / filename
+            if not path.is_symlink() and path.is_file():
+                yield path
 
 
 class ApplyPatchTool:

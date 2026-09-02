@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -85,7 +86,8 @@ def test_last_client_roundtrip_is_non_secret_and_private(
     assert loaded is not None
     assert loaded.api_key_env == "DEEPSEEK_API_KEY"
     assert loaded.model == "deepseek-chat"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_last_client_detects_corrupt_or_absent(
