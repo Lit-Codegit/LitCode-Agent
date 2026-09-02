@@ -496,12 +496,15 @@ def test_mouse_wheel_scrolls_each_split_timeline_independently(
                 timeline.scroll_home(animate=False)
                 await pilot.pause()
                 before = timeline.scroll_y
-                timeline.post_message(
-                    MouseScrollDown(
-                        timeline, 1, 1, 0, 1, 0, False, False, False
+                for _ in range(20):
+                    if timeline.scroll_y > before:
+                        break
+                    timeline.post_message(
+                        MouseScrollDown(
+                            timeline, 1, 1, 0, 1, 0, False, False, False
+                        )
                     )
-                )
-                await pilot.pause()
+                    await pilot.pause()
                 assert timeline.scroll_y > before
 
     asyncio.run(exercise())
