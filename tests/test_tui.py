@@ -29,12 +29,22 @@ from litcode_agent.tui import (
 
 
 async def wait_until(pilot, predicate, attempts: int = 200, delay: float = 0.05):
-    """Poll a TUI condition until it holds; CI 平台越慢，单次 pause 越不可靠。"""
+    """Poll a TUI condition until it holds; CI 平台越慢，单次 pause 越不可靠。
+
+    轮询期间允许 predicate 抛异常（例如节点尚未挂载的 NoMatches），
+    视为“条件尚未成立”，持续重试；最终结果由调用方断言。
+    """
     for _ in range(attempts):
-        if predicate():
-            return True
+        try:
+            if predicate():
+                return True
+        except Exception:
+            pass
         await pilot.pause(delay)
-    return predicate()
+    try:
+        return predicate()
+    except Exception:
+        return False
 
 
 class FakeModel:
