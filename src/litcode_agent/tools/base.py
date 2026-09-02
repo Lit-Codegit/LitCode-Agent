@@ -14,6 +14,14 @@ class ToolError(ValueError):
     """An expected error that the model may correct on its next turn."""
 
 
+class UserDeclinedError(ToolError):
+    """The user declined a confirmation; the tool must not be retried.
+
+    Unlike ToolError this is a final decision: the agent loop stops instead of
+    feeding the rejection back to the model, which would otherwise try to
+    achieve the same effect with a different command or tool."""
+
+
 @dataclass(frozen=True, slots=True)
 class FileChange:
     path: str

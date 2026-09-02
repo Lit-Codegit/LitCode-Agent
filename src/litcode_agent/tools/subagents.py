@@ -14,7 +14,12 @@ from pathlib import Path
 from litcode_agent.config import CommandPolicy
 from litcode_agent.session_runtime import SessionRuntime, SessionRuntimeError
 from litcode_agent.session_store import SessionStore
-from litcode_agent.tools.base import ToolError, ToolExecutionContext, ToolResult
+from litcode_agent.tools.base import (
+    ToolError,
+    ToolExecutionContext,
+    ToolResult,
+    UserDeclinedError,
+)
 
 
 class SpawnSubagentTool:
@@ -303,7 +308,7 @@ class ControlSessionTool:
         description = f"允许当前 Agent {action} 会话 {alias}？"
         approved = self.runtime.request_confirmation(lambda: self.confirm(description))
         if not approved:
-            raise ToolError("session control was not approved")
+            raise UserDeclinedError("session control was not approved")
         try:
             target_id = self.runtime.store.session_id_for_reference(
                 self.runtime.workspace, alias
@@ -353,7 +358,7 @@ def _authorize_read(
     else:
         approved = confirm(description)
     if not approved:
-        raise ToolError("session read was not approved")
+        raise UserDeclinedError("session read was not approved")
 
 
 def _check_workspace(workspace: Path, context: ToolExecutionContext) -> None:

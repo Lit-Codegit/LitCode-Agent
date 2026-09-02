@@ -20,7 +20,7 @@ from litcode_agent.model import (
     ToolCall,
 )
 from litcode_agent.tools.base import FileChange, ToolResult
-from litcode_agent.tools.base import ToolExecutionContext
+from litcode_agent.tools.base import ToolExecutionContext, UserDeclinedError
 from litcode_agent.tools.registry import ToolRegistry
 from litcode_agent.session_store import Checkpoint, SessionStore
 from litcode_agent.tools.workspace import Workspace
@@ -41,6 +41,13 @@ answer before acting on it. Ask the minimum number of questions and prefer
 providing a recommended option first with "(Recommended)" appended to its label.
 Do not use the tool for trivia you can resolve yourself; if the user rejects a
 question, adapt by choosing the best default and continue.
+
+User decisions are final. When the user declines a confirmation, rejects an
+action, or changes the direction of the task, that decision stands: do not
+retry the same operation through a different command, script, or tool, do not
+argue, and do not seek another way to reach the rejected outcome. Stop, report
+the decision, and wait for new instructions. Ask before acting whenever an
+action was previously declined.
 """
 
 TerminationReason = Literal[
@@ -49,6 +56,7 @@ TerminationReason = Literal[
     "model_incomplete",
     "max_iterations",
     "cancelled",
+    "user_declined",
 ]
 
 
@@ -274,7 +282,14 @@ class AgentSession:
             for tool_call in turn.tool_calls:
                 if cancelled():
                     return self._cancelled(iteration)
-                self._execute_tool(tool_call, iteration)
+                try:
+                    self._execute_tool(tool_call, iteration)
+                except UserDeclinedError as error:
+                    return self._finish_turn(task, self._result(
+                        str(error),
+                        "user_declined",
+                        iteration,
+                    ))
 
         # Budget exhausted while the model was still working: one sealed
         # final round lets it deliver a wrap-up instead of stopping silent.
@@ -448,21 +463,48 @@ class AgentSession:
             iteration=iteration,
             match_value=tool_call.name,
         )
-        result = (
-            ToolResult.error(f"blocked by PreToolUse hook: {pre_tool.reason}")
-            if pre_tool.blocked
-            else self.agent.tools.execute_json(
-                tool_call.name,
-                tool_call.arguments,
-                (
-                    self.agent.tool_context(self.session_id)
-                    if self.agent.tool_context is not None
-                    else ToolExecutionContext(
-                        self.session_id, self.agent._workspace()
-                    )
-                ),
+        try:
+            result = (
+                ToolResult.error(f"blocked by PreToolUse hook: {pre_tool.reason}")
+                if pre_tool.blocked
+                else self.agent.tools.execute_json(
+                    tool_call.name,
+                    tool_call.arguments,
+                    (
+                        self.agent.tool_context(self.session_id)
+                        if self.agent.tool_context is not None
+                        else ToolExecutionContext(
+                            self.session_id, self.agent._workspace()
+                        )
+                    ),
+                )
             )
-        )
+        except UserDeclinedError as error:
+            self._append_message(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(
+                        {
+                            "ok": False,
+                            "declined": True,
+                            "content": str(error),
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+            self.agent.event_sink(
+                AgentEvent(
+                    kind="tool_result",
+                    iteration=iteration,
+                    tool_call=tool_call,
+                    content=str(error),
+                    is_error=True,
+                    session_id=self.session_id,
+                )
+            )
+            raise
         self._append_message(
             {
                 "role": "tool",

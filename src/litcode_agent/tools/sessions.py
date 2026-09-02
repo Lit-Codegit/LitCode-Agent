@@ -10,7 +10,12 @@ from typing import Mapping
 from litcode_agent.config import CommandPolicy
 from litcode_agent.session_store import SessionStore
 from litcode_agent.session_runtime import SessionRuntime
-from litcode_agent.tools.base import ToolError, ToolExecutionContext, ToolResult
+from litcode_agent.tools.base import (
+    ToolError,
+    ToolExecutionContext,
+    ToolResult,
+    UserDeclinedError,
+)
 
 ConfirmSessionMessage = Callable[[str], bool]
 
@@ -197,7 +202,7 @@ class SendSessionMessageTool:
                 else:
                     approved = self.confirm(description)
                 if not approved:
-                    raise ToolError("session message was not approved")
+                    raise UserDeclinedError("session message was not approved")
         try:
             if self.runtime is not None:
                 message = self.runtime.send_message(
@@ -293,4 +298,4 @@ def _authorize_read(
     else:
         approved = confirm(description)
     if not approved:
-        raise ToolError("session reading was not approved")
+        raise UserDeclinedError("session reading was not approved")

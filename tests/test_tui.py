@@ -750,12 +750,10 @@ def test_tui_denies_dangerous_command_in_modal(tmp_path: Path) -> None:
     class ToolModel(FakeModel):
         def complete(self, messages, tools):
             self.requests.append(list(messages))
-            if len(self.requests) == 1:
-                return AssistantTurn(
-                    None,
-                    (ToolCall("danger", "run_command", '{"command":"git push"}'),),
-                )
-            return AssistantTurn("已收到拒绝结果")
+            return AssistantTurn(
+                None,
+                (ToolCall("danger", "run_command", '{"command":"git push"}'),),
+            )
 
     async def exercise() -> None:
         model = ToolModel()
@@ -773,12 +771,15 @@ def test_tui_denies_dangerous_command_in_modal(tmp_path: Path) -> None:
             await pilot.press("escape")
             for _ in range(120):
                 await pilot.pause(0.05)
-                if not app.busy and len(model.requests) == 2:
+                if not app.busy:
                     break
 
-            tool_message = model.requests[1][-1]
-            assert "dangerous command was not approved" in tool_message["content"]
             assert not app.busy
+            assert len(model.requests) == 1
+            messages = app.store.load(app.session.session_id)
+            tool_message = messages[-1]
+            assert "dangerous command was not approved" in tool_message["content"]
+            assert json.loads(tool_message["content"])["declined"] is True
 
     asyncio.run(exercise())
 

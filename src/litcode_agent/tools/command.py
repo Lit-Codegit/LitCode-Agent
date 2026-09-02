@@ -9,7 +9,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Mapping
 
 from litcode_agent.config import CommandPolicy
-from litcode_agent.tools.base import ToolError, ToolResult
+from litcode_agent.tools.base import ToolError, ToolResult, UserDeclinedError
 from litcode_agent.tools.files import _string_argument, truncate_output
 from litcode_agent.mutation_locks import MutationLocks, WorkspaceMutationLocks
 from litcode_agent.process_runner import run_shell
@@ -87,7 +87,7 @@ class RunCommandTool:
             else:
                 approved = self.confirm(command)
             if self.policy == "confirm" and not approved:
-                raise ToolError("dangerous command was not approved")
+                raise UserDeclinedError("dangerous command was not approved")
         try:
             with self.execution_lock.command():
                 completed = run_shell(

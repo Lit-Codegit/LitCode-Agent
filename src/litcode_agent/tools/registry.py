@@ -12,6 +12,7 @@ from litcode_agent.tools.base import (
     ToolError,
     ToolExecutionContext,
     ToolResult,
+    UserDeclinedError,
 )
 
 
@@ -62,6 +63,8 @@ class ToolRegistry:
                 return tool.execute_with_context(arguments, context)
             assert isinstance(tool, Tool)
             return tool.execute(arguments)
+        except UserDeclinedError:
+            raise
         except (KeyError, TypeError, ToolError, OSError) as error:
             return ToolResult.error(str(error))
 

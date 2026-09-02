@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 import pytest
 
@@ -16,7 +17,7 @@ from litcode_agent.model import (
 from litcode_agent.tools.base import ToolResult
 from litcode_agent.tools.registry import ToolRegistry
 from litcode_agent.session_store import SessionStore
-from litcode_agent.tools import ApplyPatchTool, Workspace
+from litcode_agent.tools import ApplyPatchTool, RunCommandTool, Workspace
 
 
 class FakeModel:
@@ -366,3 +367,42 @@ def test_rewind_can_restore_agent_edits_and_redo_them(tmp_path) -> None:
 
     assert session.redo() == 1
     assert (tmp_path / "a.txt").read_text() == "two"
+
+
+def test_user_declined_stops_loop_after_rejection(tmp_path: Path) -> None:
+    model = FakeModel(
+        [
+            AssistantTurn(
+                None,
+                (ToolCall("call-1", "run_command", '{"command":"rm -rf docs"}'),),
+            ),
+            AssistantTurn("这一轮不应该发生"),
+        ]
+    )
+    events: list[AgentEvent] = []
+    tool = RunCommandTool(
+        Workspace(tmp_path),
+        5,
+        4_000,
+        "confirm",
+        confirm=lambda command: False,
+    )
+
+    result = Agent(model, ToolRegistry([tool]), 5, events.append).run("Go")
+
+    assert result.reason == "user_declined"
+    assert "not approved" in result.output
+    assert len(model.requests) == 1
+    tool_message = result.messages[-1]
+    assert json.loads(tool_message["content"]) == {  # type: ignore[arg-type]
+        "ok": False,
+        "declined": True,
+        "content": "dangerous command was not approved",
+    }
+    assert [event.kind for event in events] == [
+        "model_start",
+        "model_end",
+        "tool_start",
+        "tool_result",
+    ]
+    assert events[-1].is_error

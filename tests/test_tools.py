@@ -20,7 +20,7 @@ from litcode_agent.tools import (
 )
 from litcode_agent.config import ReadRoot, Settings
 from litcode_agent.read_scope import ReadScope
-from litcode_agent.tools.base import ToolError, ToolExecutionContext
+from litcode_agent.tools.base import ToolError, ToolExecutionContext, UserDeclinedError
 from litcode_agent.tools.command import is_dangerous_command
 from litcode_agent.tools.files import truncate_output
 from litcode_agent.session_store import SessionStore
@@ -170,10 +170,24 @@ def test_confirmation_policy_controls_dangerous_command(tmp_path: Path) -> None:
         confirm=lambda command: bool(requested.append(command)),
     )
 
-    with pytest.raises(ToolError, match="not approved"):
+    with pytest.raises(UserDeclinedError, match="not approved"):
         tool.execute({"command": "rm missing.txt"})
 
     assert requested == ["rm missing.txt"]
+
+
+def test_user_declined_is_not_wrapped_as_ordinary_error(tmp_path: Path) -> None:
+    tool = RunCommandTool(
+        Workspace(tmp_path),
+        2,
+        2_000,
+        "confirm",
+        confirm=lambda command: False,
+    )
+    registry = ToolRegistry([tool])
+
+    with pytest.raises(UserDeclinedError, match="not approved"):
+        registry.execute_json("run_command", '{"command":"rm x"}', None)
 
 
 def test_command_timeout_is_reported(tmp_path: Path) -> None:
