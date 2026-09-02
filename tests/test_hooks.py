@@ -54,7 +54,7 @@ def test_pre_tool_exit_two_blocks_with_stderr(tmp_path: Path) -> None:
                 matcher="run_command",
                 hooks=(
                     HookCommand(
-                        "python -c 'import sys; print(\"禁止执行\", file=sys.stderr); raise SystemExit(2)'"
+                        "python -c \"import sys; print('禁止执行', file=sys.stderr); raise SystemExit(2)\""
                     ),
                 ),
             ),
@@ -107,7 +107,7 @@ def test_agent_returns_pre_tool_block_to_model_without_running_tool(
         pre_tool_use=(
             HookGroup(
                 matcher="touch",
-                hooks=(HookCommand("python -c 'raise SystemExit(2)'"),),
+                hooks=(HookCommand('python -c "raise SystemExit(2)"'),),
             ),
         )
     )

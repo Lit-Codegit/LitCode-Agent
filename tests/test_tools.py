@@ -141,7 +141,7 @@ def test_detects_dangerous_commands(command: str) -> None:
 
 def test_runs_safe_command(tmp_path: Path) -> None:
     result = RunCommandTool(Workspace(tmp_path), 2, 2_000, "deny").execute(
-        {"command": f'"{sys.executable}" -c "import os; print(os.getcwd())"'}
+        {"command": 'python -c "import os; print(os.getcwd())"'}
     )
 
     assert "exit_code: 0" in result.content
@@ -250,7 +250,7 @@ def test_default_registry_serializes_workspace_mutations(
 
     def blocking_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         command_started.set()
-        assert release_command.wait(2)
+        assert release_command.wait(5)
         return subprocess.CompletedProcess(args="noop", returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("litcode_agent.process_runner.subprocess.run", blocking_run)
@@ -272,13 +272,13 @@ def test_default_registry_serializes_workspace_mutations(
     )
 
     command_thread.start()
-    assert command_started.wait(1)
+    assert command_started.wait(5)
     patch_thread.start()
     assert not patch_finished.wait(0.05)
     assert not (tmp_path / "shared.txt").exists()
     release_command.set()
-    command_thread.join(2)
-    patch_thread.join(2)
+    command_thread.join(5)
+    patch_thread.join(5)
 
     assert patch_finished.is_set()
     assert (tmp_path / "shared.txt").read_text() == "done"

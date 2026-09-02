@@ -509,6 +509,7 @@ def test_user_memory_client_resumes_endpoint_when_project_has_no_models(
 ) -> None:
     user_home = tmp_path / "user-home"
     monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("USERPROFILE", str(user_home))
     from litcode_agent.credentials import save_api_key, save_last_client
     from litcode_agent.credentials import LastClient
 
@@ -533,6 +534,7 @@ def test_project_models_config_wins_over_user_memory(
 ) -> None:
     user_home = tmp_path / "user-home"
     monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("USERPROFILE", str(user_home))
     from litcode_agent.credentials import save_api_key, save_last_client
     from litcode_agent.credentials import LastClient
 

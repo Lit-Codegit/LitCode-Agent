@@ -59,7 +59,7 @@ def test_auth_login_stores_key_in_private_user_file(
         assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
         assert stat.S_IMODE(auth_file.parent.stat().st_mode) == 0o700
     assert "stored-secret" not in output.getvalue()
-    assert "litcode/auth.json" in output.getvalue()
+    assert "litcode/auth.json" in output.getvalue().replace("\n", "")
     assert "0600" in output.getvalue()
 
 

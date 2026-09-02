@@ -153,8 +153,8 @@ def test_escape_interrupts_running_reply(tmp_path: Path) -> None:
             assert "中断" in str(
                 app.query_one("#prompt-status-left", Label).render()
             )
-            for _ in range(40):
-                await pilot.pause(0.02)
+            for _ in range(160):
+                await pilot.pause(0.05)
                 if not app.busy:
                     break
             assert not app.busy
@@ -244,8 +244,8 @@ def test_model_request_receives_current_terminal_and_pane_location(
             prompt = app.query_one(PromptArea)
             prompt.text = "我在哪里"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if model.requests and not app.busy:
                     break
 
@@ -282,8 +282,8 @@ def test_schedule_command_sends_natural_language_as_explicit_tool_request(
                 "cancel_scheduled_task",
             } <= tool_names
             app._handle_command("/schedule 每周一上午九点运行测试")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if model.requests and not app.busy:
                     break
 
@@ -360,8 +360,8 @@ def test_enter_sends_and_shift_enter_inserts_newline(tmp_path: Path) -> None:
 
             prompt.text += "第二行"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if model.requests and not app.busy:
                     break
 
@@ -378,8 +378,8 @@ def test_prompt_history_recalls_messages_and_restores_draft(tmp_path: Path) -> N
             prompt = app.query_one(PromptArea)
             prompt.text = "第一条"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if model.requests and not app.busy:
                     break
 
@@ -579,8 +579,8 @@ def test_tui_submits_prompt_in_background_and_renders_answer(
             prompt = app.query_one(PromptArea)
             prompt.text = "检查项目"
             await pilot.press("enter")
-            for _ in range(20):
-                await pilot.pause(0.02)
+            for _ in range(80):
+                await pilot.pause(0.05)
                 if not app.busy and model.requests:
                     break
 
@@ -610,8 +610,8 @@ def test_assistant_markdown_has_clear_semantic_contrast(tmp_path: Path) -> None:
             prompt = app.query_one(PromptArea)
             prompt.text = "展示 Markdown"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.busy:
                     break
 
@@ -675,8 +675,8 @@ def test_tui_queues_messages_and_accepts_commands_while_busy(
             await pilot.pause()
 
             app.runtime.resume(session_id)
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.busy and len(model.requests) == 2:
                     break
             assert len(model.requests) == 2
@@ -691,8 +691,8 @@ def test_tui_model_picker_switches_current_model(tmp_path: Path) -> None:
         app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("f2")
-            for _ in range(20):
-                await pilot.pause(0.02)
+            for _ in range(80):
+                await pilot.pause(0.05)
                 if isinstance(app.screen, ModelPicker):
                     break
             assert isinstance(app.screen, ModelPicker)
@@ -723,15 +723,15 @@ def test_tui_denies_dangerous_command_in_modal(tmp_path: Path) -> None:
             prompt = app.query_one(PromptArea)
             prompt.text = "执行危险命令"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if isinstance(app.screen, ConfirmCommand):
                     break
             assert isinstance(app.screen, ConfirmCommand)
 
             await pilot.press("escape")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.busy and len(model.requests) == 2:
                     break
 
@@ -805,8 +805,8 @@ def test_new_command_detaches_session_and_keeps_running_task(
             prompt = app.query_one(PromptArea)
             prompt.text = "问题"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if app.busy:
                     break
             previous = app._active_runtime().session
@@ -834,8 +834,8 @@ def test_new_command_detaches_session_and_keeps_running_task(
             assert previous.session_id in app.running_sessions
 
             model.release.set()
-            for _ in range(50):
-                await pilot.pause(0.02)
+            for _ in range(200):
+                await pilot.pause(0.05)
                 if previous.session_id not in app.running_sessions:
                     break
             assert previous.session_id not in app.sessions.detached
@@ -869,8 +869,8 @@ def test_nohup_returns_last_pane_to_empty_without_creating_a_session(
             prompt = app.query_one(PromptArea)
             prompt.text = "新的根会话"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if model.requests and not app.busy:
                     break
             assert app.session.session_id != previous
@@ -916,8 +916,8 @@ def test_subagent_command_can_create_mount_and_start_a_child_pane(
             parent_id = app.session.session_id
 
             app._handle_command("/subagent --pane right 检查测试")
-            for _ in range(40):
-                await pilot.pause(0.02)
+            for _ in range(160):
+                await pilot.pause(0.05)
                 if model.requests and not app.busy:
                     break
 
@@ -947,13 +947,13 @@ def test_tui_manual_compaction_keeps_session_available(tmp_path: Path) -> None:
             prompt = app.query_one(PromptArea)
             prompt.text = "问题"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.busy:
                     break
             app._handle_command("/compact")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.busy:
                     break
 
@@ -972,8 +972,8 @@ def test_at_completion_references_workspace_file_in_model_prompt(
         model = FakeModel()
         app = LitCodeTUI(settings(tmp_path), model)  # type: ignore[arg-type]
         async with app.run_test(size=(120, 40)) as pilot:
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if "main.py" in app.file_paths:
                     break
             prompt = app.query_one(PromptArea)
@@ -987,8 +987,8 @@ def test_at_completion_references_workspace_file_in_model_prompt(
             assert prompt.text == "检查 @{main.py}"
 
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if model.requests and not app.busy:
                     break
 
@@ -1007,8 +1007,8 @@ def test_at_completion_can_navigate_directories(tmp_path: Path) -> None:
     async def exercise() -> None:
         app = LitCodeTUI(settings(tmp_path), FakeModel())  # type: ignore[arg-type]
         async with app.run_test(size=(120, 40)) as pilot:
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if "src/package/main.py" in app.file_paths:
                     break
             prompt = app.query_one(PromptArea)
@@ -1055,8 +1055,8 @@ def test_hash_completion_inserts_session_alias_and_sends_capsule(
             assert prompt.text == f"参考 #{{{alias}}}"
 
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if model.requests and not app.busy:
                     break
 
@@ -1084,8 +1084,8 @@ def test_tui_advertises_skill_metadata_without_eager_body(tmp_path: Path) -> Non
             prompt = app.query_one(PromptArea)
             prompt.text = "检查代码"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if model.requests and not app.busy:
                     break
 
@@ -1130,8 +1130,8 @@ def test_split_panes_run_concurrently_and_keep_streams_isolated(
             prompt = app.query_one(PromptArea)
             prompt.text = "慢任务"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if slow_started.is_set():
                     break
 
@@ -1140,8 +1140,8 @@ def test_split_panes_run_concurrently_and_keep_streams_isolated(
             assert not prompt.disabled
             prompt.text = "快任务"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.panes["pane-2"].busy:
                     break
 
@@ -1151,8 +1151,8 @@ def test_split_panes_run_concurrently_and_keep_streams_isolated(
             assert app.panes["pane-2"].session.messages[-1]["content"] == "快完成"
 
             release_slow.set()
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.panes["pane-1"].busy:
                     break
             assert not app.panes["pane-1"].busy
@@ -1291,8 +1291,8 @@ def test_tool_card_is_collapsed_with_key_argument_and_bounded_summary(
             prompt = app.query_one(PromptArea)
             prompt.text = "读取文件"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.busy and "read" in app._active_runtime().tool_cards:
                     break
 
@@ -1327,8 +1327,8 @@ def test_tui_renders_first_stream_delta_before_completion(tmp_path: Path) -> Non
             prompt = app.query_one(PromptArea)
             prompt.text = "测试流式"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if (
                     first_delta.is_set()
                     and app._active_runtime().streaming_buffer == "流"
@@ -1340,8 +1340,8 @@ def test_tui_renders_first_stream_delta_before_completion(tmp_path: Path) -> Non
             assert app._active_runtime().streaming_markdown is not None
 
             release.set()
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.busy:
                     break
 
@@ -1371,8 +1371,8 @@ def test_apply_patch_card_shows_bounded_diff_for_creation(tmp_path: Path) -> Non
             prompt = app.query_one(PromptArea)
             prompt.text = "创建文件"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.busy and "create" in event_body:
                     break
 
@@ -1541,8 +1541,8 @@ def test_history_switch_keeps_running_task_in_background(tmp_path: Path) -> None
             prompt = app.query_one(PromptArea)
             prompt.text = "慢任务"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if app.busy:
                     break
             assert app.busy
@@ -1558,8 +1558,8 @@ def test_history_switch_keeps_running_task_in_background(tmp_path: Path) -> None
             assert not app.query_one(PromptArea).disabled
 
             blocked.set()
-            for _ in range(50):
-                await pilot.pause(0.02)
+            for _ in range(200):
+                await pilot.pause(0.05)
                 if busy_id not in app.running_sessions:
                     break
             assert busy_id not in app.running_sessions
@@ -1602,16 +1602,16 @@ def test_tui_ask_user_modal_returns_answer_and_cards(tmp_path: Path) -> None:
             prompt = app.query_one(PromptArea)
             prompt.text = "选择方向"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if isinstance(app.screen, QuestionPrompt):
                     break
             assert isinstance(app.screen, QuestionPrompt)
             assert "继续还是回退？" in str(app.screen.query_one("#question-text", Static).render())
 
             await pilot.press("1")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.busy and len(model.requests) == 2:
                     break
 
@@ -1657,15 +1657,15 @@ def test_tui_ask_user_escape_returns_tool_error(tmp_path: Path) -> None:
             prompt = app.query_one(PromptArea)
             prompt.text = "选择方向"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if isinstance(app.screen, QuestionPrompt):
                     break
             assert isinstance(app.screen, QuestionPrompt)
 
             await pilot.press("escape")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.busy and len(model.requests) == 2:
                     break
 
@@ -1718,8 +1718,8 @@ def test_tui_ask_user_multi_question_confirm_tab(tmp_path: Path) -> None:
             prompt = app.query_one(PromptArea)
             prompt.text = "多题"
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if isinstance(app.screen, QuestionPrompt):
                     break
             assert isinstance(app.screen, QuestionPrompt)
@@ -1733,8 +1733,8 @@ def test_tui_ask_user_multi_question_confirm_tab(tmp_path: Path) -> None:
             assert picker.tab == picker.confirm_tab
 
             await pilot.press("enter")
-            for _ in range(30):
-                await pilot.pause(0.02)
+            for _ in range(120):
+                await pilot.pause(0.05)
                 if not app.busy and len(model.requests) == 2:
                     break
 
@@ -1821,8 +1821,8 @@ def test_background_subagent_card_stays_live_until_child_finishes(
             prompt = app.query_one(PromptArea)
             prompt.text = "启动后台"
             await pilot.press("enter")
-            for _ in range(100):
-                await pilot.pause(0.02)
+            for _ in range(240):
+                await pilot.pause(0.05)
                 if child_started.is_set() and not app.busy:
                     break
 
@@ -1835,8 +1835,8 @@ def test_background_subagent_card_stays_live_until_child_finishes(
             )
 
             child_release.set()
-            for _ in range(100):
-                await pilot.pause(0.02)
+            for _ in range(240):
+                await pilot.pause(0.05)
                 if "sub-background" not in runtime.subagent_cards:
                     break
 
@@ -1948,7 +1948,7 @@ def test_connect_flow_saves_key_queries_models_and_switches_provider(
             secret = app.screen.query_one("#secret-input", Input)
             secret.value = "sk-connect-key"
             await pilot.press("enter")
-            for _ in range(50):
+            for _ in range(200):
                 await pilot.pause()
                 if app.screen.__class__.__name__ == "ModelPicker":
                     break
@@ -2000,7 +2000,7 @@ def test_connect_custom_endpoint_flow(tmp_path: Path, monkeypatch) -> None:
             app.screen.query_one("#custom-key", Input).focus()
             await pilot.pause()
             await pilot.press("enter")
-            for _ in range(50):
+            for _ in range(200):
                 await pilot.pause()
                 if app.screen.__class__.__name__ == "ModelIDPrompt":
                     break

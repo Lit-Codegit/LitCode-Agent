@@ -43,7 +43,10 @@ def test_sessions_receive_stable_human_readable_aliases(tmp_path: Path) -> None:
     assert reopened.session_info(first).alias == aliases[first]
 
 
-def test_existing_database_is_backfilled_with_aliases(tmp_path: Path) -> None:
+def test_existing_database_is_backfilled_with_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
     import sqlite3
 
     path = tmp_path / "sessions.db"
